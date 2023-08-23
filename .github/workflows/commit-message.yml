@@ -1,0 +1,25 @@
+name: 'Commit Message checks'
+on:
+  pull_request:
+    types:
+      - opened
+      - edited
+      - reopened
+      - synchronize
+  pull_request_target:
+    types:
+      - opened
+      - edited
+      - reopened
+      - synchronize
+
+jobs:
+  check-commit-message:
+    name: Check Commit Message
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for Signed-off
+        uses: gsactions/commit-message-checker@v2
+        with:
+          pattern: '^.+(Signed-off-by): .+$'
+          error: 'You need to Sign-off the commits to be able to merge.'
