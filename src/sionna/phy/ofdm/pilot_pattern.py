@@ -198,7 +198,9 @@ class PilotPattern(Object):
                 cmap = plt.cm.tab20c
                 b = np.arange(0, 4)
                 norm = colors.BoundaryNorm(b, cmap.N)
-                im = plt.imshow(np.transpose(q), origin="lower", aspect="auto", norm=norm, cmap=cmap)
+                im = plt.imshow(np.transpose(q), interpolation="nearest",
+                                origin="lower", aspect="auto", norm=norm,
+                                cmap=cmap)
                 cbar = plt.colorbar(im)
                 cbar.set_ticks(b[:-1]+0.5)
                 cbar.set_ticklabels(legend)

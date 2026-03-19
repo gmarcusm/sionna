@@ -292,7 +292,6 @@ def calculate_tb_size_numpy(modulation_order,
 
         assert target_tb_size%1==0, "target_tb_size must be int."
         n_info = int(target_tb_size)
-        n_info_q = n_info # not quantized for user specified target_tb_size
 
         assert target_tb_size<num_coded_bits, \
             "Invalid transport block parameters. target_tb_size must be less " \
