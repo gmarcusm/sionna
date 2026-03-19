@@ -1,83 +1,138 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
 """Clustered delay line (CDL) channel model from 3GPP TR38.901 specification"""
 
+from typing import Optional, Tuple
 import json
-from importlib_resources import files
-import tensorflow as tf
-from tensorflow import cos, sin
+
 import numpy as np
+import torch
+from importlib.resources import files
 
+from sionna.phy import PI, SPEED_OF_LIGHT
+from sionna.phy.channel.channel_model import ChannelModel
 from sionna.phy.channel.utils import deg_2_rad
-from sionna.phy.channel import ChannelModel
-from sionna.phy import PI
-from sionna.phy import config
-from sionna.phy.utils.tensors import insert_dims
-from . import Topology, ChannelCoefficientsGenerator
-from . import Rays
+from sionna.phy.utils import rand, normal
+from .channel_coefficients import ChannelCoefficientsGenerator, Topology
+from .rays import Rays
+from . import models
 
-from . import models # pylint: disable=relative-beyond-top-level
+__all__ = ["CDL"]
+
 
 class CDL(ChannelModel):
-    # pylint: disable=line-too-long
     r"""
-    Clustered delay line (CDL) channel model from the 3GPP [TR38901]_ specification
+    Clustered delay line (CDL) channel model from the 3GPP :cite:p:`TR38901`
+    specification
 
-    The power delay profiles (PDPs) are normalized to have a total energy of one.
+    The power delay profiles (PDPs) are normalized to have a total energy
+    of one.
 
     If a minimum speed and a maximum speed are specified such that the
     maximum speed is greater than the minimum speed, then UTs speeds are
     randomly and uniformly sampled from the specified interval for each link
     and each batch example.
 
-    The CDL model only works for systems with a single transmitter and a single
-    receiver. The transmitter and receiver can be equipped with multiple
-    antennas.
+    The CDL model only works for systems with a single transmitter and a
+    single receiver. The transmitter and receiver can be equipped with
+    multiple antennas.
 
-    Example
-    --------
+    The channel coefficient generation is done following the procedure
+    described in sections 7.7.1 and 7.7.3.
 
-    The following code snippet shows how to setup a CDL channel model assuming
-    an OFDM waveform:
+    :param model: CDL model to use. Must be ``"A"``, ``"B"``, ``"C"``,
+        ``"D"``, or ``"E"``.
+    :param delay_spread: RMS delay spread [s]. Ignored if
+        ``normalize_delays`` is set to `False`.
+    :param carrier_frequency: Carrier frequency [Hz]
+    :param ut_array: Antenna array used by the UTs. All UTs share the same
+        antenna array configuration.
+    :param bs_array: Antenna array used by the BSs. All BSs share the same
+        antenna array configuration.
+    :param direction: Link direction. Must be ``"uplink"`` or
+        ``"downlink"``.
+    :param ut_orientation: Orientation of the UT. If set to `None`,
+        [:math:`\pi`, 0, 0] is used. Shape [3] or [batch size, 3].
+    :param bs_orientation: Orientation of the BS. If set to `None`,
+        [0, 0, 0] is used. Shape [3] or [batch size, 3].
+    :param ut_velocity: UT velocity vector [m/s]. If set to `None`,
+        velocities are randomly sampled using ``min_speed`` and
+        ``max_speed``. Shape [3] or [batch size, 3].
+    :param min_speed: Minimum speed [m/s]. Ignored if ``ut_velocity`` is
+        not `None`. Defaults to 0.
+    :param max_speed: Maximum speed [m/s]. Ignored if ``ut_velocity`` is
+        not `None`. Defaults to 0.
+    :param normalize_delays: If set to `True`, the path delays are
+        normalized such that the delay of the first path is zero.
+        Defaults to `True`.
+    :param precision: Precision used for internal calculations and outputs.
+        If set to `None`,
+        :attr:`~sionna.phy.config.Config.precision` is used.
+    :param device: Device for computation (e.g., ``"cpu"``, ``"cuda:0"``).
+        If `None`, :attr:`~sionna.phy.config.Config.device` is used.
 
-    >>> # Panel array configuration for the transmitter and receiver
-    >>> bs_array = PanelArray(num_rows_per_panel = 4,
-    ...                       num_cols_per_panel = 4,
-    ...                       polarization = 'dual',
-    ...                       polarization_type = 'cross',
-    ...                       antenna_pattern = '38.901',
-    ...                       carrier_frequency = 3.5e9)
-    >>> ut_array = PanelArray(num_rows_per_panel = 1,
-    ...                       num_cols_per_panel = 1,
-    ...                       polarization = 'single',
-    ...                       polarization_type = 'V',
-    ...                       antenna_pattern = 'omni',
-    ...                       carrier_frequency = 3.5e9)
-    >>> # CDL channel model
-    >>> cdl = CDL(model = "A",
-    >>>           delay_spread = 300e-9,
-    ...           carrier_frequency = 3.5e9,
-    ...           ut_array = ut_array,
-    ...           bs_array = bs_array,
-    ...           direction = 'uplink')
-    >>> channel = OFDMChannel(channel_model = cdl,
-    ...                       resource_grid = rg)
+    :input batch_size: `int`.
+        Batch size.
 
-    where ``rg`` is an instance of :class:`~sionna.phy.ofdm.ResourceGrid`.
+    :input num_time_steps: `int`.
+        Number of time steps.
 
-    Notes
-    ------
+    :input sampling_frequency: `float`.
+        Sampling frequency [Hz].
 
-    The following tables from [TR38901]_ provide typical values for the delay
-    spread.
+    :output a: [batch size, num_rx = 1, num_rx_ant, num_tx = 1, num_tx_ant, num_paths, num_time_steps], `torch.complex`.
+        Path coefficients.
+
+    :output tau: [batch size, num_rx = 1, num_tx = 1, num_paths], `torch.float`.
+        Path delays [s].
+
+    .. rubric:: Examples
+
+    The following code snippet shows how to setup a CDL channel model
+    assuming an OFDM waveform:
+
+    .. code-block:: python
+
+        from sionna.phy.channel.tr38901 import Antenna, AntennaArray, CDL
+
+        # Antenna array configuration for the transmitter and receiver
+        bs_array = AntennaArray(
+            antenna=Antenna(pattern="38.901", polarization="dual"),
+            num_rows=4,
+            num_cols=4,
+        )
+        ut_array = AntennaArray(
+            antenna=Antenna(pattern="omni", polarization="single"),
+            num_rows=1,
+            num_cols=1,
+        )
+
+        # CDL channel model
+        cdl = CDL(
+            model="A",
+            delay_spread=300e-9,
+            carrier_frequency=3.5e9,
+            ut_array=ut_array,
+            bs_array=bs_array,
+            direction="uplink",
+        )
+
+        # Generate channel impulse response
+        a, tau = cdl(batch_size=64, num_time_steps=100, sampling_frequency=1e6)
+
+    .. rubric:: Notes
+
+    The following tables from :cite:p:`TR38901` provide typical values for the
+    delay spread.
 
     +--------------------------+-------------------+
     | Model                    | Delay spread [ns] |
     +==========================+===================+
     | Very short delay spread  | :math:`10`        |
     +--------------------------+-------------------+
-    | Short short delay spread | :math:`10`        |
+    | Short delay spread       | :math:`30`        |
     +--------------------------+-------------------+
     | Nominal delay spread     | :math:`100`       |
     +--------------------------+-------------------+
@@ -107,7 +162,7 @@ class CDL(ChannelModel):
     |                        +----------------------+------+------+----+-----+-----+----+-----+
     |                        | Normal delay profile | 363  | 363  | 302| 266 | 249 |228 | 221 |
     |                        +----------------------+------+------+----+-----+-----+----+-----+
-    |                        | Long delay profile   | 1148 | 1148 | 955| 841 | 786 | 720| 698 |
+    |                        | Long delay profile   | 1148 | 1148 | 955| 841 | 786 | 720| 698 |
     +------------------------+----------------------+------+------+----+-----+-----+----+-----+
     | RMa / RMa O2I          | Short delay profile  | 32   | 32   | N/A| N/A | N/A | N/A| N/A |
     |                        +----------------------+------+------+----+-----+-----+----+-----+
@@ -119,339 +174,302 @@ class CDL(ChannelModel):
     |                        +----------------------+-----------------------------------------+
     |                        | Long delay profile   | 616                                     |
     +------------------------+----------------------+-----------------------------------------+
-
-    Parameters
-    -----------
-
-    model : "A" | "B" | "C" | "D" | "E"
-        CDL model to use
-
-    delay_spread : `float`
-        RMS delay spread [s]
-
-    carrier_frequency : `float`
-        Carrier frequency [Hz]
-
-    ut_array : :class:`~sionna.phy.channel.tr38901.PanelArray`
-        Panel array used by the UTs. All UTs share the same antenna array
-        configuration.
-
-    bs_array : :class:`~sionna.phy.channel.tr38901.PanelArray`
-        Panel array used by the Bs. All BSs share the same antenna array
-        configuration.
-
-    direction : "uplink" | "downlink"
-        Link direction
-
-    ut_orientation : `None` (default) | [3], `tf.float`
-        Orientation of the UT. If set to `None`, [:math:`\pi`, 0, 0] is used.
-
-    bs_orientation : `None` (default) | [3], `tf.float`
-        Orientation of the BS. If set to `None`, [0, 0, 0] is used.
-
-    min_speed : float, (default 0.0)
-        Minimum speed [m/s]
-
-    max_speed : `None` (default) | `float`
-        Maximum speed [m/s]. If set to `None`,
-        then ``max_speed`` takes the same value as ``min_speed``.
-
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
-        If set to `None`,
-        :attr:`~sionna.phy.config.Config.precision` is used.
-
-    Input
-    -----
-    batch_size : `int`
-        Batch size
-
-    num_time_steps : `int`
-        Number of time steps
-
-    sampling_frequency : `float`
-        Sampling frequency [Hz]
-
-    Output
-    -------
-    a : [batch size, num_rx = 1, num_rx_ant, num_tx = 1, num_tx_ant, num_paths, num_time_steps], tf.complex
-        Path coefficients
-
-    tau : [batch size, num_rx = 1, num_tx = 1, num_paths], tf.float
-        Path delays [s]
     """
 
-    # Number of rays per cluster is set to 20 for CDL
-    NUM_RAYS = 20
+    def __init__(
+        self,
+        model: str,
+        delay_spread: float,
+        carrier_frequency: float,
+        ut_array=None,
+        bs_array=None,
+        direction: str = "downlink",
+        ut_orientation: Optional[torch.Tensor] = None,
+        bs_orientation: Optional[torch.Tensor] = None,
+        ut_velocity: Optional[torch.Tensor] = None,
+        min_speed: float = 0.0,
+        max_speed: float = 0.0,
+        normalize_delays: bool = True,
+        precision: Optional[str] = None,
+        device: Optional[str] = None,
+    ) -> None:
+        super().__init__(precision=precision, device=device)
 
-    def __init__(   self,
-                    model,
-                    delay_spread,
-                    carrier_frequency,
-                    ut_array,
-                    bs_array,
-                    direction,
-                    ut_orientation=None,
-                    bs_orientation=None,
-                    min_speed=0.,
-                    max_speed=None,
-                    precision=None):
+        # Validate model
+        if model not in ("A", "B", "C", "D", "E"):
+            raise ValueError("Invalid CDL model")
 
-        super().__init__(precision=precision)
+        # Validate direction
+        if direction not in ("uplink", "downlink"):
+            raise ValueError("Invalid direction")
 
-        assert direction in('uplink', 'downlink'), "Invalid link direction"
+        self._model = model
+        # Register as buffers for CUDAGraph compatibility
+        self.register_buffer("_delay_spread", torch.tensor(
+            delay_spread, dtype=self.dtype, device=self.device
+        ))
+        self.register_buffer("_carrier_frequency", torch.tensor(
+            carrier_frequency, dtype=self.dtype, device=self.device
+        ))
         self._direction = direction
+        self._min_speed = min_speed
+        self._max_speed = max_speed
+        self._normalize_delays = normalize_delays
 
-        # If no orientation is defined by the user, set to default values
-        # that make sense
-        if ut_orientation is None:
-            ut_orientation = tf.constant([PI, 0.0, 0.0], self.rdtype)
-        if bs_orientation is None:
-            bs_orientation = tf.zeros([3], self.rdtype)
+        # Wavelength (m)
+        self.register_buffer("_lambda_0", torch.tensor(
+            SPEED_OF_LIGHT / carrier_frequency, dtype=self.dtype, device=self.device
+        ))
 
-        # Setting which from UT or BS is the transmitter and which is the
-        # receiver according to the link direction
-        if self._direction == 'downlink':
-            self._moving_end = 'rx'
+        # Set TX and RX arrays based on direction
+        if direction == "downlink":
             self._tx_array = bs_array
             self._rx_array = ut_array
-            self._tx_orientation = bs_orientation
-            self._rx_orientation = ut_orientation
-        elif self._direction == 'uplink':
-            self._moving_end = 'tx'
+        else:  # uplink
             self._tx_array = ut_array
             self._rx_array = bs_array
-            self._tx_orientation = ut_orientation
-            self._rx_orientation = bs_orientation
 
-        self._carrier_frequency = tf.constant(carrier_frequency, self.rdtype)
-        self._delay_spread = tf.constant(delay_spread, self.rdtype)
-        self._min_speed = tf.constant(min_speed, self.rdtype)
-        if max_speed is None:
-            self._max_speed = self._min_speed
+        # Orientations
+        # Default UT orientation is [π, 0, 0] to match TF implementation
+        if ut_orientation is None:
+            ut_orientation = torch.tensor([PI, 0.0, 0.0], dtype=self.dtype, device=self.device)
         else:
-            assert max_speed >= min_speed, \
-                "min_speed cannot be larger than max_speed"
-            self._max_speed = tf.constant(max_speed, self.rdtype)
+            ut_orientation = torch.as_tensor(
+                ut_orientation, dtype=self.dtype, device=self.device
+            )
+        if bs_orientation is None:
+            bs_orientation = torch.zeros(3, dtype=self.dtype, device=self.device)
+        else:
+            bs_orientation = torch.as_tensor(
+                bs_orientation, dtype=self.dtype, device=self.device
+            )
 
-        # Loading the model parameters
-        assert model in ("A", "B", "C", "D", "E"), "Invalid CDL model"
-        if model == 'A':
-            parameters_fname = "CDL-A.json"
-        elif model == 'B':
-            parameters_fname = "CDL-B.json"
-        elif model == 'C':
-            parameters_fname = "CDL-C.json"
-        elif model == 'D':
-            parameters_fname = "CDL-D.json"
-        else: # 'E'
-            parameters_fname = "CDL-E.json"
-        self._load_parameters(parameters_fname)
+        self._ut_orientation = ut_orientation
+        self._bs_orientation = bs_orientation
 
-        # Channel coefficient generator for sampling channel impulse responses
-        self._cir_sampler = ChannelCoefficientsGenerator(carrier_frequency,
-                                                         self._tx_array,
-                                                         self._rx_array,
-                                                         subclustering=False,
-                                                         precision=precision)
+        # Velocity
+        if ut_velocity is not None:
+            self.register_buffer("_ut_velocity", torch.as_tensor(
+                ut_velocity, dtype=self.dtype, device=self.device
+            ))
+        else:
+            self.register_buffer("_ut_velocity", None)
 
-    def __call__(self, batch_size, num_time_steps, sampling_frequency):
+        # Load CDL model parameters
+        self._load_parameters()
 
-        ## Topology for generating channel coefficients
-        # Sample random velocities
-        v_r = config.tf_rng.uniform(shape=[batch_size, 1],
-                                    minval=self._min_speed,
-                                    maxval=self._max_speed,
-                                    dtype=self.rdtype)
-        v_phi = config.tf_rng.uniform(shape=[batch_size, 1],
-                                      minval=0.0,
-                                      maxval=2.*PI,
-                                      dtype=self.rdtype)
-        v_theta = config.tf_rng.uniform(shape=[batch_size, 1],
-                                        minval=0.0,
-                                        maxval=PI,
-                                        dtype=self.rdtype)
-        velocities = tf.stack([v_r*cos(v_phi)*sin(v_theta),
-                               v_r*sin(v_phi)*sin(v_theta),
-                               v_r*cos(v_theta)], axis=-1)
-        los = tf.fill([batch_size, 1, 1], self._los)
-        los_aoa = tf.tile(self._los_aoa, [batch_size, 1, 1])
-        los_zoa = tf.tile(self._los_zoa, [batch_size, 1, 1])
-        los_aod = tf.tile(self._los_aod, [batch_size, 1, 1])
-        los_zod = tf.tile(self._los_zod, [batch_size, 1, 1])
-        distance_3d = tf.zeros([batch_size, 1, 1], self.rdtype)
-        tx_orientation = tf.tile(insert_dims(self._tx_orientation, 2, 0),
-                                 [batch_size, 1, 1])
-        rx_orientation = tf.tile(insert_dims(self._rx_orientation, 2, 0),
-                                 [batch_size, 1, 1])
-        k_factor = tf.tile(self._k_factor, [batch_size, 1, 1])
-        topology = Topology(velocities=velocities,
-                            moving_end=self._moving_end,
-                            los_aoa=los_aoa,
-                            los_zoa=los_zoa,
-                            los_aod=los_aod,
-                            los_zod=los_zod,
-                            los=los,
-                            distance_3d=distance_3d,
-                            tx_orientations=tx_orientation,
-                            rx_orientations=rx_orientation)
+        # Create the channel coefficients generator
+        self._cir_gen = ChannelCoefficientsGenerator(
+            carrier_frequency=carrier_frequency,
+            tx_array=self._tx_array,
+            rx_array=self._rx_array,
+            subclustering=False,
+            precision=precision,
+            device=device,
+        )
 
-        # Rays used to generate the channel model
-        delays = tf.tile(self._delays*self._delay_spread, [batch_size, 1, 1, 1])
-        powers = tf.tile(self._powers, [batch_size, 1, 1, 1])
-        aoa = tf.tile(self._aoa, [batch_size, 1, 1, 1, 1])
-        aod = tf.tile(self._aod, [batch_size, 1, 1, 1, 1])
-        zoa = tf.tile(self._zoa, [batch_size, 1, 1, 1, 1])
-        zod = tf.tile(self._zod, [batch_size, 1, 1, 1, 1])
-        xpr = tf.tile(self._xpr, [batch_size, 1, 1, 1, 1])
+        # Pre-allocated buffers for CUDA graph compatibility
+        self._allocated_batch_size: int = 0
+        self._allocated_num_time_steps: int = 0
 
-       # Random coupling
-        aoa, aod, zoa, zod = self._random_coupling(aoa, aod, zoa, zod)
+        # Velocity buffers
+        self.register_buffer("_velocity_r", None)
+        self.register_buffer("_velocity_phi", None)
+        self.register_buffer("_velocity_theta", None)
+        self.register_buffer("_velocity_buffer", None)
 
-        rays = Rays(delays=delays,
-                    powers=powers,
-                    aoa=aoa,
-                    aod=aod,
-                    zoa=zoa,
-                    zod=zod,
-                    xpr=xpr)
+        # Topology buffers (for non-LoS case)
+        self.register_buffer("_los_aoa_zeros", None)
+        self.register_buffer("_los_aod_zeros", None)
+        self.register_buffer("_los_zoa_zeros", None)
+        self.register_buffer("_los_zod_zeros", None)
+        self.register_buffer("_los_indicator", None)
+        self.register_buffer("_distance_3d_zeros", None)
 
-        # Sampling channel impulse responses
-        # pylint: disable=unbalanced-tuple-unpacking
-        h, delays = self._cir_sampler(num_time_steps, sampling_frequency,
-                                      k_factor, rays, topology)
+        # Shuffle buffers
+        self.register_buffer("_shuffle_random_aoa", None)
+        self.register_buffer("_shuffle_random_aod", None)
+        self.register_buffer("_shuffle_random_zoa", None)
+        self.register_buffer("_shuffle_random_zod", None)
 
-        # Reshaping to match the expected output
-        h = tf.transpose(h, [0, 2, 4, 1, 5, 3, 6])
-        delays = tf.transpose(delays, [0, 2, 1, 3])
+    def allocate_for_batch_size(
+        self, batch_size: int, num_time_steps: int = 100
+    ) -> None:
+        """Pre-allocate all tensors for CUDA graph compatibility.
 
-        # Stop gadients to avoid useless backpropagation
-        h = tf.stop_gradient(h)
-        delays = tf.stop_gradient(delays)
+        Must be called before using with torch.compile(mode="max-autotune")
+        or CUDA graphs.
+
+        :param batch_size: Batch size to allocate for
+        :param num_time_steps: Number of time steps to allocate for
+        """
+        if (self._allocated_batch_size == batch_size and
+            self._allocated_num_time_steps == num_time_steps):
+            return  # Already allocated
+
+        self._allocated_batch_size = batch_size
+        self._allocated_num_time_steps = num_time_steps
+
+        # Velocity buffers (only needed if ut_velocity is None)
+        if self._ut_velocity is None:
+            self.register_buffer("_velocity_r",
+                torch.zeros(batch_size, 1, dtype=self.dtype, device=self.device))
+            self.register_buffer("_velocity_phi",
+                torch.zeros(batch_size, 1, dtype=self.dtype, device=self.device))
+            self.register_buffer("_velocity_theta",
+                torch.zeros(batch_size, 1, dtype=self.dtype, device=self.device))
+            self.register_buffer("_velocity_buffer",
+                torch.zeros(batch_size, 3, dtype=self.dtype, device=self.device))
+
+        # Topology buffers (always needed for non-LoS case)
+        if not self._has_los:
+            self.register_buffer("_los_aoa_zeros",
+                torch.zeros(1, 1, 1, dtype=self.dtype, device=self.device))
+            self.register_buffer("_los_aod_zeros",
+                torch.zeros(1, 1, 1, dtype=self.dtype, device=self.device))
+            self.register_buffer("_los_zoa_zeros",
+                torch.zeros(1, 1, 1, dtype=self.dtype, device=self.device))
+            self.register_buffer("_los_zod_zeros",
+                torch.zeros(1, 1, 1, dtype=self.dtype, device=self.device))
+
+        self.register_buffer("_los_indicator",
+            torch.full((batch_size, 1, 1), self._has_los, dtype=torch.bool, device=self.device))
+        self.register_buffer("_distance_3d_zeros",
+            torch.zeros((batch_size, 1, 1), dtype=self.dtype, device=self.device))
+
+        # Shuffle buffers for random coupling
+        num_clusters = self._num_clusters
+        rays_per_cluster = self._rays_per_cluster
+        shuffle_shape = (batch_size, 1, 1, num_clusters, rays_per_cluster)
+        self.register_buffer("_shuffle_random_aoa",
+            torch.zeros(shuffle_shape, dtype=self.dtype, device=self.device))
+        self.register_buffer("_shuffle_random_aod",
+            torch.zeros(shuffle_shape, dtype=self.dtype, device=self.device))
+        self.register_buffer("_shuffle_random_zoa",
+            torch.zeros(shuffle_shape, dtype=self.dtype, device=self.device))
+        self.register_buffer("_shuffle_random_zod",
+            torch.zeros(shuffle_shape, dtype=self.dtype, device=self.device))
+
+        # Allocate in the channel coefficients generator
+        self._cir_gen.allocate_for_batch_size(
+            batch_size, num_time_steps,
+            num_clusters, rays_per_cluster
+        )
+
+    def __call__(
+        self,
+        batch_size: int,
+        num_time_steps: int,
+        sampling_frequency: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Generate CDL channel impulse response"""
+        # Generate random velocity if not provided
+        velocity = self._get_velocity(batch_size)
+
+        # Create topology
+        topology = self._create_topology(batch_size, velocity)
+
+        # Create rays from CDL model parameters
+        rays = self._create_rays(batch_size)
+
+        # K-factor (only for D and E models)
+        k_factor = self._get_k_factor(batch_size)
+
+        # Generate channel impulse response
+        h, delays = self._cir_gen(
+            num_time_samples=num_time_steps,
+            sampling_frequency=sampling_frequency,
+            k_factor=k_factor,
+            rays=rays,
+            topology=topology,
+        )
+
+        # Reshape output to match expected format
+        # h: [batch, num_tx, num_rx, num_paths, num_rx_ant, num_tx_ant, num_time_steps]
+        # -> [batch, num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths, num_time_steps]
+        h = h.permute(0, 2, 4, 1, 5, 3, 6)
+
+        # delays: [batch, num_tx, num_rx, num_paths]
+        # -> [batch, num_rx, num_tx, num_paths]
+        delays = delays.permute(0, 2, 1, 3)
 
         return h, delays
 
-    @property
-    def num_clusters(self):
-        r"""Number of paths (:math:`M`)"""
-        return self._num_clusters
+    ########################################
+    # Internal utility methods
+    ########################################
 
-    @property
-    def los(self):
-        r"""`True` is this is a LoS model. `False` otherwise."""
-        return self._los
-
-    @property
-    def k_factor(self):
-        r"""K-factor in linear scale. Only available with LoS models."""
-        assert self._los, "This property is only available for LoS models"
-        # We return the K-factor for the path with zero-delay, and not for the
-        # entire PDP.
-        return self._k_factor[0,0,0]/self._powers[0,0,0,0]
-
-    @property
-    def delays(self):
-        r"""Path delays [s]"""
-        return self._delays[0,0,0]*self._delay_spread
-
-    @property
-    def powers(self):
-        r"""Path powers in linear scale"""
-        if self.los:
-            k_factor = self._k_factor[0,0,0]
-            nlos_powers = self._powers[0,0,0]
-            # Power of the LoS path
-            p0 = k_factor + nlos_powers[0]
-            returned_powers = tf.tensor_scatter_nd_update(nlos_powers,
-                                                            [[0]], [p0])
-            returned_powers = returned_powers / (k_factor+1.)
-        else:
-            returned_powers = self._powers[0,0,0]
-        return returned_powers
-
-    @property
-    def delay_spread(self):
-        r"""RMS delay spread [s]"""
-        return self._delay_spread
-
-    @delay_spread.setter
-    def delay_spread(self, value):
-        self._delay_spread = value
-
-    ###########################################
-    # Utility functions
-    ###########################################
-
-    def _load_parameters(self, fname):
-        r"""Load parameters of a CDL model.
+    def _load_parameters(self) -> None:
+        r"""Load CDL model parameters from JSON files.
 
         The model parameters are stored as JSON files with the following keys:
-        * los : boolean that indicates if the model is a LoS model
-        * num_clusters : integer corresponding to the number of clusters (paths)
-        * delays : List of path delays in ascending order normalized by the RMS
-            delay spread
-        * powers : List of path powers in dB scale
-        * aod : Paths AoDs [degree]
-        * aoa : Paths AoAs [degree]
-        * zod : Paths ZoDs [degree]
-        * zoa : Paths ZoAs [degree]
-        * cASD : Cluster ASD
-        * cASA : Cluster ASA
-        * cZSD : Cluster ZSD
-        * cZSA : Cluster ZSA
-        * xpr : XPR in dB
+
+        * ``los`` : boolean that indicates if the model is a LoS model
+        * ``num_clusters`` : integer corresponding to the number of clusters
+          (paths)
+        * ``delays`` : List of path delays in ascending order normalized by
+          the RMS delay spread
+        * ``powers`` : List of path powers in dB scale
+        * ``aod`` : Paths AoDs [degree]
+        * ``aoa`` : Paths AoAs [degree]
+        * ``zod`` : Paths ZoDs [degree]
+        * ``zoa`` : Paths ZoAs [degree]
+        * ``cASD`` : Cluster ASD
+        * ``cASA`` : Cluster ASA
+        * ``cZSD`` : Cluster ZSD
+        * ``cZSA`` : Cluster ZSA
+        * ``xpr`` : XPR in dB
 
         For LoS models, the two first paths have zero delay, and are assumed
         to correspond to the specular and NLoS component, in this order.
-
-        Input
-        ------
-        fname : str
-            File from which to load the parameters.
-
-        Output
-        ------
-        None
         """
+        model = self._model
+        delay_spread = self._delay_spread
+        dtype = self.dtype
+        device = self.device
 
-        # Load the JSON configuration file
+        # Load JSON file for this model
+        fname = f"CDL-{model}.json"
         source = files(models).joinpath(fname)
-        # pylint: disable=unspecified-encoding
-        with open(source) as parameter_file:
+        with open(source, encoding="utf-8") as parameter_file:
             params = json.load(parameter_file)
 
-        # LoS scenario ?
-        self._los = tf.cast(params['los'], tf.bool)
+        # LoS scenario?
+        self._has_los = bool(params["los"])
 
-        # Loading cluster delays and powers
-        self._num_clusters = tf.constant(params['num_clusters'], tf.int32)
+        # Number of clusters
+        self._num_clusters = params["num_clusters"]
+        self._rays_per_cluster = 20
 
-        # Loading the rays components, all of shape [num clusters]
-        delays = tf.constant(params['delays'], self.rdtype)
-        powers = tf.constant(np.power(10.0, np.array(params['powers'])/10.0),
-                                                            self.rdtype)
+        # Load delays and powers
+        delays = torch.tensor(params["delays"], dtype=dtype, device=device)
+        powers = torch.tensor(
+            np.power(10.0, np.array(params["powers"]) / 10.0),
+            dtype=dtype, device=device
+        )
 
         # Normalize powers
-        norm_fact = tf.reduce_sum(powers)
-        powers = powers / norm_fact
+        powers = powers / powers.sum()
 
-        # Loading the angles and angle spreads of arrivals and departure
-        c_aod = tf.constant(params['cASD'], self.rdtype)
-        aod = tf.constant(params['aod'], self.rdtype)
-        c_aoa = tf.constant(params['cASA'], self.rdtype)
-        aoa = tf.constant(params['aoa'], self.rdtype)
-        c_zod = tf.constant(params['cZSD'], self.rdtype)
-        zod = tf.constant(params['zod'], self.rdtype)
-        c_zoa = tf.constant(params['cZSA'], self.rdtype)
-        zoa = tf.constant(params['zoa'], self.rdtype)
+        # Load angles (in degrees) and their cluster spreads
+        aod = torch.tensor(params["aod"], dtype=dtype, device=device)
+        aoa = torch.tensor(params["aoa"], dtype=dtype, device=device)
+        zod = torch.tensor(params["zod"], dtype=dtype, device=device)
+        zoa = torch.tensor(params["zoa"], dtype=dtype, device=device)
 
-        # If LoS, compute the model K-factor following 7.7.6 of TR38.901 and
-        # the LoS path angles of arrival and departure.
-        # We remove the specular component from the arrays, as it will be added
-        # separately when computing the channel coefficients
-        if self._los:
-            # Extract the specular component, as it will be added separately by
-            # the CIR generator.
+        # Load cluster angle spreads
+        c_aod = torch.tensor(params["cASD"], dtype=dtype, device=device)
+        c_aoa = torch.tensor(params["cASA"], dtype=dtype, device=device)
+        c_zod = torch.tensor(params["cZSD"], dtype=dtype, device=device)
+        c_zoa = torch.tensor(params["cZSA"], dtype=dtype, device=device)
+
+        # Load XPR and convert from dB to linear
+        xpr_db = params["xpr"]
+        xpr = torch.tensor(np.power(10.0, xpr_db / 10.0), dtype=dtype, device=device)
+
+        # If LoS, compute K-factor and extract LoS component
+        if self._has_los:
+            # Extract the specular component (first path)
             los_power = powers[0]
             powers = powers[1:]
             delays = delays[1:]
@@ -464,232 +482,378 @@ class CDL(ChannelModel):
             los_zoa = zoa[0]
             zoa = zoa[1:]
 
-            # The CIR generator scales all NLoS powers by 1/(K+1),
-            # where K = k_factor, and adds to the path with zero delay a
-            # specular component with power K/(K+1).
-            # Note that all the paths are scaled by 1/(K+1), including the ones
-            # with non-zero delays.
-            # We re-normalized the NLoS power paths to ensure total unit energy
-            # after scaling
-            norm_fact = tf.reduce_sum(powers)
+            # Re-normalize NLoS powers
+            norm_fact = powers.sum()
             powers = powers / norm_fact
-            # To ensure that the path with zero delay the ratio between the
-            # specular component and the NLoS component has the same ratio as
-            # in the CDL PDP, we need to set the K-factor to to the value of
-            # the specular component. The ratio between the other paths is
-            # preserved as all paths are scaled by 1/(K+1).
-            # Note that because of the previous normalization of the NLoS paths'
-            # powers, which ensured that their total power is 1,
-            # this is equivalent to defining the K factor as done in 3GPP
-            # specifications (see step 11):
-            # K = (power of specular component)/(total power of the NLoS paths)
-            k_factor = los_power/norm_fact
 
-            los_aod = deg_2_rad(los_aod)
-            los_aoa = deg_2_rad(los_aoa)
-            los_zod = deg_2_rad(los_zod)
-            los_zoa = deg_2_rad(los_zoa)
+            # K-factor = (power of specular component) / (total NLoS power)
+            # Register as buffer for CUDAGraph compatibility
+            self.register_buffer("_k_factor", los_power / norm_fact)
+
+            # Store LoS angles (in radians)
+            self._los_aod = deg_2_rad(los_aod)
+            self._los_aoa = deg_2_rad(los_aoa)
+            self._los_zod = deg_2_rad(los_zod)
+            self._los_zoa = deg_2_rad(los_zoa)
+
+            # Note: num_clusters in JSON already excludes the LoS component,
+            # so we don't need to decrement it
         else:
-            # For NLoS models, we need to give value to the K-factor and LoS
-            # angles, but they will not be used.
-            k_factor = tf.ones((), self.rdtype)
+            # Register as buffer for CUDAGraph compatibility
+            self.register_buffer("_k_factor", torch.tensor(0.0, dtype=dtype, device=device))
 
-            los_aod = tf.zeros((), self.rdtype)
-            los_aoa = tf.zeros((), self.rdtype)
-            los_zod = tf.zeros((), self.rdtype)
-            los_zoa = tf.zeros((), self.rdtype)
+        # Scale delays if normalizing
+        if self._normalize_delays:
+            delays = delays * delay_spread
 
-        # Generate clusters rays and convert angles to radian
-        aod = self._generate_rays(aod, c_aod) # [num clusters, num rays]
-        aod = deg_2_rad(aod) # [num clusters, num rays]
-        aoa = self._generate_rays(aoa, c_aoa) # [num clusters, num rays]
-        aoa = deg_2_rad(aoa) # [num clusters, num rays]
-        zod = self._generate_rays(zod, c_zod) # [num clusters, num rays]
-        zod = deg_2_rad(zod) # [num clusters, num rays]
-        zoa = self._generate_rays(zoa, c_zoa) # [num clusters, num rays]
-        zoa = deg_2_rad(zoa) # [num clusters, num rays]
+        # Generate cluster rays using equation 7.7-0a from TR38.901
+        # This adds the per-ray offset angles from Table 7.5-3
+        aod = self._generate_rays(aod, c_aod)  # [num_clusters, num_rays]
+        aod = deg_2_rad(aod)
+        aoa = self._generate_rays(aoa, c_aoa)  # [num_clusters, num_rays]
+        aoa = deg_2_rad(aoa)
+        zod = self._generate_rays(zod, c_zod)  # [num_clusters, num_rays]
+        zod = deg_2_rad(zod)
+        zoa = self._generate_rays(zoa, c_zoa)  # [num_clusters, num_rays]
+        zoa = deg_2_rad(zoa)
 
-        # Store LoS power
-        if self._los:
-            self._los_power = los_power
+        # Swap angles for uplink direction
+        if self._direction == "uplink":
+            aod, aoa = aoa, aod
+            zod, zoa = zoa, zod
+            if self._has_los:
+                self._los_aod, self._los_aoa = self._los_aoa, self._los_aod
+                self._los_zod, self._los_zoa = self._los_zoa, self._los_zod
 
-        # Reshape the as expected by the channel impulse response generator
-        self._k_factor = self._reshape_for_cir_computation(k_factor)
-        los_aod  = self._reshape_for_cir_computation(los_aod)
-        los_aoa  = self._reshape_for_cir_computation(los_aoa)
-        los_zod  = self._reshape_for_cir_computation(los_zod)
-        los_zoa  = self._reshape_for_cir_computation(los_zoa)
-        self._delays = self._reshape_for_cir_computation(delays)
-        self._powers = self._reshape_for_cir_computation(powers)
-        aod = self._reshape_for_cir_computation(aod)
-        aoa = self._reshape_for_cir_computation(aoa)
-        zod = self._reshape_for_cir_computation(zod)
-        zoa = self._reshape_for_cir_computation(zoa)
+        # Store parameters
+        self._delays = delays
+        self._powers = powers
+        self._aod = aod
+        self._aoa = aoa
+        self._zod = zod
+        self._zoa = zoa
+        self._xpr = xpr
 
-        # Setting angles of arrivals and departures according to the link
-        # direction
-        if self._direction == 'downlink':
-            self._los_aoa = los_aoa
-            self._los_zoa = los_zoa
-            self._los_aod = los_aod
-            self._los_zod = los_zod
-            self._aoa = aoa
-            self._zoa = zoa
-            self._aod = aod
-            self._zod = zod
-        elif self._direction == 'uplink':
-            self._los_aoa = los_aod
-            self._los_zoa = los_zod
-            self._los_aod = los_aoa
-            self._los_zod = los_zoa
-            self._aoa = aod
-            self._zoa = zod
-            self._aod = aoa
-            self._zod = zoa
+    def _get_velocity(self, batch_size: int) -> torch.Tensor:
+        """Get UT velocity, either from a specified value or random sampling.
 
-        # XPR
-        xpr = params['xpr']
-        xpr = np.power(10.0, xpr/10.0)
-        xpr = tf.constant(xpr, self.rdtype)
-        xpr = tf.fill([self._num_clusters, CDL.NUM_RAYS], xpr)
-        self._xpr = self._reshape_for_cir_computation(xpr)
+        :param batch_size: Batch size
 
-    def _generate_rays(self, angles, c):
-        r"""
-        Generate rays from ``angles`` (which could be ZoD, ZoA, AoD, or AoA) and
-        the angle spread ``c`` using equation 7.7-0a of TR38.901 specifications
-
-        Input
-        -------
-        angles : [num cluster], float
-            Tensor of angles with shape `[num_clusters]`
-
-        c : float
-            Angle spread
-
-        Output
-        -------
-        ray_angles : float
-            A tensor of shape [num clusters, num rays] containing the angle of
-            each ray
+        :output velocity: UT velocity [m/s], shape [batch_size, 3]
         """
+        if self._ut_velocity is not None:
+            velocity = self._ut_velocity
+            if velocity.dim() == 1:
+                velocity = velocity.unsqueeze(0).expand(batch_size, -1)
+            return velocity
 
-        # Basis vector of offset angle from table 7.5-3 from specfications
-        # TR38.901
-        basis_vector = tf.constant([0.0447, -0.0447,
-                                    0.1413, -0.1413,
-                                    0.2492, -0.2492,
-                                    0.3715, -0.3715,
-                                    0.5129, -0.5129,
-                                    0.6797, -0.6797,
-                                    0.8844, -0.8844,
-                                    1.1481, -1.1481,
-                                    1.5195, -1.5195,
-                                    2.1551, -2.1551], self.rdtype)
+        # Use pre-allocated buffers if available (CUDA graph compatible path)
+        if self._allocated_batch_size == batch_size and self._velocity_buffer is not None:
+            # In-place random generation
+            # Note: generator argument removed for CUDA graph compatibility
+            # (torch.compile cannot trace Generator objects)
+            self._velocity_r.uniform_()
+            self._velocity_phi.uniform_()
+            self._velocity_theta.uniform_()
+
+            # Scale to proper ranges
+            v_r = self._velocity_r * (self._max_speed - self._min_speed) + self._min_speed
+            v_phi = self._velocity_phi * 2.0 * PI
+            v_theta = self._velocity_theta * PI
+
+            # Compute velocity in-place
+            self._velocity_buffer[:, 0] = (v_r * torch.cos(v_phi) * torch.sin(v_theta)).squeeze(-1)
+            self._velocity_buffer[:, 1] = (v_r * torch.sin(v_phi) * torch.sin(v_theta)).squeeze(-1)
+            self._velocity_buffer[:, 2] = (v_r * torch.cos(v_theta)).squeeze(-1)
+
+            return self._velocity_buffer
+
+        # Fallback: create new tensors (non-CUDA-graph path)
+        v_r = (
+            rand((batch_size, 1), dtype=self.dtype, device=self.device, generator=self.torch_rng)
+            * (self._max_speed - self._min_speed) + self._min_speed
+        )
+        v_phi = (
+            rand((batch_size, 1), dtype=self.dtype, device=self.device, generator=self.torch_rng)
+            * 2.0 * PI
+        )
+        v_theta = (
+            rand((batch_size, 1), dtype=self.dtype, device=self.device, generator=self.torch_rng)
+            * PI
+        )
+        velocity = torch.cat(
+            [
+                v_r * torch.cos(v_phi) * torch.sin(v_theta),
+                v_r * torch.sin(v_phi) * torch.sin(v_theta),
+                v_r * torch.cos(v_theta),
+            ],
+            dim=-1,
+        )
+        return velocity
+
+    def _create_topology(self, batch_size: int, velocity: torch.Tensor) -> Topology:
+        """Create network topology for channel generation.
+
+        :param batch_size: Batch size
+        :param velocity: UT velocity [m/s], shape [batch_size, 3]
+
+        :output topology: Network topology
+        """
+        # LoS angles (for LoS models D, E)
+        if self._has_los:
+            los_aoa = self._los_aoa.reshape(1, 1, 1)
+            los_aod = self._los_aod.reshape(1, 1, 1)
+            los_zoa = self._los_zoa.reshape(1, 1, 1)
+            los_zod = self._los_zod.reshape(1, 1, 1)
+        else:
+            # Use pre-allocated buffers if available (CUDA graph compatible)
+            if self._allocated_batch_size == batch_size and self._los_aoa_zeros is not None:
+                los_aoa = self._los_aoa_zeros
+                los_aod = self._los_aod_zeros
+                los_zoa = self._los_zoa_zeros
+                los_zod = self._los_zod_zeros
+            else:
+                los_aoa = torch.zeros(1, 1, 1, dtype=self.dtype, device=self.device)
+                los_aod = torch.zeros(1, 1, 1, dtype=self.dtype, device=self.device)
+                los_zoa = torch.zeros(1, 1, 1, dtype=self.dtype, device=self.device)
+                los_zod = torch.zeros(1, 1, 1, dtype=self.dtype, device=self.device)
+
+        los_aoa = los_aoa.expand(batch_size, 1, 1)
+        los_aod = los_aod.expand(batch_size, 1, 1)
+        los_zoa = los_zoa.expand(batch_size, 1, 1)
+        los_zod = los_zod.expand(batch_size, 1, 1)
+
+        # LoS indicator - use pre-allocated buffer if available
+        if self._allocated_batch_size == batch_size and self._los_indicator is not None:
+            los = self._los_indicator
+        else:
+            los = torch.full(
+                (batch_size, 1, 1), self._has_los, dtype=torch.bool, device=self.device
+            )
+
+        # Distance (used for LoS phase computation)
+        # Use pre-allocated buffer if available
+        if self._allocated_batch_size == batch_size and self._distance_3d_zeros is not None:
+            distance_3d = self._distance_3d_zeros
+        else:
+            distance_3d = torch.zeros(
+                (batch_size, 1, 1), dtype=self.dtype, device=self.device
+            )
+
+        # Orientations
+        ut_orientation = self._ut_orientation
+        if ut_orientation.dim() == 1:
+            ut_orientation = ut_orientation.unsqueeze(0).expand(batch_size, -1)
+        ut_orientation = ut_orientation.unsqueeze(1)  # Add UT dimension
+
+        bs_orientation = self._bs_orientation
+        if bs_orientation.dim() == 1:
+            bs_orientation = bs_orientation.unsqueeze(0).expand(batch_size, -1)
+        bs_orientation = bs_orientation.unsqueeze(1)  # Add BS dimension
+
+        # Set TX and RX orientations based on direction
+        if self._direction == "downlink":
+            tx_orientations = bs_orientation
+            rx_orientations = ut_orientation
+        else:
+            tx_orientations = ut_orientation
+            rx_orientations = bs_orientation
+
+        # Moving end
+        if self._direction == "downlink":
+            moving_end = "rx"
+            velocities = velocity.unsqueeze(1)  # Add RX dimension
+        else:
+            moving_end = "tx"
+            velocities = velocity.unsqueeze(1)  # Add TX dimension
+
+        topology = Topology(
+            velocities=velocities,
+            moving_end=moving_end,
+            los_aoa=los_aoa,
+            los_aod=los_aod,
+            los_zoa=los_zoa,
+            los_zod=los_zod,
+            los=los,
+            distance_3d=distance_3d,
+            tx_orientations=tx_orientations,
+            rx_orientations=rx_orientations,
+        )
+
+        return topology
+
+    def _create_rays(self, batch_size: int) -> Rays:
+        """Create rays from CDL model parameters.
+
+        :param batch_size: Batch size
+
+        :output rays: Rays
+        """
+        num_clusters = self._num_clusters
+        rays_per_cluster = self._rays_per_cluster
+
+        # Expand to batch and BS/UT dimensions
+        # Shape: [batch, num_tx=1, num_rx=1, num_clusters]
+        delays = self._delays.reshape(1, 1, 1, num_clusters).expand(batch_size, 1, 1, -1)
+        powers = self._powers.reshape(1, 1, 1, num_clusters).expand(batch_size, 1, 1, -1)
+
+        # Angles are already [num_clusters, rays_per_cluster] after _generate_rays
+        # Shape: [batch, num_tx=1, num_rx=1, num_clusters, rays_per_cluster]
+        aod = self._aod.reshape(1, 1, 1, num_clusters, rays_per_cluster).expand(
+            batch_size, 1, 1, -1, -1
+        )
+        aoa = self._aoa.reshape(1, 1, 1, num_clusters, rays_per_cluster).expand(
+            batch_size, 1, 1, -1, -1
+        )
+        zod = self._zod.reshape(1, 1, 1, num_clusters, rays_per_cluster).expand(
+            batch_size, 1, 1, -1, -1
+        )
+        zoa = self._zoa.reshape(1, 1, 1, num_clusters, rays_per_cluster).expand(
+            batch_size, 1, 1, -1, -1
+        )
+
+        # Apply random coupling (Step 8 of TR38.901)
+        aoa, aod, zoa, zod = self._random_coupling(aoa, aod, zoa, zod, batch_size)
+
+        # XPR: [batch, num_tx=1, num_rx=1, num_clusters, rays_per_cluster]
+        xpr = self._xpr.reshape(1, 1, 1, 1, 1).expand(
+            batch_size, 1, 1, num_clusters, rays_per_cluster
+        )
+
+        rays = Rays(
+            delays=delays,
+            powers=powers,
+            aoa=aoa,
+            aod=aod,
+            zoa=zoa,
+            zod=zod,
+            xpr=xpr,
+        )
+
+        return rays
+
+    def _get_k_factor(self, batch_size: int) -> torch.Tensor:
+        """Get K-factor for the model.
+
+        :param batch_size: Batch size
+
+        :output k_factor: K-factor, shape [batch_size, 1, 1]
+        """
+        k_factor = self._k_factor.reshape(1, 1, 1).expand(batch_size, 1, 1)
+        return k_factor
+
+    def _generate_rays(
+        self, angles: torch.Tensor, c: torch.Tensor
+    ) -> torch.Tensor:
+        """Generate rays using equation 7.7-0a of TR38.901 specifications.
+
+        :param angles: Cluster angles [num_clusters]
+        :param c: Cluster angle spread
+
+        :output ray_angles: Ray angles [num_clusters, num_rays=20]
+        """
+        # Basis vector of offset angles from Table 7.5-3 of TR38.901
+        basis_vector = torch.tensor(
+            [
+                0.0447, -0.0447,
+                0.1413, -0.1413,
+                0.2492, -0.2492,
+                0.3715, -0.3715,
+                0.5129, -0.5129,
+                0.6797, -0.6797,
+                0.8844, -0.8844,
+                1.1481, -1.1481,
+                1.5195, -1.5195,
+                2.1551, -2.1551,
+            ],
+            dtype=self.dtype,
+            device=self.device,
+        )
 
         # Reshape for broadcasting
-        # [1, num rays = 20]
-        basis_vector = tf.expand_dims(basis_vector, axis=0)
-        # [num clusters, 1]
-        angles = tf.expand_dims(angles, axis=1)
+        # basis_vector: [1, num_rays=20]
+        basis_vector = basis_vector.unsqueeze(0)
+        # angles: [num_clusters, 1]
+        angles = angles.unsqueeze(1)
 
-        # Generate rays following 7.7-0a
-        # [num clusters, num rays = 20]
-        ray_angles = angles + c*basis_vector
+        # Generate rays following equation 7.7-0a
+        # ray_angles: [num_clusters, num_rays=20]
+        ray_angles = angles + c * basis_vector
 
         return ray_angles
 
-    def _reshape_for_cir_computation(self, array):
-        r"""
-        Add three leading dimensions to array, with shape [1, num_tx, num_rx],
-        to reshape it as expected by the channel impulse response sampler.
+    def _shuffle_angles(
+        self,
+        angles: torch.Tensor,
+        random_buffer: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Randomly shuffle angles of arrival/departure within each cluster.
 
-        Input
-        -------
-        array : Any shape, float
-            Array to reshape
+        :param angles: Angles to shuffle,
+            [batch_size, num_tx, num_rx, num_clusters, num_rays]
+        :param random_buffer: Pre-allocated buffer for random numbers
+            (for CUDA graph compatibility)
 
-        Output
-        -------
-        reshaped_array : Tensor, float
-            The tensor ``array`` expanded with 3 dimensions for the batch,
-            number of tx, and number of rx.
+        :output shuffled_angles: Shuffled angles with the same shape
         """
-
-        array_rank = tf.rank(array)
-        tiling = tf.constant([1, 1, 1], tf.int32)
-        if array_rank > 0:
-            tiling = tf.concat([tiling, tf.ones([array_rank],tf.int32)], axis=0)
-
-        array = insert_dims(array, 3, 0)
-        array = tf.tile(array, tiling)
-
-        return array
-
-    def _shuffle_angles(self, angles):
-        # pylint: disable=line-too-long
-        """
-        Randomly shuffle a tensor carrying azimuth/zenith angles
-        of arrival/departure.
-
-        Input
-        ------
-        angles : [batch size, num of BSs, num of UTs, maximum number of clusters, number of rays], tf.float
-            Angles to shuffle
-
-        Output
-        -------
-        shuffled_angles : [batch size, num of BSs, num of UTs, maximum number of clusters, number of rays], tf.float
-            Shuffled ``angles``
-        """
-
         # Create randomly shuffled indices by arg-sorting samples from a random
         # normal distribution
-        random_numbers = config.tf_rng.normal(tf.shape(angles))
-        shuffled_indices = tf.argsort(random_numbers)
-        # Shuffling the angles
-        shuffled_angles = tf.gather(angles,shuffled_indices, batch_dims=4)
+        if random_buffer is not None:
+            # Use pre-allocated buffer (CUDA graph compatible)
+            # Note: generator argument removed for CUDA graph compatibility
+            random_buffer.normal_()
+            shuffled_indices = torch.argsort(random_buffer, dim=-1)
+        else:
+            # Fallback: create new tensor
+            random_numbers = normal(
+                angles.shape, dtype=self.dtype, device=self.device, generator=self.torch_rng
+            )
+            shuffled_indices = torch.argsort(random_numbers, dim=-1)
+
+        # Shuffling the angles using gather
+        shuffled_angles = torch.gather(angles, dim=-1, index=shuffled_indices)
         return shuffled_angles
 
-    def _random_coupling(self, aoa, aod, zoa, zod):
-        # pylint: disable=line-too-long
+    def _random_coupling(
+        self,
+        aoa: torch.Tensor,
+        aod: torch.Tensor,
+        zoa: torch.Tensor,
+        zod: torch.Tensor,
+        batch_size: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Randomly couple angles within a cluster (Step 8 in TR38.901).
+
+        :param aoa: Azimuth angles of arrival (AoA),
+            [batch_size, num_tx, num_rx, num_clusters, num_rays]
+        :param aod: Azimuth angles of departure (AoD),
+            [batch_size, num_tx, num_rx, num_clusters, num_rays]
+        :param zoa: Zenith angles of arrival (ZoA),
+            [batch_size, num_tx, num_rx, num_clusters, num_rays]
+        :param zod: Zenith angles of departure (ZoD),
+            [batch_size, num_tx, num_rx, num_clusters, num_rays]
+        :param batch_size: Batch size (for buffer lookup)
+
+        :output shuffled_aoa: Shuffled azimuth angles of arrival.
+
+        :output shuffled_aod: Shuffled azimuth angles of departure.
+
+        :output shuffled_zoa: Shuffled zenith angles of arrival.
+
+        :output shuffled_zod: Shuffled zenith angles of departure.
         """
-        Randomly couples the angles within a cluster for both azimuth and
-        elevation.
-
-        Step 8 in TR 38.901 specification.
-
-        Input
-        ------
-        aoa : [batch size, num of BSs, num of UTs, maximum number of clusters, number of rays], tf.float
-            Paths azimuth angles of arrival [degree] (AoA)
-
-        aod : [batch size, num of BSs, num of UTs, maximum number of clusters, number of rays], tf.float
-            Paths azimuth angles of departure (AoD) [degree]
-
-        zoa : [batch size, num of BSs, num of UTs, maximum number of clusters, number of rays], tf.float
-            Paths zenith angles of arrival [degree] (ZoA)
-
-        zod : [batch size, num of BSs, num of UTs, maximum number of clusters, number of rays], tf.float
-            Paths zenith angles of departure [degree] (ZoD)
-
-        Output
-        -------
-        shuffled_aoa : [batch size, num of BSs, num of UTs, maximum number of clusters, number of rays], tf.float
-            Shuffled `aoa`
-
-        shuffled_aod : [batch size, num of BSs, num of UTs, maximum number of clusters, number of rays], tf.float
-            Shuffled `aod`
-
-        shuffled_zoa : [batch size, num of BSs, num of UTs, maximum number of clusters, number of rays], tf.float
-            Shuffled `zoa`
-
-        shuffled_zod : [batch size, num of BSs, num of UTs, maximum number of clusters, number of rays], tf.float
-            Shuffled `zod`
-        """
-        shuffled_aoa = self._shuffle_angles(aoa)
-        shuffled_aod = self._shuffle_angles(aod)
-        shuffled_zoa = self._shuffle_angles(zoa)
-        shuffled_zod = self._shuffle_angles(zod)
+        # Use pre-allocated buffers if available (CUDA graph compatible)
+        if self._allocated_batch_size == batch_size and self._shuffle_random_aoa is not None:
+            shuffled_aoa = self._shuffle_angles(aoa, self._shuffle_random_aoa)
+            shuffled_aod = self._shuffle_angles(aod, self._shuffle_random_aod)
+            shuffled_zoa = self._shuffle_angles(zoa, self._shuffle_random_zoa)
+            shuffled_zod = self._shuffle_angles(zod, self._shuffle_random_zod)
+        else:
+            shuffled_aoa = self._shuffle_angles(aoa)
+            shuffled_aod = self._shuffle_angles(aod)
+            shuffled_zoa = self._shuffle_angles(zoa)
+            shuffled_zod = self._shuffle_angles(zod)
 
         return shuffled_aoa, shuffled_aod, shuffled_zoa, shuffled_zod
+
+

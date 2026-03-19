@@ -1,261 +1,270 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+"""Unit tests for sionna.phy.fec.turbo.encoding module."""
+
 import os
-import unittest
+
 import numpy as np
-import tensorflow as tf
+import pytest
+import torch
+
 from sionna.phy.fec.turbo import TurboEncoder
 from sionna.phy.mapping import BinarySource
 
-current_dir = os.path.dirname(os.path.abspath(__file__))
-test_dir = os.path.abspath(os.path.join(current_dir, os.pardir, os.pardir))
 
-class TestTurboEncoding(unittest.TestCase):
+# Get test data directory
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+REF_PATH = os.path.join(TEST_DIR, "..", "..", "codes", "turbo")
 
-    def test_output_dim(self):
-        r"""Test with all-zero codeword that output dims are correct (=n) and output also equals all-zero."""
 
+class TestTurboEncoder:
+    """Tests for TurboEncoder class."""
+
+    @pytest.mark.parametrize("terminate", [False, True])
+    @pytest.mark.parametrize("k", [10, 20, 50, 100])
+    @pytest.mark.parametrize("rate", [1 / 2, 1 / 3])
+    def test_output_dim(self, rate, k, terminate, device):
+        """Test with all-zero codeword that output dims are correct (=n)
+        and output also equals all-zero.
+        """
         bs = 10
-        coderates = [1/2, 1/3]
-        ks = [10, 20, 50, 100]
-        cl = 5 # constraint length
+        cl = 5  # constraint length
 
-        for rate in coderates:
-            for k in ks:
-                for t in [False, True]: # termination
+        n = int(k / rate)
+        if terminate:
+            n += int(cl / rate)
 
-                    n = int(k/rate) # calculate coderate
-                    if t:
-                        n += int(cl/rate) # account for additional constraint length
+        enc = TurboEncoder(
+            rate=rate, constraint_length=cl, terminate=terminate, device=device
+        )
+        u = torch.zeros(bs, k, dtype=torch.float32, device=device)
+        c = enc(u)
 
-                    enc = TurboEncoder(rate=rate,
-                                       constraint_length=cl,
-                                       terminate=t)
-                    u = tf.zeros([bs, k], tf.float32)
-                    c = enc(u).numpy()
+        # If no termination is used, the output must be k/r
+        if terminate is False:
+            assert c.shape[-1] == n
 
-                    # if no termination is used, the output must be k/r
-                    if t is False:
-                        self.assertTrue(c.shape[-1]==n)
+        # Verify that coderate is correct (allow small epsilon)
+        assert abs(enc.coderate - k / c.shape[-1]) < 1e-6
 
-                    # verify that coderate is correct
-                    # allow small epsilon due to rounding
-                    self.assertTrue(enc.coderate-k/c.shape[-1]<1e-6)
+        # Also check that all-zero input yields all-zero output
+        c_hat = torch.zeros_like(c)
+        assert torch.equal(c, c_hat)
 
-                    # also check that all-zero input yields all-zero output
-                    c_hat = np.zeros_like(c)
-                    self.assertTrue(np.array_equal(c, c_hat))
+        # Test that output dim can change (in eager mode)
+        k_new = k + 1
+        n_new = int(k_new / rate)
+        u_new = torch.zeros(bs, k_new, device=device)
+        c_new = enc(u_new)
 
-                    # test that output dim can change (in eager mode)
-                    k += 1 # increase length
-                    n = int(k/rate) # calculate coderate
-                    u = tf.zeros([bs, k])
-                    c = enc(u).numpy()
+        # If no termination is used, the output must be k/r
+        if terminate is False:
+            assert c_new.shape[-1] == n_new
 
-                    # if no termination is used, the output must be k/r
-                    if t is False:
-                        self.assertTrue(c.shape[-1]==n)
+        # Also check that all-zero input yields all-zero output
+        c_hat_new = torch.zeros_like(c_new)
+        assert torch.equal(c_new, c_hat_new)
 
-                    # also check that all-zero input yields all-zero output
-                    c_hat = np.zeros_like(c)
-                    self.assertTrue(np.array_equal(c, c_hat))
-
-                    # verify that coderate is correctly updated
-                    # allow small epsilon due to rounding
-                    self.assertTrue(enc.coderate-k/c.shape[-1]<1e-6)
+        # Verify that coderate is correctly updated
+        assert abs(enc.coderate - k_new / c_new.shape[-1]) < 1e-6
 
     def test_invalid_inputs(self):
-        r"""Test with invalid rate values and invalid constraint lengths as
+        """Test with invalid rate values and invalid constraint lengths as
         input. Only rates [1/2, 1/3] and constraint lengths [3, 4, 5, 6]
-        are accepted currently."""
-
+        are accepted currently.
+        """
         rate_invalid = [0.2, 0.45, 0.01]
-        rate_valid = [1/3, 1/2]
+        rate_valid = [1 / 3, 1 / 2]
 
         constraint_length_invalid = [2, 9, 0]
         constraint_length_valid = [3, 4, 5, 6]
+
         for rate in rate_valid:
             for mu in constraint_length_invalid:
-                with self.assertRaises(BaseException):
-                    enc = TurboEncoder(rate=rate, constraint_length=mu)
+                with pytest.raises(ValueError):
+                    TurboEncoder(rate=rate, constraint_length=mu)
 
         for rate in rate_invalid:
             for mu in constraint_length_valid:
-                with self.assertRaises(BaseException):
-                    enc = TurboEncoder(rate=rate, constraint_length= mu)
+                with pytest.raises(ValueError):
+                    TurboEncoder(rate=rate, constraint_length=mu)
 
-        gmat = [['101', '111', '000'], ['000', '010', '011']]
-        with self.assertRaises(BaseException):
-            enc = TurboEncoder(gen_poly=gmat)
+        gmat = [["101", "111", "000"], ["000", "010", "011"]]
+        with pytest.raises((ValueError, TypeError)):
+            TurboEncoder(gen_poly=gmat)
 
-    def test_polynomial_input(self):
-        r"""Test that different formats of input polynomials are accepted and raises exceptions when the generator polynomials fail assertions."""
-
+    def test_polynomial_input(self, device):
+        """Test that different formats of input polynomials are accepted and
+        raises exceptions when the generator polynomials fail assertions.
+        """
         bs = 10
         k = 100
-        rate = 1/2
-        n = int(k/rate) # calculate coderate
-        u = tf.zeros([bs, k])
+        rate = 1 / 2
+        n = int(k / rate)
+        u = torch.zeros(bs, k, device=device)
 
-        g1 = ['101', '111']
-        g2 = np.array(g1)
+        g1 = ["101", "111"]
+        g2 = ("101", "111")
 
-        g = [g1, g2]
-        for gen_poly in g:
-            enc = TurboEncoder(gen_poly=gen_poly, rate=rate, terminate=False)
-            c = enc(u).numpy()
-            self.assertTrue(c.shape[-1]==n)
-            # also check that all-zero input yields all-zero output
-            c_hat = np.zeros([bs, n])
-            self.assertTrue(np.array_equal(c, c_hat))
+        for gen_poly in [g1, g2]:
+            enc = TurboEncoder(
+                gen_poly=gen_poly, rate=rate, terminate=False, device=device
+            )
+            c = enc(u)
+            assert c.shape[-1] == n
 
-        def util_check_assertion_err(gen_poly_, msg_):
-            with self.assertRaises(BaseException) as exception_context:
-                enc = TurboEncoder(gen_poly=gen_poly_)
-                self.assertEqual(str(exception_context.exception), msg_)
+            # Also check that all-zero input yields all-zero output
+            c_hat = torch.zeros(bs, n, device=device)
+            assert torch.equal(c, c_hat)
 
-        gs = [
-            ['1001', '111'],
-            ['1001', 111],
-            ('1211', '1101')]
-        msg_s = [
-            "Each polynomial must be of same length.",
-                 "Each polynomial must be a string.",
-                 "Each Polynomial must be a string of 0/1 s."
-                 ]
-        for idx, g in enumerate(gs):
-            util_check_assertion_err(g,msg_s[idx])
+        # Test invalid polynomials
+        gs_invalid = [
+            (["1001", "111"], ValueError),  # Different lengths
+            (["1001", 111], TypeError),  # Non-string
+            (("1211", "1101"), ValueError),  # Non-binary chars
+        ]
 
+        for g, expected_error in gs_invalid:
+            with pytest.raises(expected_error):
+                TurboEncoder(gen_poly=g)
 
-    def test_multi_dimensional(self):
-        """Test against arbitrary shapes
-        """
+    @pytest.mark.parametrize("shape", [[4, 5, 5], []])
+    def test_multi_dimensional(self, shape, device):
+        """Test against arbitrary shapes."""
         k = 120
-        n = 240 # rate must be 1/2 or 1/3
-        shapes  =[[4, 5, 5,], []] # includes non-batch dimension test
+        n = 240  # rate must be 1/2 or 1/3
 
-        source = BinarySource()
-        enc = TurboEncoder(rate=k/n, constraint_length=5, terminate=False)
+        source = BinarySource(device=device)
+        enc = TurboEncoder(
+            rate=k / n, constraint_length=5, terminate=False, device=device
+        )
 
-        for s_ in shapes:
-            s = s_.copy()
-            bs = int(np.prod(s))
-            b = source([bs, k])
+        s = shape.copy()
+        bs = int(np.prod(s)) if s else 1
+        b = source([bs, k])
+        if s:
             s.append(k)
-            b_res = tf.reshape(b, s)
+            b_res = b.reshape(s)
+        else:
+            b_res = b.reshape(k)
 
-            # encode 2D Tensor
-            c = enc(b).numpy()
-            # encode 4D Tensor
-            c_res = enc(b_res).numpy()
-            # test that shape was preserved
-            self.assertTrue(c_res.shape[:-1]==b_res.shape[:-1])
+        # Encode 2D tensor
+        c = enc(b)
+        # Encode multi-D tensor
+        c_res = enc(b_res)
 
-            # and reshape to 2D shape
-            c_res = tf.reshape(c_res, [bs, n])
-            # both version should yield same result
-            self.assertTrue(np.array_equal(c, c_res))
+        # Test that shape was preserved
+        expected_shape = list(b_res.shape[:-1]) + [n]
+        assert list(c_res.shape) == expected_shape
 
-    def test_batch(self):
-        """Test that all samples in batch yield same output (for same input).
-        """
+        # And reshape to 2D shape
+        c_res_flat = c_res.reshape(bs, n) if s else c_res.reshape(1, n)
+        # Both versions should yield same result
+        assert torch.equal(c, c_res_flat)
+
+    def test_batch(self, device):
+        """Test that all samples in batch yield same output (for same input)."""
         bs = 100
         k = 120
 
-        source = BinarySource()
-        enc = TurboEncoder(rate=0.5, constraint_length=6)
+        source = BinarySource(device=device)
+        enc = TurboEncoder(rate=0.5, constraint_length=6, device=device)
 
         b = source([1, 15, k])
-        b_rep = tf.tile(b, [bs, 1, 1])
+        b_rep = b.repeat(bs, 1, 1)
 
-        # and run tf version (to be tested)
-        c = enc(b_rep).numpy()
+        c = enc(b_rep)
 
         for i in range(bs):
-            self.assertTrue(np.array_equal(c[0,:,:], c[i,:,:]))
+            assert torch.equal(c[0, :, :], c[i, :, :])
 
-    def test_dtypes_flexible(self):
-        """Test that encoder supports variable dtypes and
-        yields same result."""
-
-        dt_supported = (tf.float16, tf.float32, tf.float64, tf.int8,
-            tf.int32, tf.int64, tf.uint8, tf.uint16, tf.uint32)
+    def test_dtypes_flexible(self, device):
+        """Test that encoder supports variable dtypes and yields same result."""
+        dt_supported = (
+            torch.float16,
+            torch.float32,
+            torch.float64,
+            torch.int32,
+            torch.int64,
+        )
 
         bs = 10
         k = 32
 
-        source = BinarySource()
+        source = BinarySource(device=device)
 
-        enc_ref = TurboEncoder(rate=0.5,
-                              constraint_length=6,
-                              output_dtype=tf.float32)
+        enc_ref = TurboEncoder(
+            rate=0.5, constraint_length=6, precision="single", device=device
+        )
 
         u = source([bs, k])
         c_ref = enc_ref(u)
 
         for dt in dt_supported:
-            enc = TurboEncoder(rate=0.5,
-                              constraint_length=6,
-                              output_dtype=dt)
-            u_dt = tf.cast(u, dt)
+            enc = TurboEncoder(
+                rate=0.5, constraint_length=6, precision="single", device=device
+            )
+            u_dt = u.to(dt)
             c = enc(u_dt)
 
-            c_32 = tf.cast(c, tf.float32)
+            c_32 = c.to(torch.float32)
+            assert torch.equal(c_ref, c_32)
 
-            self.assertTrue(np.array_equal(c_ref.numpy(), c_32.numpy()))
-
-    def test_tf_fun(self):
-        """Test that tf.function decorator works and XLA is supported"""
-
+    def test_torch_compile(self, device):
+        """Test that torch.compile works and XLA-like compilation is supported."""
         bs = 10
         k = 100
 
-        source = BinarySource()
+        source = BinarySource(device=device)
 
         for t in [False, True]:
+            enc = TurboEncoder(
+                rate=0.5, constraint_length=6, terminate=t, device=device
+            )
 
-            enc = TurboEncoder(rate=0.5, constraint_length=6, terminate=t)
+            compiled_enc = torch.compile(enc)
 
-            @tf.function
-            def run_graph(u):
-                return enc(u)
-
-            @tf.function(jit_compile=True)
-            def run_graph_xla(u):
-                return enc(u)
-
-            # test that for arbitrary input only 0,1 values are outputed
+            # Test that for arbitrary input only 0,1 values are output
             u = source([bs, k])
-            x = run_graph(u).numpy()
+            x = compiled_enc(u)
 
-            # execute the graph twice
-            x = run_graph(u).numpy()
+            # Execute twice
+            x2 = compiled_enc(u)
+            assert torch.equal(x, x2)
 
-            # and change batch_size
-            u = source([bs+1, k])
-            x = run_graph(u).numpy()
+            # And change batch_size
+            u = source([bs + 1, k])
+            x = compiled_enc(u)
 
-            # check XLA
-            x = run_graph_xla(u).numpy()
-            u = source([bs, k])
-            x = run_graph_xla(u).numpy()
+            # Test no batch dim
+            u = source([k])
+            x = compiled_enc(u)
 
-            # test no batch dim
-            u = source([k,])
-            x = run_graph(u).numpy()
-            x = run_graph_xla(u).numpy()
+    @pytest.mark.parametrize("k", [40, 112, 168, 432])
+    def test_ref_implementation(self, k, device):
+        """Test against pre-encoded codewords from reference implementation."""
+        if not os.path.exists(REF_PATH):
+            pytest.skip("Reference data not found")
 
+        enc = TurboEncoder(
+            rate=1 / 3, terminate=True, constraint_length=4, device=device
+        )
 
-    def test_ref_implementation(self):
-        r"""Test against pre-encoded codewords from reference implementation.
-        """
-        ref_path = test_dir + '/codes/turbo/'
-        ks = [40, 112, 168, 432]
-        enc = TurboEncoder(rate=1/3, terminate=True, constraint_length=4)
+        uref = np.load(os.path.join(REF_PATH, f"ref_k{k}_u.npy"))
+        cref = np.load(os.path.join(REF_PATH, f"ref_k{k}_x.npy"))
 
-        for k in ks:
-            uref = np.load(ref_path + 'ref_k{}_u.npy'.format(k))
-            cref = np.load(ref_path + 'ref_k{}_x.npy'.format(k))
-            c = enc(tf.constant(uref, tf.float32)).numpy()
-            self.assertTrue(np.array_equal(c, cref))
+        u = torch.tensor(uref, dtype=torch.float32, device=device)
+        c = enc(u)
+
+        assert np.array_equal(c.cpu().numpy(), cref)
+
+    def test_docstring_example(self):
+        """Verify the docstring example works correctly."""
+        encoder = TurboEncoder(rate=1 / 3, constraint_length=4, terminate=True)
+        u = torch.randint(0, 2, (10, 40), dtype=torch.float32)
+        c = encoder(u)
+        # For k=40, rate=1/3, terminate=True, n = 40*3 + 12 = 132
+        assert c.shape == torch.Size([10, 132])
+

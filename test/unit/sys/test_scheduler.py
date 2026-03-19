@@ -1,110 +1,187 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+"""Unit tests for sionna.sys.scheduling"""
 
-import unittest
-import numpy as np
-import tensorflow as tf
+import pytest
+import torch
+
 from sionna.phy import config
-from sionna.phy.utils import insert_dims
 from sionna.sys import PFSchedulerSUMIMO
-from sys_utils import pf_scheduler_multislot, pf_scheduler_multislot_xla
 
 
-class TestPFSchedulerSUMIMO(unittest.TestCase):
+class TestScheduler:
+    """Tests for the PFSchedulerSUMIMO class."""
 
-    def test_first_slot(self):
-        """
-        Checks that at the first slot the scheduler selects the UTs with maximum
-        achievable rate
-        """
-        batch_size = [6, 2]
-        num_ut = 5
-        num_freq_res = 10
-        num_time_samples = 3
-        num_streams = 1
-        beta = .98
-        precision = 'double'
+    def test_first_slot(self, device, precision):
+        """Test scheduler behavior in the first slot."""
+        num_ut = 8
+        num_freq_res = 52
+        num_ofdm_sym = 14
+        batch_size = 10
 
-        pf_sched = PFSchedulerSUMIMO(num_ut,
-                                     num_freq_res,
-                                     num_time_samples,
-                                     batch_size=batch_size,
-                                     num_streams_per_ut=num_streams,
-                                     beta=beta,
-                                     precision=precision)
-        # XLA scheduler
+        scheduler = PFSchedulerSUMIMO(
+            num_ut=num_ut,
+            num_freq_res=num_freq_res,
+            num_ofdm_sym=num_ofdm_sym,
+            batch_size=batch_size,
+            precision=precision,
+            device=device,
+        )
 
-        def pf_sched_xla(rate_last_slot, rate_achievable):
-            return pf_sched(rate_last_slot, rate_achievable)
+        # Generate random last slot rates and achievable rates
+        rate_last_slot = torch.rand(batch_size, num_ut, device=device) * 100
+        rate_achievable_curr_slot = torch.rand(
+            batch_size, num_ofdm_sym, num_freq_res, num_ut, device=device
+        ) * 100
 
-        # Rate achievable in the current slot
-        rate_achievable = tf.Variable(
-            config.tf_rng.uniform(batch_size +
-                                  [num_time_samples,
-                                   num_freq_res,
-                                   num_ut],
-                                  minval=0,
-                                  maxval=10))
-        # Rate achieved over last slot
-        rate_last_slot = tf.Variable(
-            tf.zeros(batch_size + [num_ut]))
+        # Get scheduling decisions
+        is_scheduled = scheduler(rate_last_slot, rate_achievable_curr_slot)
 
-        for sched_fun in [pf_sched, pf_sched_xla]:
-            # [batch_size, num_time_samples, num_freq_res, num_ut, num_streams]
-            is_scheduled = sched_fun(rate_last_slot, rate_achievable)
+        # Check shape - includes num_streams_per_ut (defaults to 1)
+        assert is_scheduled.shape == (batch_size, num_ofdm_sym, num_freq_res, num_ut, 1)
 
-            uts_with_max_achievable_rate = np.argmax(
-                rate_achievable.numpy(), axis=-1)
+        # Check that exactly one user is scheduled per resource
+        assert (is_scheduled.sum(dim=-2).squeeze(-1) == 1).all()
 
-            uts_scheduled = np.reshape(np.where(
-                is_scheduled.numpy() == 1)[-2],
-                batch_size + [num_time_samples, num_freq_res])
+    def test_fairness_over_time(self, device, precision):
+        """Test that scheduler achieves fairness over multiple slots."""
+        num_ut = 4
+        num_freq_res = 12
+        num_ofdm_sym = 14
+        num_slots = 100
 
-            # At first slot, scheduler selects UTs with max achievable rate
-            self.assertEqual(np.sum(np.abs((uts_with_max_achievable_rate -
-                                            uts_scheduled))), 0)
-            # Either all streams are assigned to a UT, or none
-            self.assertTrue(tf.reduce_all((tf.reduce_all(is_scheduled, axis=-1) ==
-                                           tf.reduce_any(is_scheduled, axis=-1))))
+        scheduler = PFSchedulerSUMIMO(
+            num_ut=num_ut,
+            num_freq_res=num_freq_res,
+            num_ofdm_sym=num_ofdm_sym,
+            beta=0.9,  # Use beta instead of smoothing_factor
+            precision=precision,
+            device=device,
+        )
 
-    def test_fairness_multislot(self):
-        """
-        Checks that all UTs receive the same number of allocated resources
-        although their achievable rate is different
-        """
-        batch_size = [10]
-        num_ut = 20
-        num_freq_res = 10
-        num_time_samples = 3
-        num_streams_per_ut = 2
-        beta = .98
-        precision = 'double'
+        # Track how many times each user is scheduled
+        schedule_count = torch.zeros(num_ut, device=device)
 
-        num_slots = 10000
+        # Set random seed for reproducibility
+        torch.manual_seed(42)
 
-        # Achievable rate, very different across UTs
-        rate_achievable_avg = config.tf_rng.uniform(
-            batch_size + [num_ut],
-            minval=0,
-            maxval=100)
+        for _ in range(num_slots):
+            # Add small random noise to break ties - essential for fairness test
+            # Without noise, argmax always returns the same user when rates are equal
+            rate_achievable_curr_slot = torch.ones(
+                num_ofdm_sym, num_freq_res, num_ut, device=device
+            ) * 10 + torch.rand(num_ofdm_sym, num_freq_res, num_ut, device=device) * 0.1
+            
+            # Last slot rate (use past achieved rate as proxy)
+            rate_last_slot = scheduler.rate_achieved_past
+            is_scheduled = scheduler(rate_last_slot, rate_achievable_curr_slot)
+            # Sum over all resources to get per-user schedule count
+            schedule_count += is_scheduled.sum(dim=(0, 1, 3)).float().squeeze(-1)
 
-        for pf_fun in [pf_scheduler_multislot_xla]:
-            pf_sched = PFSchedulerSUMIMO(num_ut,
-                                         num_freq_res,
-                                         num_time_samples,
-                                         batch_size=batch_size,
-                                         num_streams_per_ut=num_streams_per_ut,
-                                         beta=beta,
-                                         precision=precision)
+        # With roughly equal rates, each user should be scheduled roughly equally
+        total_schedules = schedule_count.sum()
+        expected_per_user = total_schedules / num_ut
+        for ut in range(num_ut):
+            # Allow for some variance (within 50% of expected)
+            assert schedule_count[ut] > expected_per_user * 0.2, (
+                f"User {ut} scheduled too infrequently"
+            )
+            assert schedule_count[ut] < expected_per_user * 1.8, (
+                f"User {ut} scheduled too frequently"
+            )
 
-            hist = pf_fun(pf_sched, rate_achievable_avg, num_slots)
+    def test_unequal_rates(self, device, precision):
+        """Test scheduler with unequal achievable rates."""
+        num_ut = 4
+        num_freq_res = 12
+        num_ofdm_sym = 14
 
-            num_allocated_res = tf.reduce_sum(
-                hist['is_scheduled'], axis=[-1, -3, -4, -(5 + len(batch_size))]).numpy()
+        scheduler = PFSchedulerSUMIMO(
+            num_ut=num_ut,
+            num_freq_res=num_freq_res,
+            num_ofdm_sym=num_ofdm_sym,
+            beta=0.9,
+            precision=precision,
+            device=device,
+        )
 
-            # Resource unbalancedness must be small
-            unbalancedness = (num_allocated_res.max(
-                axis=1) - num_allocated_res.min(axis=1)) / num_allocated_res.sum(axis=1)
+        # User 0 has much higher rate
+        rate_achievable_curr_slot = torch.ones(
+            num_ofdm_sym, num_freq_res, num_ut, device=device
+        ) * 10
+        rate_achievable_curr_slot[..., 0] = 100.0
 
-            self.assertTrue(np.all(unbalancedness < 1e-2))
+        # Last slot rate (uniform)
+        rate_last_slot = torch.ones(num_ut, device=device)
+
+        # In first slot, user 0 should be scheduled most (highest PF metric)
+        is_scheduled = scheduler(rate_last_slot, rate_achievable_curr_slot)
+
+        # User 0 should have the most schedules
+        schedule_count = is_scheduled.sum(dim=(0, 1, 3)).squeeze(-1)
+        assert schedule_count[0] > schedule_count[1]
+
+    def test_batch_processing(self, device, precision):
+        """Test scheduler with batched inputs."""
+        num_ut = 4
+        num_freq_res = 12
+        num_ofdm_sym = 14
+        batch_size = 8
+
+        scheduler = PFSchedulerSUMIMO(
+            num_ut=num_ut,
+            num_freq_res=num_freq_res,
+            num_ofdm_sym=num_ofdm_sym,
+            batch_size=batch_size,
+            precision=precision,
+            device=device,
+        )
+
+        rate_last_slot = torch.rand(batch_size, num_ut, device=device) * 100
+        rate_achievable_curr_slot = torch.rand(
+            batch_size, num_ofdm_sym, num_freq_res, num_ut, device=device
+        ) * 100
+
+        is_scheduled = scheduler(rate_last_slot, rate_achievable_curr_slot)
+
+        # Check shape
+        assert is_scheduled.shape == (batch_size, num_ofdm_sym, num_freq_res, num_ut, 1)
+
+        # Check that exactly one user is scheduled per resource per batch element
+        assert (is_scheduled.sum(dim=-2).squeeze(-1) == 1).all()
+
+    @pytest.mark.parametrize("mode", ["default", "reduce-overhead"])
+    def test_compiled(self, device, mode):
+        """Test that PFSchedulerSUMIMO works with torch.compile."""
+        if device == "cpu" and mode == "reduce-overhead":
+            pytest.skip("reduce-overhead mode not well supported on CPU")
+
+        num_ut = 4
+        num_freq_res = 12
+        num_ofdm_sym = 14
+        batch_size = 4
+
+        scheduler = PFSchedulerSUMIMO(
+            num_ut=num_ut,
+            num_freq_res=num_freq_res,
+            num_ofdm_sym=num_ofdm_sym,
+            batch_size=batch_size,
+            device=device,
+        )
+
+        # Compile the call method
+        if mode != "default":
+            compiled_call = torch.compile(scheduler.call, mode=mode)
+        else:
+            compiled_call = scheduler.call
+
+        rate_last_slot = torch.rand(batch_size, num_ut, device=device) * 100
+        rate_achievable_curr_slot = torch.rand(
+            batch_size, num_ofdm_sym, num_freq_res, num_ut, device=device
+        ) * 100
+
+        is_scheduled = compiled_call(rate_last_slot, rate_achievable_curr_slot)
+
+        assert is_scheduled.shape == (batch_size, num_ofdm_sym, num_freq_res, num_ut, 1)

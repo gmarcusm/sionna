@@ -1,16 +1,34 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
-"""Utility functions and layers for the MIMO package"""
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+"""Utility functions and layers for the MIMO package."""
 
+from typing import Optional
 import numpy as np
-import tensorflow as tf
-from sionna.phy.utils import expand_to_rank, insert_dims, inv_cholesky
-from sionna.phy.block import Block
+import torch
 
-def complex2real_vector(z):
-    # pylint: disable=line-too-long
-    r"""Transforms a complex-valued vector into its real-valued equivalent
+from sionna.phy.block import Block
+from sionna.phy.config import config, dtypes, Precision
+from sionna.phy.utils import expand_to_rank, insert_dims, inv_cholesky
+
+__all__ = [
+    "complex2real_vector",
+    "real2complex_vector",
+    "complex2real_matrix",
+    "real2complex_matrix",
+    "complex2real_covariance",
+    "real2complex_covariance",
+    "complex2real_channel",
+    "real2complex_channel",
+    "whiten_channel",
+    "List2LLR",
+    "List2LLRSimple",
+]
+
+
+def complex2real_vector(z: torch.Tensor) -> torch.Tensor:
+    r"""Transforms a complex-valued vector into its real-valued equivalent.
 
     Transforms the last dimension of a complex-valued tensor into
     its real-valued equivalent by stacking the real and imaginary
@@ -21,21 +39,25 @@ def complex2real_vector(z):
     :math:`\mathbf{y}\in \mathbb{R}^M`, respectively, this function returns
     the vector :math:`\left[\mathbf{x}^{\mathsf{T}}, \mathbf{y}^{\mathsf{T}} \right ]^{\mathsf{T}}\in\mathbb{R}^{2M}`.
 
-    Input
-    -----
-    : [...,M], `tf.complex`
+    :param z: [..., M], `torch.complex`. Complex-valued input vector.
 
-    Output
-    ------
-    : [...,2M], `tf.complex.real_dtype`
+    :output z_real: [..., 2M], `torch.float`. Real-valued equivalent vector.
+
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        z = torch.complex(torch.tensor([1., 2.]), torch.tensor([3., 4.]))
+        zr = complex2real_vector(z)
+        # zr = tensor([1., 2., 3., 4.])
     """
-    x = tf.math.real(z)
-    y = tf.math.imag(z)
-    return tf.concat([x, y], axis=-1)
+    x = z.real
+    y = z.imag
+    return torch.cat([x, y], dim=-1)
 
-def real2complex_vector(z):
-# pylint: disable=line-too-long
-    r"""Transforms a real-valued vector into its complex-valued equivalent
+
+def real2complex_vector(z: torch.Tensor) -> torch.Tensor:
+    r"""Transforms a real-valued vector into its complex-valued equivalent.
 
     Transforms the last dimension of a real-valued tensor into
     its complex-valued equivalent by interpreting the first half
@@ -46,20 +68,24 @@ def real2complex_vector(z):
     this function returns
     the vector :math:`\mathbf{x}+j\mathbf{y}\in\mathbb{C}^M`.
 
-    Input
-    -----
-    : [...,2M], `tf.float`
+    :param z: [..., 2M], `torch.float`. Real-valued input vector.
 
-    Output
-    ------
-    : [...,M], `tf.complex`
+    :output z_complex: [..., M], `torch.complex`. Complex-valued equivalent vector.
+
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        z = torch.tensor([1., 2., 3., 4.])
+        zc = real2complex_vector(z)
+        # zc = tensor([1.+3.j, 2.+4.j])
     """
-    x, y = tf.split(z, 2, -1)
-    return tf.complex(x, y)
+    x, y = z.chunk(2, dim=-1)
+    return torch.complex(x, y)
 
-def complex2real_matrix(z):
-    # pylint: disable=line-too-long
-    r"""Transforms a complex-valued matrix into its real-valued equivalent
+
+def complex2real_matrix(z: torch.Tensor) -> torch.Tensor:
+    r"""Transforms a complex-valued matrix into its real-valued equivalent.
 
     Transforms the last two dimensions of a complex-valued tensor into
     their real-valued matrix equivalent representation.
@@ -76,23 +102,27 @@ def complex2real_matrix(z):
                                 \mathbf{Y} & \mathbf{X}
                              \end{pmatrix}.
 
-    Input
-    -----
-    : [...,M,K], `tf.complex`
+    :param z: [..., M, K], `torch.complex`. Complex-valued input matrix.
 
-    Output
-    ------
-    : [...,2M, 2K], `tf.complex.real_dtype`
+    :output z_real: [..., 2M, 2K], `torch.float`. Real-valued equivalent matrix.
+
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        z = torch.complex(torch.ones(2, 3), torch.ones(2, 3) * 2)
+        zr = complex2real_matrix(z)
+        # zr.shape = torch.Size([4, 6])
     """
-    x = tf.math.real(z)
-    y = tf.math.imag(z)
-    row1 = tf.concat([x, -y], axis=-1)
-    row2 = tf.concat([y, x], axis=-1)
-    return tf.concat([row1, row2], axis=-2)
+    x = z.real
+    y = z.imag
+    row1 = torch.cat([x, -y], dim=-1)
+    row2 = torch.cat([y, x], dim=-1)
+    return torch.cat([row1, row2], dim=-2)
 
-def real2complex_matrix(z):
-    # pylint: disable=line-too-long
-    r"""Transforms a real-valued matrix into its complex-valued equivalent
+
+def real2complex_matrix(z: torch.Tensor) -> torch.Tensor:
+    r"""Transforms a real-valued matrix into its complex-valued equivalent.
 
     Transforms the last two dimensions of a real-valued tensor into
     their complex-valued matrix equivalent representation.
@@ -111,31 +141,38 @@ def real2complex_matrix(z):
     :math:`\mathbf{Y}\in \mathbb{R}^{M\times K}`, this function returns
     the matrix :math:`\mathbf{Z}=\mathbf{X}+j\mathbf{Y}\in\mathbb{C}^{M\times K}`.
 
-    Input
-    -----
-    : [...,2M,2K], `tf.float`
+    :param z: [..., 2M, 2K], `torch.float`. Real-valued input matrix.
 
-    Output
-    ------
-    : [...,M, 2], `tf.complex`
+    :output z_complex: [..., M, K], `torch.complex`. Complex-valued equivalent matrix.
+
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        zr = torch.tensor([[1., 1., -2., -2.],
+                           [1., 1., -2., -2.],
+                           [2., 2., 1., 1.],
+                           [2., 2., 1., 1.]])
+        zc = real2complex_matrix(zr)
+        # zc.shape = torch.Size([2, 2])
     """
-    m = tf.shape(z)[-2]//2
-    k = tf.shape(z)[-1]//2
-    x = z[...,:m,:k]
-    y = z[...,m:,:k]
-    return tf.complex(x, y)
+    m = z.shape[-2] // 2
+    k = z.shape[-1] // 2
+    x = z[..., :m, :k]
+    y = z[..., m:, :k]
+    return torch.complex(x, y)
 
-def complex2real_covariance(r):
-    # pylint: disable=line-too-long
-    r"""Transforms a complex-valued covariance matrix to its real-valued equivalent
 
-    Assume a proper complex random variable :math:`\mathbf{z}\in\mathbb{C}^M` [ProperRV]_
+def complex2real_covariance(r: torch.Tensor) -> torch.Tensor:
+    r"""Transforms a complex-valued covariance matrix to its real-valued equivalent.
+
+    Assume a proper complex random variable :math:`\mathbf{z}\in\mathbb{C}^M` :cite:p:`ProperRV`
     with covariance matrix :math:`\mathbf{R}= \in\mathbb{C}^{M\times M}`
     and real and imaginary parts :math:`\mathbf{x}\in \mathbb{R}^M` and
     :math:`\mathbf{y}\in \mathbb{R}^M`, respectively.
     This function transforms the given :math:`\mathbf{R}` into the covariance matrix of the real-valued equivalent
     vector :math:`\tilde{\mathbf{z}}=\left[\mathbf{x}^{\mathsf{T}}, \mathbf{y}^{\mathsf{T}} \right ]^{\mathsf{T}}\in\mathbb{R}^{2M}`, which
-    is computed as [CovProperRV]_
+    is computed as :cite:p:`CovProperRV`
 
     .. math::
 
@@ -145,29 +182,32 @@ def complex2real_covariance(r):
             \frac12\Im\{\mathbf{R}\} & \frac12\Re\{\mathbf{R}\}
         \end{pmatrix}.
 
-    Input
-    -----
-    : [...,M,M], `tf.complex`
+    :param r: [..., M, M], `torch.complex`. Complex-valued covariance matrix.
 
-    Output
-    ------
-    : [...,2M, 2M], `tf.complex.real_dtype`
+    :output q: [..., 2M, 2M], `torch.float`. Real-valued equivalent covariance matrix.
+
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        r = torch.complex(torch.eye(2), torch.zeros(2, 2))
+        rr = complex2real_covariance(r)
+        # rr.shape = torch.Size([4, 4])
     """
     q = complex2real_matrix(r)
-    scale = tf.cast(2, q.dtype)
-    return q/scale
+    return q / 2.0
 
-def real2complex_covariance(q):
-    # pylint: disable=line-too-long
-    r"""Transforms a real-valued covariance matrix to its complex-valued equivalent
 
-    Assume a proper complex random variable :math:`\mathbf{z}\in\mathbb{C}^M` [ProperRV]_
+def real2complex_covariance(q: torch.Tensor) -> torch.Tensor:
+    r"""Transforms a real-valued covariance matrix to its complex-valued equivalent.
+
+    Assume a proper complex random variable :math:`\mathbf{z}\in\mathbb{C}^M` :cite:p:`ProperRV`
     with covariance matrix :math:`\mathbf{R}= \in\mathbb{C}^{M\times M}`
     and real and imaginary parts :math:`\mathbf{x}\in \mathbb{R}^M` and
     :math:`\mathbf{y}\in \mathbb{R}^M`, respectively.
     This function transforms the given covariance matrix of the real-valued equivalent
     vector :math:`\tilde{\mathbf{z}}=\left[\mathbf{x}^{\mathsf{T}}, \mathbf{y}^{\mathsf{T}} \right ]^{\mathsf{T}}\in\mathbb{R}^{2M}`, which
-    is given as [CovProperRV]_
+    is given as :cite:p:`CovProperRV`
 
     .. math::
 
@@ -179,21 +219,26 @@ def real2complex_covariance(q):
 
     into is complex-valued equivalent :math:`\mathbf{R}`.
 
-    Input
-    -----
-    : [...,2M,2M], `tf.float`
+    :param q: [..., 2M, 2M], `torch.float`. Real-valued covariance matrix.
 
-    Output
-    ------
-    : [...,M, M], `tf.complex`
+    :output r: [..., M, M], `torch.complex`. Complex-valued equivalent covariance matrix.
+
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        q = torch.eye(4) * 0.5
+        r = real2complex_covariance(q)
+        # r.shape = torch.Size([2, 2])
     """
     r = real2complex_matrix(q)
-    scale = tf.cast(2, r.dtype)
-    return r*scale
+    return r * 2.0
 
-def complex2real_channel(y, h, s):
-    # pylint: disable=line-too-long
-    r"""Transforms a complex-valued MIMO channel into its real-valued equivalent
+
+def complex2real_channel(
+    y: torch.Tensor, h: torch.Tensor, s: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Transforms a complex-valued MIMO channel into its real-valued equivalent.
 
     Assume the canonical MIMO channel model
 
@@ -209,41 +254,38 @@ def complex2real_channel(y, h, s):
 
     This function returns the real-valued equivalent representations of
     :math:`\mathbf{y}`, :math:`\mathbf{H}`, and :math:`\mathbf{S}`,
-    which are used by a wide variety of MIMO detection algorithms (Section VII) [YH2015]_.
+    which are used by a wide variety of MIMO detection algorithms (Section VII) :cite:p:`YH2015`.
     These are obtained by applying :meth:`~sionna.phy.mimo.complex2real_vector` to :math:`\mathbf{y}`,
     :meth:`~sionna.phy.mimo.complex2real_matrix` to :math:`\mathbf{H}`,
     and :meth:`~sionna.phy.mimo.complex2real_covariance` to :math:`\mathbf{S}`.
 
-    Input
-    -----
-    y : [...,M], `tf.complex`
-        Complex-valued received signals
+    :param y: [..., M], `torch.complex`. Complex-valued received signals.
+    :param h: [..., M, K], `torch.complex`. Complex-valued channel matrices.
+    :param s: [..., M, M], `torch.complex`. Complex-valued noise covariance matrices.
 
-    h : [...,M,K], `tf.complex`
-        Complex-valued channel matrices
+    :output yr: [..., 2M], `torch.float`. Real-valued equivalent received signals.
+    :output hr: [..., 2M, 2K], `torch.float`. Real-valued equivalent channel matrices.
+    :output sr: [..., 2M, 2M], `torch.float`. Real-valued equivalent noise covariance matrices.
 
-    s : [...,M,M], tf.complex
-        Complex-valued noise covariance matrices
+    .. rubric:: Examples
 
-    Output
-    ------
-    : [...,2M], `tf.complex.real_dtype`
-        Real-valued equivalent received signals
+    .. code-block:: python
 
-    : [...,2M,2K], `tf.complex.real_dtype`
-        Real-valued equivalent channel matrices
-
-    : [...,2M,2M], `tf.complex.real_dtype`
-        Real-valued equivalent noise covariance matrices
+        y = torch.complex(torch.randn(4), torch.randn(4))
+        h = torch.complex(torch.randn(4, 2), torch.randn(4, 2))
+        s = torch.eye(4, dtype=torch.complex64)
+        yr, hr, sr = complex2real_channel(y, h, s)
     """
     yr = complex2real_vector(y)
     hr = complex2real_matrix(h)
     sr = complex2real_covariance(s)
     return yr, hr, sr
 
-def real2complex_channel(y, h, s):
-    # pylint: disable=line-too-long
-    r"""Transforms a real-valued MIMO channel into its complex-valued equivalent
+
+def real2complex_channel(
+    y: torch.Tensor, h: torch.Tensor, s: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Transforms a real-valued MIMO channel into its complex-valued equivalent.
 
     Assume the canonical MIMO channel model
 
@@ -260,38 +302,38 @@ def real2complex_channel(y, h, s):
     This function transforms the real-valued equivalent representations of
     :math:`\mathbf{y}`, :math:`\mathbf{H}`, and :math:`\mathbf{S}`, as, e.g.,
     obtained with the function :meth:`~sionna.phy.mimo.complex2real_channel`,
-    back to their complex-valued equivalents (Section VII) [YH2015]_.
+    back to their complex-valued equivalents (Section VII) :cite:p:`YH2015`.
 
-    Input
-    -----
-    y : [...,2M], `tf.float`
-        Real-valued received signals
+    :param y: [..., 2M], `torch.float`. Real-valued received signals.
+    :param h: [..., 2M, 2K], `torch.float`. Real-valued channel matrices.
+    :param s: [..., 2M, 2M], `torch.float`. Real-valued noise covariance matrices.
 
-    h : [...,2M,2K], `tf.float`
-        Real-valued channel matrices
+    :output yc: [..., M], `torch.complex`. Complex-valued equivalent received signals.
+    :output hc: [..., M, K], `torch.complex`. Complex-valued equivalent channel matrices.
+    :output sc: [..., M, M], `torch.complex`. Complex-valued equivalent noise covariance matrices.
 
-    s : [...,2M,2M], `tf.float`
-        Real-valued noise covariance matrices
+    .. rubric:: Examples
 
-    Output
-    ------
-    : [...,M], `tf.complex`
-        Complex-valued equivalent received signals
+    .. code-block:: python
 
-    : [...,M,K], `tf.complex`
-        Complex-valued equivalent channel matrices
-
-    : [...,M,M], `tf.complex`
-        Complex-valued equivalent noise covariance matrices
+        yr = torch.randn(8)
+        hr = torch.randn(8, 4)
+        sr = torch.eye(8)
+        yc, hc, sc = real2complex_channel(yr, hr, sr)
     """
     yc = real2complex_vector(y)
     hc = real2complex_matrix(h)
     sc = real2complex_covariance(s)
     return yc, hc, sc
 
-def whiten_channel(y, h, s, return_s=True):
-    # pylint: disable=line-too-long
-    r"""Whitens a canonical MIMO channel
+
+def whiten_channel(
+    y: torch.Tensor,
+    h: torch.Tensor,
+    s: torch.Tensor,
+    return_s: bool = True,
+) -> tuple[torch.Tensor, ...]:
+    r"""Whitens a canonical MIMO channel.
 
     Assume the canonical MIMO channel model
 
@@ -313,53 +355,51 @@ def whiten_channel(y, h, s, return_s=True):
     Optionally, the whitened noise covariance matrix :math:`\mathbf{I}_M`
     can be returned.
 
-    Input
-    -----
-    y : [...,M], `tf.float` or `tf.complex`
-        Received signals
-
-    h : [...,M,K], `tf.float` or `tf.complex`
-        Channel matrices
-
-    s : [...,M,M], `tf.float` or `tf.complex`
-        Noise covariance matrices
-
-    return_s : `bool`, (default `True`)
+    :param y: [..., M], `torch.float` or `torch.complex`. Received signals.
+    :param h: [..., M, K], `torch.float` or `torch.complex`. Channel matrices.
+    :param s: [..., M, M], `torch.float` or `torch.complex`. Noise covariance matrices.
+    :param return_s: `bool`, (default `True`).
         If `True`, the whitened covariance matrix is returned.
 
-    Output
-    ------
-    : [...,M], `tf.float` or `tf.complex`
-        Whitened received signals
-
-    : [...,M,K], `tf.float` or `tf.complex`
-        Whitened channel matrices
-
-    : [...,M,M], `tf.float` or `tf.complex`
+    :output yw: [..., M], `torch.float` or `torch.complex`. Whitened received signals.
+    :output hw: [..., M, K], `torch.float` or `torch.complex`. Whitened channel matrices.
+    :output sw: [..., M, M], `torch.float` or `torch.complex`.
         Whitened noise covariance matrices.
         Only returned if ``return_s`` is `True`.
+
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        y = torch.complex(torch.randn(4), torch.randn(4))
+        h = torch.complex(torch.randn(4, 2), torch.randn(4, 2))
+        s = torch.eye(4, dtype=torch.complex64) * 0.5
+        yw, hw, sw = whiten_channel(y, h, s)
     """
     # Compute whitening matrix
     l_inv = inv_cholesky(s)
 
-    # Whiten obervation and channel matrix
-    yw = tf.linalg.matvec(l_inv, y)
-    hw = tf.linalg.matmul(l_inv, h)
+    # Whiten observation and channel matrix
+    yw = (l_inv @ y.unsqueeze(-1)).squeeze(-1)
+    hw = l_inv @ h
 
     if return_s:
         # Ideal interference covariance matrix after whitening
-        sw = tf.eye(tf.shape(s)[-2],
-                    batch_shape=tf.shape(s)[:-2],
-                    dtype=s.dtype)
+        m = s.shape[-2]
+        sw = torch.eye(m, dtype=s.dtype, device=s.device)
+        # Expand to batch shape
+        batch_shape = s.shape[:-2]
+        if batch_shape:
+            sw = sw.expand(*batch_shape, m, m)
         return yw, hw, sw
     else:
         return yw, hw
 
+
 class List2LLR(Block):
-    # pylint: disable=line-too-long
     r"""
     Abstract class defining a callable to compute LLRs from a list of
-    candidate vectors (or paths) provided by a MIMO detector
+    candidate vectors (or paths) provided by a MIMO detector.
 
     The following channel model is assumed
 
@@ -379,48 +419,41 @@ class List2LLR(Block):
     and their associated distance metrics :math:`d_k=\lVert \bar{\mathbf{y}} - \mathbf{R}\bar{\mathbf{x}}_k \rVert^2`
     for :math:`k=1,\dots,K`. This layer can also be used with the real-valued representation of the channel.
 
-    Parameters
-    ----------
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
-        If set to `None`,
-        :attr:`~sionna.phy.config.Config.precision` is used.
+    :param precision: Precision used for internal calculations and outputs.
+        If set to `None`, :attr:`~sionna.phy.config.Config.precision` is used.
+    :param device: Device for computation.
+        If `None`, :attr:`~sionna.phy.config.Config.device` is used.
 
-    Input
-    -----
-    y : [...,M], `tf.complex` or `tf.float`
-        Channel outputs of the whitened channel
+    :input y: [..., M], `torch.complex` or `torch.float`. Channel outputs of the whitened channel.
+    :input r: [..., num_streams, num_streams], same dtype as ``y``.
+        Upper triangular channel matrix of the whitened channel.
+    :input dists: [..., num_paths], `torch.float`. Distance metric for each path (or candidate).
+    :input path_inds: [..., num_paths, num_streams], `torch.int32`.
+        Symbol indices for every stream of every path (or candidate).
+    :input path_syms: [..., num_paths, num_streams], same dtype as ``y``.
+        Constellation symbol for every stream of every path (or candidate).
 
-    r : [...,num_streams, num_streams], same `dtype` as ``y``
-        Upper triangular channel matrix of the whitened channel
+    :output llr: [..., num_streams, num_bits_per_symbol], `torch.float`.
+        LLRs for all bits of every stream.
 
-    dists : [...,num_paths], `tf.float`
-        Distance metric for each path (or candidate)
+    .. rubric:: Notes
 
-    path_inds : [...,num_paths,num_streams], `tf.int32`
-        Symbol indices for every stream of every path (or candidate)
-
-    path_syms : [...,num_path,num_streams], same `dtype` as ``y``
-        Constellation symbol for every stream of every path (or candidate)
-
-    Output
-    ------
-    llr : [...num_streams,num_bits_per_symbol], `tf.float`
-        LLRs for all bits of every stream
-
-
-    Note
-    ----
     An implementation of this class does not need to make use of all of
     the provided inputs which enable various different implementations.
     """
-    def __init__(self, precision=None, **kwargs):
-        super().__init__(precision=precision, **kwargs)
+
+    def __init__(
+        self,
+        precision: Optional[Precision] = None,
+        device: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(precision=precision, device=device, **kwargs)
+
 
 class List2LLRSimple(List2LLR):
-    # pylint: disable=line-too-long
     r"""
-    Computes LLRs from a list of candidate vectors (or paths) provided by a MIMO detector
+    Computes LLRs from a list of candidate vectors (or paths) provided by a MIMO detector.
 
     The following channel model is assumed:
 
@@ -443,10 +476,10 @@ class List2LLRSimple(List2LLR):
     The LLR for the :math:`i\text{th}` bit of the :math:`k\text{th}` stream is computed as
 
     .. math::
-        \begin{align}
+        \begin{aligned}
             LLR(k,i) &= \log\left(\frac{\Pr(b_{k,i}=1|\bar{\mathbf{y}},\mathbf{R})}{\Pr(b_{k,i}=0|\bar{\mathbf{y}},\mathbf{R})}\right)\\
                 &\approx \min_{j \in  \mathcal{C}_{k,i,0}}d_j - \min_{j \in  \mathcal{C}_{k,i,1}}d_j
-        \end{align}
+        \end{aligned}
 
     where :math:`\mathcal{C}_{k,i,1}` and :math:`\mathcal{C}_{k,i,0}` are the set of indices
     in the list of candidates for which the :math:`i\text{th}` bit of the :math:`k\text{th}`
@@ -456,123 +489,135 @@ class List2LLRSimple(List2LLR):
     If :math:`\mathcal{C}_{k,i,0}` is empty, :math:`LLR(k,i)=LLR_\text{clip}`;
     if :math:`\mathcal{C}_{k,i,1}` is empty, :math:`LLR(k,i)=-LLR_\text{clip}`.
 
-    Parameters
-    ----------
-    num_bits_per_symbol : `int`
-        Number of bits per constellation symbol
+    :param num_bits_per_symbol: Number of bits per constellation symbol
+    :param llr_clip_val: The absolute values of LLRs are clipped to this value.
+        Defaults to 20.0.
+    :param precision: Precision used for internal calculations and outputs.
+        If set to `None`, :attr:`~sionna.phy.config.Config.precision` is used.
+    :param device: Device for computation.
+        If `None`, :attr:`~sionna.phy.config.Config.device` is used.
 
-    llr_clip_val : `float`, (default 20.0)
-        The absolute values of LLRs are clipped to this value.
+    :input y: [..., M], `torch.complex` or `torch.float`. Channel outputs of the whitened channel.
+    :input r: [..., num_streams, num_streams], same dtype as ``y``.
+        Upper triangular channel matrix of the whitened channel.
+    :input dists: [..., num_paths], `torch.float`. Distance metric for each path (or candidate).
+    :input path_inds: [..., num_paths, num_streams], `torch.int32`.
+        Symbol indices for every stream of every path (or candidate).
+    :input path_syms: [..., num_paths, num_streams], same dtype as ``y``.
+        Constellation symbol for every stream of every path (or candidate).
 
-    Parameters
-    ----------
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
-        If set to `None`,
-        :attr:`~sionna.phy.config.Config.precision` is used.
+    :output llr: [..., num_streams, num_bits_per_symbol], `torch.float`.
+        LLRs for all bits of every stream.
 
-    Input
-    -----
-    y : [...,M], `tf.complex` or `tf.float`
-        Channel outputs of the whitened channel
+    .. rubric:: Examples
 
-    r : [...,num_streams, num_streams], same `dtype` as ``y``
-        Upper triangular channel matrix of the whitened channel
+    .. code-block:: python
 
-    dists : [...,num_paths], `tf.float`
-        Distance metric for each path (or candidate)
-
-    path_inds : [...,num_paths,num_streams], `tf.int32`
-        Symbol indices for every stream of every path (or candidate)
-
-    path_syms : [...,num_path,num_streams], same `dtype` as ``y``
-        Constellation symbol for every stream of every path (or candidate)
-
-    Output
-    ------
-    llr : [...num_streams,num_bits_per_symbol], `tf.float`
-        LLRs for all bits of every stream
+        list2llr = List2LLRSimple(num_bits_per_symbol=4)
+        # Use with KBestDetector outputs
     """
-    def __init__(self,
-                 num_bits_per_symbol,
-                 llr_clip_val=20.0,
-                 precision=None,
-                 **kwargs):
-        super().__init__(precision=precision, **kwargs)
 
-        # Array composed of binary representations of all symbols indices
+    def __init__(
+        self,
+        num_bits_per_symbol: int,
+        llr_clip_val: float = 20.0,
+        precision: Optional[Precision] = None,
+        device: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(precision=precision, device=device, **kwargs)
+
+        # Array composed of binary representations of all symbol indices
         num_points = 2**num_bits_per_symbol
         a = np.zeros([num_points, num_bits_per_symbol])
         for i in range(num_points):
-            a[i, :] = np.array(list(np.binary_repr(i, num_bits_per_symbol)),
-                               dtype=np.int32)
+            a[i, :] = np.array(
+                list(np.binary_repr(i, num_bits_per_symbol)), dtype=np.int32
+            )
 
-        # Compute symbol indices for which the bits are 0 or 1, e.g.,:
+        # Compute symbol indices for which the bits are 0 or 1, e.g.:
         # The ith column of c0 provides all symbol indices for which
         # the ith bit is 0.
-        c0 = np.zeros([int(num_points/2), num_bits_per_symbol])
-        c1 = np.zeros([int(num_points/2), num_bits_per_symbol])
+        c0 = np.zeros([num_points // 2, num_bits_per_symbol])
+        c1 = np.zeros([num_points // 2, num_bits_per_symbol])
         for i in range(num_bits_per_symbol):
-            c0[:,i] = np.where(a[:,i]==0)[0]
-            c1[:,i] = np.where(a[:,i]==1)[0]
+            c0[:, i] = np.where(a[:, i] == 0)[0]
+            c1[:, i] = np.where(a[:, i] == 1)[0]
 
         # Convert to tensor and add dummy dimensions needed for broadcasting
-        self._c0 = expand_to_rank(tf.constant(c0, tf.int32), 5, 0)
-        self._c1 = expand_to_rank(tf.constant(c1, tf.int32), 5, 0)
+        # Shape: [1, 1, 1, num_points/2, num_bits_per_symbol]
+        c0_tensor = torch.tensor(c0, dtype=torch.int32, device=self.device)
+        self._c0 = expand_to_rank(c0_tensor, 5, 0)
+        c1_tensor = torch.tensor(c1, dtype=torch.int32, device=self.device)
+        self._c1 = expand_to_rank(c1_tensor, 5, 0)
 
         # Assign this absolute value to all LLRs without counter-hypothesis
-        self.llr_clip_val = llr_clip_val
+        self._llr_clip_val = llr_clip_val
 
     @property
-    def llr_clip_val(self):
-        """
-        `float` : Get/set the value to which the absolute values of LLRs
-            are clipped
-        """
+    def llr_clip_val(self) -> float:
+        """The value to which the absolute values of LLRs are clipped."""
         return self._llr_clip_val
 
     @llr_clip_val.setter
-    def llr_clip_val(self, value):
+    def llr_clip_val(self, value: float) -> None:
         self._llr_clip_val = value
 
-    # pylint: disable=unused-argument
-    def call(self, y, r, dists, path_inds, path_syms):
+    @staticmethod
+    @torch.compile(fullgraph=True)
+    def _fused_equal_any(path_inds: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """Fused equal + any operation to avoid materializing large intermediate tensor.
 
-        # dists :     [batch_size, num_paths]
-        # path_inds : [batch_size, num_paths, num_streams]
+        When compiled, this fuses the comparison and reduction into a single kernel.
+
+        :param path_inds: Symbol indices with shape [..., num_paths, num_streams, 1]
+        :param c: Reference indices with shape [1, 1, 1, num_symbols/2, num_bits]
+
+        :output result: [..., num_paths, num_streams, num_bits], `torch.bool`.
+            Boolean tensor indicating bit matches.
+        """
+        return (path_inds == c).any(dim=-2)
+
+    def call(
+        self,
+        y: torch.Tensor,
+        r: torch.Tensor,
+        dists: torch.Tensor,
+        path_inds: torch.Tensor,
+        path_syms: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute LLRs from candidate paths."""
+        # dists:     [batch_size, num_paths]
+        # path_inds: [batch_size, num_paths, num_streams]
 
         # Scaled by 0.5 to account for the reduced noise power in each complex
         # dimension if real channel representation is used.
-        if y.dtype.is_floating:
-            dists = dists/2.0
+        if not y.is_complex():
+            dists = dists / 2.0
 
         # Compute for every symbol in every path which bits are 0 or 1
-        # b0/b1: [batch_size, num_path, num_streams, num_bits_per_symbol]
-        # The reduce_any op is forced to run in XLA mode to be able to
-        # work with very large tensors. There seems to an int32 indexing issue
-        # for all TF reduce CUDA kernels.
+        # b0/b1: [batch_size, num_paths, num_streams, num_bits_per_symbol]
+        # Use compiled function to fuse equal+any, avoiding large intermediate tensor
         path_inds = insert_dims(path_inds, 2, axis=-1)
-        b0 = tf.equal(path_inds, self._c0)
-        b1 = tf.equal(path_inds, self._c1)
-        b0 = tf.function(tf.reduce_any, jit_compile=True)(b0, axis=-2)
-        b1 = tf.function(tf.reduce_any, jit_compile=True)(b1, axis=-2)
+        b0 = self._fused_equal_any(path_inds, self._c0)
+        b1 = self._fused_equal_any(path_inds, self._c1)
 
         # Compute distances for all bits in all paths, set distance to inf
         # if the bit does not have the correct value
-        dists = expand_to_rank(dists, tf.rank(b0), axis=-1)
-        d0 = tf.where(b0, dists, tf.constant(np.inf, dists.dtype))
-        d1 = tf.where(b1, dists, tf.constant(np.inf, dists.dtype))
+        dists = expand_to_rank(dists, b0.dim(), axis=-1)
+        d0 = torch.where(b0, dists, torch.tensor(float("inf"), dtype=dists.dtype, device=dists.device))
+        d1 = torch.where(b1, dists, torch.tensor(float("inf"), dtype=dists.dtype, device=dists.device))
 
         # Compute minimum distance for each bit in each stream
         # l0/l1: [batch_size, num_streams, num_bits_per_symbol]
-        l0 = tf.reduce_min(d0, axis=1)
-        l1 = tf.reduce_min(d1, axis=1)
+        l0, _ = d0.min(dim=1)
+        l1, _ = d1.min(dim=1)
 
         # Compute LLRs
-        llr = l0-l1
+        llr = l0 - l1
 
-        #  Clip LLRs
-        llr = tf.clip_by_value(llr, -self.llr_clip_val, self.llr_clip_val)
+        # Clip LLRs
+        llr = llr.clamp(-self._llr_clip_val, self._llr_clip_val)
 
         return llr
 

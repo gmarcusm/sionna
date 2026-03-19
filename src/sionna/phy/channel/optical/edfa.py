@@ -1,13 +1,19 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+"""Model for an Erbium-Doped Fiber Amplifier."""
 
-"""
-This module defines a model for an Erbium-Doped Fiber Amplifier.
-"""
-import tensorflow as tf
-from sionna.phy import config, constants
-from sionna.phy import Block
+from typing import Optional
+
+import torch
+
+from sionna.phy import Block, H
+from sionna.phy.utils import normal
+
+
+__all__ = ["EDFA"]
+
 
 class EDFA(Block):
     # pylint: disable=line-too-long
@@ -24,7 +30,7 @@ class EDFA(Block):
     :math:`\text{SNR}` is the signal-to-noise-ratio. Shot noise is
     neglected here but is required to derive the noise power of the amplifier, as
     otherwise the input SNR is infinitely large. Hence, for the input SNR,
-    it follows [A2012]_ that
+    it follows :cite:p:`A2012` that
     :math:`\mathrm{SNR}_\mathrm{in}=\frac{P}{2hf_cW}`, where :math:`h` denotes
     Planck's constant, :math:`P` is the signal power, and :math:`W` the
     considered bandwidth.
@@ -42,7 +48,7 @@ class EDFA(Block):
     \exp\left(\alpha \ell \right)`.
     The spontaneous emission factor is :math:`n_\mathrm{sp}=\frac{F}
     {2}\frac{G}{G-1}`.
-    According to [A2012]_ and [EKWFG2010]_ combined with [BGT2000]_ and [GD1991]_,
+    According to :cite:p:`A2012` and :cite:p:`EKWFG2010` combined with :cite:p:`BGT2000` and :cite:p:`GD1991`,
     the noise power spectral density of the EDFA per state of
     polarization is obtained as :math:`\rho_\mathrm{ASE}^{(1)} = n_\mathrm{sp}\left
     (G-1\right) h f_c=\frac{1}{2}G F h f_c`.
@@ -54,115 +60,111 @@ class EDFA(Block):
     Here, the notation :math:`()^{(1)}` means that this is the noise introduced by a
     single EDFA.
 
-    Example
-    --------
+    :param g: Amplifier gain (linear domain). Defaults to 4.0.
+    :param f: Noise figure (linear domain). Defaults to 7.0.
+    :param f_c: Carrier frequency :math:`f_\mathrm{c}` in :math:`(\text{Hz})`.
+        Defaults to 193.55e12.
+    :param dt: Time step :math:`\Delta_t` in :math:`(\text{s})`. Defaults to 1e-12.
+    :param with_dual_polarization: If `True`, considers axis [-2] as x- and
+        y-polarization and applies the noise per polarization. Defaults to `False`.
+    :param precision: Precision used for internal calculations and outputs.
+        If set to `None`, :attr:`~sionna.phy.config.Config.precision` is used.
+    :param device: Device for computation. If `None`,
+        :attr:`~sionna.phy.config.Config.device` is used.
 
-    Setting-up:
+    :input x: Tensor, `torch.complex`.
+        Optical input signal.
 
-    >>> edfa = EDFA(
-    >>>     g=4.0,
-    >>>     f=2.0,
-    >>>     f_c=193.55e12,
-    >>>     dt=1.0e-12,
-    >>>     with_dual_polarization=False)
+    :output y: Tensor (same shape as ``x``), `torch.complex`.
+        Amplifier output.
 
-    Running:
+    .. rubric:: Examples
 
-    >>> # x is the optical input signal
-    >>> y = EDFA(x)
+    .. code-block:: python
 
-    Parameters
-    ----------
-    g : `float`, (default 4.0)
-        Amplifier gain (linear domain)
+        import torch
+        from sionna.phy.channel.optical import EDFA
 
-    f : `float`, (default 7.0)
-        Noise figure (linear domain)
-
-    f_c : `float`, (default 193.55e12)
-        Carrier frequency :math:`f_\mathrm{c}` in :math:`(\text{Hz})`
-
-    dt : `float`, (default 1e-12)
-        Time step :math:`\Delta_t` in :math:`(\text{s})`
-
-    with_dual_polarization : `bool`, (default `False`)
-        Considers axis [-2] as x- and y-polarization and applies the noise
-        per polarization
-
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
-        If set to `None`,
-        :attr:`~sionna.phy.config.Config.precision` is used.
-
-    Input
-    -----
-    x : Tensor, `tf.complex`
-        Optical input signal
-
-    Output
-    -------
-    y : Tensor (same shape as ``x``), `tf.complex`
-        Amplifier output
-    """
-    def __init__(
-            self,
+        edfa = EDFA(
             g=4.0,
-            f=7.0,
+            f=2.0,
             f_c=193.55e12,
-            dt=1e-12,
-            with_dual_polarization=False,
-            precision=None,
-            **kwargs):
-        super().__init__(precision=precision, **kwargs)
-        self._g = tf.cast(g, self.rdtype)
-        self._f = tf.cast(f, self.rdtype)
-        self._f_c = tf.cast(f_c, self.rdtype)
-        self._dt = tf.cast(dt, self.rdtype)
+            dt=1.0e-12,
+            with_dual_polarization=False)
 
-        assert isinstance(with_dual_polarization, bool), \
-                            "with_dual_polarization must be bool."
+        # x is the optical input signal
+        x = torch.randn(10, 100, dtype=torch.complex64)
+        y = edfa(x)
+        print(y.shape)
+        # torch.Size([10, 100])
+    """
+
+    def __init__(
+        self,
+        g: float = 4.0,
+        f: float = 7.0,
+        f_c: float = 193.55e12,
+        dt: float = 1e-12,
+        with_dual_polarization: bool = False,
+        precision: Optional[str] = None,
+        device: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(precision=precision, device=device, **kwargs)
+
+        # Register as buffers for CUDAGraph compatibility
+        self.register_buffer("_g", torch.tensor(g, dtype=self.dtype, device=self.device))
+        self.register_buffer("_f", torch.tensor(f, dtype=self.dtype, device=self.device))
+        self.register_buffer("_f_c", torch.tensor(f_c, dtype=self.dtype, device=self.device))
+        self.register_buffer("_dt", torch.tensor(dt, dtype=self.dtype, device=self.device))
+
+        assert isinstance(
+            with_dual_polarization, bool
+        ), "with_dual_polarization must be bool."
         self._with_dual_polarization = with_dual_polarization
 
         # Spontaneous emission factor
         if self._g == 1.0:
-            self._n_sp = tf.cast(0.0, self.rdtype)
+            self.register_buffer("_n_sp", torch.tensor(0.0, dtype=self.dtype, device=self.device))
         else:
-            self._n_sp = self._f / tf.cast(
-                2.0, self.rdtype) * self._g / (
-                                 self._g - tf.cast(1.0, self.rdtype))
+            self.register_buffer("_n_sp", self._f / 2.0 * self._g / (self._g - 1.0))
 
-        self._rho_n_ase = tf.cast(
-            self._n_sp * (self._g - tf.cast(1.0, self.rdtype)) *
-            constants.H * self._f_c,
-            self.rdtype)  # Noise density in (W/Hz)
-        self._p_n_ase = tf.cast(
-            2.0, self.rdtype) * self._rho_n_ase * tf.cast(
-            1.0, self.rdtype) / (self._dt)  # Noise power in (W)
+        self._rho_n_ase = (
+            self._n_sp * (self._g - 1.0) * H * self._f_c
+        )  # Noise density in (W/Hz)
+
+        self._p_n_ase = 2.0 * self._rho_n_ase / self._dt  # Noise power in (W)
 
         if self._with_dual_polarization:
-            self._p_n_ase = self._p_n_ase / tf.cast(2.0, self.rdtype)
+            self._p_n_ase = self._p_n_ase / 2.0
 
-    def call(self, inputs):
+    def call(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Process the optical input signal through the EDFA.
+
+        :param inputs: Optical input signal
+
+        :output y: Amplified signal with ASE noise
+        """
         if self._with_dual_polarization:
-            tf.assert_equal(tf.shape(inputs)[-2], 2)
+            assert (
+                inputs.shape[-2] == 2
+            ), "For dual polarization, second to last dimension must be 2."
 
-        x = tf.cast(inputs, self.cdtype)
+        x = inputs.to(dtype=self.cdtype, device=self.device)
 
         # Calculate noise signal with given noise power
-        n = tf.complex(
-            config.tf_rng.normal(
-                tf.shape(x),
-                tf.cast(0.0, self.rdtype),
-                tf.sqrt(self._p_n_ase / tf.cast(2.0, self.rdtype)),
-                self.rdtype),
-            config.tf_rng.normal(
-                tf.shape(x),
-                tf.cast(0.0, self.rdtype),
-                tf.sqrt(self._p_n_ase / tf.cast(2.0, self.rdtype)),
-                self.rdtype))
+        # Uses smart randn that switches to global RNG in compiled mode
+        noise_std = torch.sqrt(self._p_n_ase / 2.0)
+        n_real = normal(
+            x.shape, dtype=self.dtype, device=self.device, generator=self.torch_rng
+        ) * noise_std
+        n_imag = normal(
+            x.shape, dtype=self.dtype, device=self.device, generator=self.torch_rng
+        ) * noise_std
+        n = torch.complex(n_real, n_imag)
 
         # Amplify signal
-        x = x * tf.cast(tf.sqrt(self._g), self.cdtype)
+        x = x * torch.sqrt(self._g).to(self.cdtype)
 
         # Add noise signal
         y = x + n

@@ -1,64 +1,85 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
 """Functions to compute frequently used metrics in Sionna PHY"""
 
-import tensorflow as tf
-from sionna.phy import dtypes
+import torch
+from sionna.phy.config import dtypes, Precision
 
-def compute_ber(b, b_hat, precision="double"):
-    """Computes the bit error rate (BER) between two binary tensors
+__all__ = [
+    "compute_ber",
+    "compute_ser",
+    "compute_bler",
+    "count_errors",
+    "count_block_errors",
+]
 
-    Input
-    -----
-    b : `tf.float` or `tf.int`
-        A tensor of arbitrary shape filled with ones and
-        zeros
 
-    b_hat : `tf.float` or `tf.int`
-        A tensor like ``b``
+def compute_ber(
+    b: torch.Tensor, b_hat: torch.Tensor, precision: Precision = "double"
+) -> torch.Tensor:
+    """Computes the bit error rate (BER) between two binary tensors.
 
-    precision : `str`, "single" | "double" (default)
-        Precision used for internal calculations and outputs
+    :param b: A tensor of arbitrary shape filled with ones and zeros.
+    :param b_hat: A tensor like ``b``.
+    :param precision: Precision used for internal calculations and outputs.
+        Defaults to ``"double"``.
 
-    Output
-    ------
-    : `tf.float`
-        BER
+    :output ber: `torch.float`.
+        BER.
+
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        import torch
+        from sionna.phy.utils import compute_ber
+
+        b = torch.tensor([0, 1, 0, 1])
+        b_hat = torch.tensor([0, 1, 1, 0])
+        print(compute_ber(b, b_hat).item())
+        # 0.5
     """
-    b_hat = tf.cast(b_hat, b.dtype)
-    rdtype = dtypes[precision]["tf"]["rdtype"]
-    ber = tf.not_equal(b, b_hat)
-    ber = tf.cast(ber, rdtype)
-    return tf.reduce_mean(ber)
+    b_hat = b_hat.to(b.dtype)
+    rdtype = dtypes[precision]["torch"]["dtype"]
+    ber = torch.ne(b, b_hat)
+    ber = ber.to(rdtype)
+    return torch.mean(ber)
 
-def compute_ser(s, s_hat, precision="double"):
-    """Computes the symbol error rate (SER) between two integer tensors
 
-    Input
-    -----
-    s : `tf.float` or `tf.int`
-        A tensor of arbitrary shape filled with integers
+def compute_ser(
+    s: torch.Tensor, s_hat: torch.Tensor, precision: Precision = "double"
+) -> torch.Tensor:
+    """Computes the symbol error rate (SER) between two integer tensors.
 
-    s_hat : `tf.float` or `tf.int`
-        A tensor like ``s``
+    :param s: A tensor of arbitrary shape filled with integers.
+    :param s_hat: A tensor like ``s``.
+    :param precision: Precision used for internal calculations and outputs.
+        Defaults to ``"double"``.
 
-    precision : `str`, "single" | "double" (default)
-        Precision used for internal calculations and outputs
+    :output ser: `torch.float`.
+        SER.
 
-    Output
-    ------
-    : `tf.float`
-        SER
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        import torch
+        from sionna.phy.utils import compute_ser
+
+        s = torch.tensor([0, 1, 2, 3])
+        s_hat = torch.tensor([0, 1, 3, 2])
+        print(compute_ser(s, s_hat).item())
+        # 0.5
     """
-    s_hat = tf.cast(s_hat, s.dtype)
-    rdtype = dtypes[precision]["tf"]["rdtype"]
-    ser = tf.not_equal(s, s_hat)
-    ser = tf.cast(ser, rdtype)
-    return tf.reduce_mean(ser)
+    return compute_ber(s, s_hat, precision)
 
-def compute_bler(b, b_hat, precision="double"):
-    """Computes the block error rate (BLER) between two binary tensors
+
+def compute_bler(
+    b: torch.Tensor, b_hat: torch.Tensor, precision: Precision = "double"
+) -> torch.Tensor:
+    """Computes the block error rate (BLER) between two binary tensors.
 
     A block error happens if at least one element of ``b`` and ``b_hat``
     differ in one block. The BLER is evaluated over the last dimension of
@@ -68,53 +89,63 @@ def compute_bler(b, b_hat, precision="double"):
     This is also sometimes referred to as `word error rate` or `frame error
     rate`.
 
-    Input
-    -----
-    b : `tf.float` or `tf.int`
-        A tensor of arbitrary shape filled with ones and
-        zeros
+    :param b: A tensor of arbitrary shape filled with ones and zeros.
+    :param b_hat: A tensor like ``b``.
+    :param precision: Precision used for internal calculations and outputs.
+        Defaults to ``"double"``.
 
-    b_hat : `tf.float` or `tf.int`
-        A tensor like ``b``
+    :output bler: `torch.float`.
+        BLER.
 
-    precision : `str`, "single" | "double" (default)
-        Precision used for internal calculations and outputs
+    .. rubric:: Examples
 
-    Output
-    ------
-    : `tf.float`
-        BLER
+    .. code-block:: python
+
+        import torch
+        from sionna.phy.utils import compute_bler
+
+        b = torch.tensor([[0, 1], [1, 0]])
+        b_hat = torch.tensor([[0, 1], [1, 1]])
+        # The first block is correct, the second block is incorrect
+        print(compute_bler(b, b_hat).item())
+        # 0.5
     """
-    b_hat = tf.cast(b_hat, b.dtype)
-    rdtype = dtypes[precision]["tf"]["rdtype"]
-    bler = tf.reduce_any(tf.not_equal(b, b_hat), axis=-1)
-    bler = tf.cast(bler, rdtype)
-    return tf.reduce_mean(bler)
+    b_hat = b_hat.to(b.dtype)
+    rdtype = dtypes[precision]["torch"]["dtype"]
+    bler = torch.any(torch.ne(b, b_hat), dim=-1)
+    bler = bler.to(rdtype)
+    return torch.mean(bler)
 
-def count_errors(b, b_hat):
-    """Counts the number of bit errors between two binary tensors
 
-    Input
-    -----
-    b : `tf.float` or `tf.int`
-        A tensor of arbitrary shape filled with ones and
-        zeros
+def count_errors(b: torch.Tensor, b_hat: torch.Tensor) -> torch.Tensor:
+    """Counts the number of bit errors between two binary tensors.
 
-    b_hat : `tf.float` or `tf.int`
-        A tensor like ``b``
+    :param b: A tensor of arbitrary shape filled with ones and zeros.
+    :param b_hat: A tensor like ``b``.
 
-    Output
-    ------
-    : `tf.int64`
-        Number of bit errors
+    :output num_errors: `torch.int64`.
+        Number of bit errors.
+
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        import torch
+        from sionna.phy.utils import count_errors
+
+        b = torch.tensor([0, 1, 0, 1])
+        b_hat = torch.tensor([0, 1, 1, 0])
+        print(count_errors(b, b_hat).item())
+        # 2
     """
-    b_hat = tf.cast(b_hat, b.dtype)
-    errors = tf.not_equal(b, b_hat)
-    errors = tf.cast(errors, tf.int64)
-    return tf.reduce_sum(errors)
+    b_hat = b_hat.to(b.dtype)
+    errors = torch.ne(b, b_hat)
+    errors = errors.to(torch.int64)
+    return torch.sum(errors)
 
-def count_block_errors(b, b_hat):
-    """Counts the number of block errors between two binary tensors
+
+def count_block_errors(b: torch.Tensor, b_hat: torch.Tensor) -> torch.Tensor:
+    """Counts the number of block errors between two binary tensors.
 
     A block error happens if at least one element of ``b`` and ``b_hat``
     differ in one block. The BLER is evaluated over the last dimension of
@@ -124,22 +155,25 @@ def count_block_errors(b, b_hat):
     This is also sometimes referred to as `word error rate` or `frame error
     rate`.
 
-    Input
-    -----
-    b : `tf.float` or `tf.int`
-        A tensor of arbitrary shape filled with ones and
-        zeros
+    :param b: A tensor of arbitrary shape filled with ones and zeros.
+    :param b_hat: A tensor like ``b``.
 
-    b_hat : `tf.float` or `tf.int`
-        A tensor like ``b``
+    :output num_errors: `torch.int64`.
+        Number of block errors.
 
-    Output
-    ------
-    : `tf.int64`
-        Number of block errors
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        import torch
+        from sionna.phy.utils import count_block_errors
+
+        b = torch.tensor([[0, 1], [1, 0]])
+        b_hat = torch.tensor([[0, 1], [1, 1]])
+        print(count_block_errors(b, b_hat).item())
+        # 1
     """
-    b_hat = tf.cast(b_hat, b.dtype)
-    errors = tf.reduce_any(tf.not_equal(b,b_hat), axis=-1)
-    errors = tf.cast(errors, tf.int64)
-    return tf.reduce_sum(errors)
-
+    b_hat = b_hat.to(b.dtype)
+    errors = torch.any(torch.ne(b, b_hat), dim=-1)
+    errors = errors.to(torch.int64)
+    return torch.sum(errors)

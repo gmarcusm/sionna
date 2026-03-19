@@ -1,59 +1,102 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
 """Utility functions for LDPC decoding."""
 
-import tensorflow as tf
+from typing import Optional, Union
+
 import matplotlib.pyplot as plt
+import numpy as np
+import scipy.sparse as sp
+import torch
+
+from sionna.phy.object import Object
 from sionna.phy.fec.utils import llr2mi
-from sionna.phy.block import Object
 
 
-class EXITCallback():
+__all__ = [
+    "EXITCallback",
+    "DecoderStatisticsCallback",
+    "WeightedBPCallback",
+]
+
+
+class EXITCallback(Object):
     # pylint: disable=line-too-long
     """Callback for the LDPCBPDecoder to track EXIT statistics.
 
-    Can be registered as ``c2v_callbacks`` ``v2c_callbacks`` in the
+    Can be registered as ``c2v_callbacks`` or ``v2c_callbacks`` in the
     :class:`~sionna.phy.fec.ldpc.decoding.LDPCBPDecoder` and the
     :class:`~sionna.phy.fec.ldpc.decoding.LDPC5GDecoder`.
 
     This callback requires all-zero codeword simulations.
 
-    Parameters
-    ----------
-    num_iter: int
-        Maximum number of decoding iterations.
+    :param num_iter: Maximum number of decoding iterations.
+    :param device: Device for computation (e.g., 'cpu', 'cuda:0').
 
-    Input
-    -----
-    msg: [num_vns, None, batch_size], tf.ragged, tf.float
-        The v2c or c2v messages as ragged tensor
+    :input msg: [batch_size, num_vns, max_degree], `torch.float`.
+        The v2c or c2v messages.
 
-    it: int
-        Current number of decoding iterations
+    :input it: `int`.
+        Current number of decoding iterations.
 
-    Output
-    ------
-    : tf.ragged, tf.float
-        Same as ``msg``
+    :output msg: `torch.float`.
+        Same as ``msg``.
 
+    .. rubric:: Examples
+
+
+    .. code-block:: python
+
+        from sionna.phy.fec.ldpc import LDPCBPDecoder
+        from sionna.phy.fec.ldpc.utils import EXITCallback
+
+        # Create callback
+        exit_cb = EXITCallback(num_iter=20)
+
+        # Create decoder with callback
+        decoder = LDPCBPDecoder(pcm, v2c_callbacks=[exit_cb])
+
+        # After decoding, access mutual information
+        mi = exit_cb.mi
     """
-    def __init__(self, num_iter):
-        self._mi = tf.Variable(tf.zeros(num_iter+1), dtype=tf.float32)
-        self._num_samples = tf.Variable(tf.zeros(num_iter+1), dtype=tf.float32)
+
+    def __init__(
+        self,
+        num_iter: int,
+        device: Optional[str] = None,
+    ):
+        super().__init__(device=device)
+        self.register_buffer("_mi", torch.zeros(num_iter + 1, dtype=torch.float32, device=self.device))
+        self.register_buffer("_num_samples", torch.zeros(
+            num_iter + 1, dtype=torch.float32, device=self.device
+        ))
 
     @property
-    def mi(self):
+    def mi(self) -> torch.Tensor:
         """Mutual information after each iteration"""
         return self._mi / self._num_samples
 
-    def __call__(self, msg, it, *args, **kwargs):
-        self._mi[it].assign(llr2mi(-1*msg.flat_values)+self._mi[it])
-        self._num_samples[it].assign(1.+self._num_samples[it])
+    def __call__(
+        self,
+        msg: torch.Tensor,
+        it: int,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Process messages and update EXIT statistics."""
+        # Flatten messages and compute MI (exclude padded values)
+        msg_flat = msg.reshape(-1)
+        nonzero_mask = msg_flat != 0
+        if nonzero_mask.any():
+            mi_val = llr2mi(-1 * msg_flat[nonzero_mask])
+            self._mi[it] = self._mi[it] + mi_val
+        self._num_samples[it] = self._num_samples[it] + 1.0
         return msg
 
 
-class DecoderStatisticsCallback():
+class DecoderStatisticsCallback(Object):
     """Callback for the LDPCBPDecoder to track decoder statistics.
 
     Can be registered as ``c2v_callbacks`` in the
@@ -65,100 +108,120 @@ class DecoderStatisticsCallback():
     This overestimates the success-rate as it includes cases where the decoder
     converges to the wrong codeword.
 
-    Parameters
-    ----------
-        num_iter: int
-            Maximum number of decoding iterations.
+    :param num_iter: Maximum number of decoding iterations.
+    :param device: Device for computation (e.g., 'cpu', 'cuda:0').
 
-    Input
-    -----
-    msg: [num_vns, None, batch_size], tf.ragged, tf.float
-        v2c messages as ragged tensor
+    :input msg: [batch_size, num_vns, max_degree], `torch.float`.
+        v2c messages.
 
-    it: int
-        Current number of decoding iterations
+    :input it: `int`.
+        Current number of decoding iterations.
 
-    Output
-    ------
-    : tf.ragged, tf.float
-        Same as ``msg``
+    :output msg: `torch.float`.
+        Same as ``msg``.
+
+    .. rubric:: Examples
+
+
+    .. code-block:: python
+
+        from sionna.phy.fec.ldpc import LDPCBPDecoder
+        from sionna.phy.fec.ldpc.utils import DecoderStatisticsCallback
+
+        # Create callback
+        stats_cb = DecoderStatisticsCallback(num_iter=20)
+
+        # Create decoder with callback
+        decoder = LDPCBPDecoder(pcm, c2v_callbacks=[stats_cb])
+
+        # After decoding, access statistics
+        print(stats_cb.success_rate)
+        print(stats_cb.avg_number_iterations)
     """
-    def __init__(self, num_iter):
-        self._num_samples = tf.Variable(tf.zeros((num_iter,), tf.int64),
-                                        dtype=tf.int64)
-        self._decoded_samples = tf.Variable(tf.zeros((num_iter,), tf.int64),
-                                            dtype=tf.int64)
+
+    def __init__(
+        self,
+        num_iter: int,
+        device: Optional[str] = None,
+    ):
+        super().__init__(device=device)
         self._num_iter = num_iter
+        self.register_buffer("_num_samples", torch.zeros(num_iter, dtype=torch.int64, device=self.device))
+        self.register_buffer("_decoded_samples", torch.zeros(
+            num_iter, dtype=torch.int64, device=self.device
+        ))
 
     @property
-    def num_samples(self):
+    def num_samples(self) -> torch.Tensor:
         """Total number of processed codewords"""
         return self._num_samples
 
     @property
-    def num_decoded_cws(self):
+    def num_decoded_cws(self) -> torch.Tensor:
         """Number of decoded codewords after each iteration"""
         return self._decoded_samples
 
     @property
-    def success_rate(self):
+    def success_rate(self) -> torch.Tensor:
         """Success rate after each iteration"""
-        succ = tf.cast(self._decoded_samples, tf.float64)
-        num_samples = tf.cast(self._num_samples, tf.float64)
-        return succ/num_samples
+        succ = self._decoded_samples.to(torch.float64)
+        num_samples = self._num_samples.to(torch.float64)
+        return succ / num_samples
 
     @property
-    def avg_number_iterations(self):
+    def avg_number_iterations(self) -> torch.Tensor:
         """Average number of decoding iterations"""
-        num_decoded = tf.cast(self._decoded_samples, tf.float64)
-        num_samples = tf.cast(self._num_samples, tf.float64)
+        num_decoded = self._decoded_samples.to(torch.float64)
+        num_samples = self._num_samples.to(torch.float64)
 
         num_active = num_samples - num_decoded
-
-        total_iters = tf.reduce_sum(num_active)
+        total_iters = num_active.sum()
         avg_iter = total_iters / num_samples[0]
         return avg_iter
 
-    def reset_stats(self):
+    def reset_stats(self) -> None:
         """Reset internal statistics"""
-        self._num_samples.assign(tf.zeros((self._num_iter,), tf.int64))
-        self._decoded_samples.assign(tf.zeros((self._num_iter,), tf.int64))
+        self.register_buffer("_num_samples", torch.zeros(
+            self._num_iter, dtype=torch.int64, device=self.device
+        ))
+        self.register_buffer("_decoded_samples", torch.zeros(
+            self._num_iter, dtype=torch.int64, device=self.device
+        ))
 
-    def __call__(self, msg, it, *args, **kwargs):
-        # check sign of each CN
-        sign_val = tf.ragged.map_flat_values(lambda x :
-                                         tf.where(tf.equal(x, 0),
-                                         tf.ones_like(x), x),
-                                         tf.sign(msg))
-        # calculate sign of entire node
-        sign_node = tf.reduce_prod(sign_val, axis=1)
-        node_success = tf.where(sign_node>0, True, False)
-        cw_success = tf.reduce_all(node_success, axis=0)
-        x = tf.where(cw_success, 1., 0)
-        x = tf.reduce_sum(x)
+    def __call__(
+        self,
+        msg: torch.Tensor,
+        it: int,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Process messages and update decoder statistics."""
+        # msg shape: [batch_size, num_nodes, max_degree]
+        sign_val = torch.sign(msg)
+        sign_val = torch.where(sign_val == 0, torch.ones_like(sign_val), sign_val)
 
-        # and update internal variables
-        num_samples = tf.cast(msg.shape[-1], tf.int64)
-        num_decoded = tf.cast(x, tf.int64)
-        updates = tf.tensor_scatter_nd_update(
-                                    tf.zeros([self._num_iter,], tf.int64),
-                                    [[it]], [num_samples])
-        self._num_samples.assign_add(updates)
+        sign_node = sign_val.prod(dim=2)  # [bs, num_nodes]
 
-        updates = tf.tensor_scatter_nd_update(
-                                    tf.zeros([self._num_iter,], tf.int64),
-                                    [[it]], [num_decoded])
-        self._decoded_samples.assign_add(updates)
-        # return original message for compatibility with callbacks
+        node_success = sign_node > 0  # [bs, num_nodes]
+        cw_success = node_success.all(dim=1)  # [bs]
+
+        num_decoded = cw_success.sum().to(torch.int64)
+        batch_size = msg.shape[0]
+
+        # Update statistics
+        if it < self._num_iter:
+            self._num_samples[it] = self._num_samples[it] + batch_size
+            self._decoded_samples[it] = self._decoded_samples[it] + num_decoded
+
         return msg
+
 
 class WeightedBPCallback(Object):
     # pylint: disable=line-too-long
-    r"""Callback for the LDPCBPDecoder to enable weighted BP [Nachmani]_.
+    r"""Callback for the LDPCBPDecoder to enable weighted BP :cite:p:`Nachmani`.
 
     The BP decoder is fully differentiable and can be made trainable
-    by following the concept of `weighted BP` [Nachmani]_ as shown in Fig. 1
-    leading to
+    by following the concept of *weighted BP* :cite:p:`Nachmani` leading to
 
     .. math::
         y_{j \to i} = 2 \operatorname{tanh}^{-1} \left( \prod_{i' \in \mathcal{N}(j) \setminus i} \operatorname{tanh} \left( \frac{\textcolor{red}{w_{i' \to j}} \cdot x_{i' \to j}}{2} \right) \right)
@@ -167,70 +230,184 @@ class WeightedBPCallback(Object):
     :math:`x_{i \to j}`.
     Please note that the training of some check node types may be not supported.
 
-    ..  figure:: ../figures/weighted_bp.png
-
-        Fig. 1: Weighted BP as proposed in [Nachmani]_.
-
     Can be registered as ``c2v_callbacks`` and ``v2c_callbacks`` in the
     :class:`~sionna.phy.fec.ldpc.decoding.LDPCBPDecoder` and the
     :class:`~sionna.phy.fec.ldpc.decoding.LDPC5GDecoder`.
 
-    Parameters
-    ----------
-    num_edges: int
-        Number of edges in the decoding graph
+    :param num_edges: Number of edges in the decoding graph.
+    :param pcm: Optional parity-check matrix. If provided, enables weighted BP
+        in padded message format used by the decoder.
+    :param precision: Precision used for internal calculations and outputs.
+        If set to `None`, :py:attr:`~sionna.phy.config.precision` is used.
+    :param device: Device for computation (e.g., 'cpu', 'cuda:0').
 
-    precision : `None` (default) | 'single' | 'double'
-        Precision used for internal calculations and outputs.
-        If set to `None`, :py:attr:`~sionna.config.precision` is used.
+    :input msg: [batch_size, num_vns, max_degree], `torch.float`.
+        v2c messages.
 
-    Input
-    -----
-    msg: [num_vns, None, batch_size], tf.ragged, tf.float
-        v2c messages as ragged tensor
+    :output msg: `torch.float`.
+        Same as ``msg``.
 
-    Output
-    ------
-    : tf.ragged, tf.float
-        Same as ``msg``
+    .. rubric:: Examples
+
+
+    .. code-block:: python
+
+        from sionna.phy.fec.ldpc import LDPCBPDecoder
+        from sionna.phy.fec.ldpc.utils import WeightedBPCallback
+        import numpy as np
+
+        # Create a simple parity-check matrix
+        pcm = np.array([[1, 1, 0, 1], [0, 1, 1, 1]])
+
+        # Create callback with trainable weights
+        weighted_cb = WeightedBPCallback(num_edges=np.sum(pcm), pcm=pcm)
+
+        # Create decoder with callback
+        decoder = LDPCBPDecoder(pcm, v2c_callbacks=[weighted_cb])
+
+        # Access trainable weights
+        print(weighted_cb.weights)
     """
-    def __init__(self, num_edges, precision=None, **kwargs):
-        """Nothing to init"""
-        super().__init__(precision=precision, **kwargs)
 
-        self._edge_weights = tf.Variable(tf.ones((num_edges,)),
-                                         trainable=True,
-                                         dtype=self.rdtype)
+    def __init__(
+        self,
+        num_edges: int,
+        pcm: Optional[Union[np.ndarray, sp.spmatrix]] = None,
+        precision: Optional[str] = None,
+        device: Optional[str] = None,
+        **kwargs,
+    ):
+        super().__init__(precision=precision, device=device, **kwargs)
+
+        # Note: Using nn.Parameter instead of register_buffer since requires_grad=True
+        self._edge_weights = torch.nn.Parameter(torch.ones(
+            num_edges, dtype=self.dtype, device=self.device
+        ))
+
+        # Build indices for padded format if PCM is provided
+        self._has_pcm = pcm is not None
+        if self._has_pcm:
+            self._build_padded_indices(pcm)
+
+    def _build_padded_indices(
+        self, pcm: Union[np.ndarray, sp.spmatrix]
+    ) -> None:
+        """Build index arrays for mapping flat edge weights to padded format"""
+        # Convert to sparse if needed
+        if isinstance(pcm, np.ndarray):
+            pcm_sparse = sp.csr_matrix(pcm)
+        else:
+            pcm_sparse = pcm
+
+        # Get edge indices (same logic as in LDPCBPDecoder)
+        cn_idx, vn_idx, _ = sp.find(pcm_sparse)
+
+        # Sort by VN index (for VN-padded format)
+        idx_vn_sorted = np.argsort(vn_idx)
+        vn_idx_sorted = vn_idx[idx_vn_sorted]
+
+        # Sort by CN index (for CN-padded format)
+        idx_cn_sorted = np.argsort(cn_idx)
+
+        num_vns = pcm.shape[1]
+        num_cns = pcm.shape[0]
+
+        # Compute row splits for VN perspective
+        vn_row_splits = np.zeros(num_vns + 1, dtype=np.int64)
+        for i in vn_idx_sorted:
+            vn_row_splits[i + 1] += 1
+        vn_row_splits = np.cumsum(vn_row_splits)
+
+        # Compute row splits for CN perspective
+        cn_idx_sorted = cn_idx[idx_cn_sorted]
+        cn_row_splits = np.zeros(num_cns + 1, dtype=np.int64)
+        for i in cn_idx_sorted:
+            cn_row_splits[i + 1] += 1
+        cn_row_splits = np.cumsum(cn_row_splits)
+
+        # Compute max degrees
+        vn_degrees = np.diff(vn_row_splits)
+        cn_degrees = np.diff(cn_row_splits)
+        max_vn_degree = int(vn_degrees.max()) if len(vn_degrees) > 0 else 0
+        max_cn_degree = int(cn_degrees.max()) if len(cn_degrees) > 0 else 0
+
+        # Build VN gather index: maps (vn, position) -> edge_index
+        vn_gather_idx = np.zeros((num_vns, max_vn_degree), dtype=np.int64)
+        for vn in range(num_vns):
+            start = vn_row_splits[vn]
+            end = vn_row_splits[vn + 1]
+            degree = end - start
+            if degree > 0:
+                # idx_vn_sorted gives original edge indices sorted by VN
+                vn_gather_idx[vn, :degree] = idx_vn_sorted[start:end]
+
+        # Build CN gather index: maps (cn, position) -> edge_index
+        cn_gather_idx = np.zeros((num_cns, max_cn_degree), dtype=np.int64)
+        for cn in range(num_cns):
+            start = cn_row_splits[cn]
+            end = cn_row_splits[cn + 1]
+            degree = end - start
+            if degree > 0:
+                cn_gather_idx[cn, :degree] = idx_cn_sorted[start:end]
+
+        # Register as buffers
+        self.register_buffer(
+            "_vn_gather_idx",
+            torch.tensor(vn_gather_idx, dtype=torch.long, device=self.device)
+        )
+        self.register_buffer(
+            "_cn_gather_idx",
+            torch.tensor(cn_gather_idx, dtype=torch.long, device=self.device)
+        )
+        self._num_vns = num_vns
+        self._num_cns = num_cns
+        self._max_vn_degree = max_vn_degree
+        self._max_cn_degree = max_cn_degree
 
     @property
-    def weights(self):
+    def weights(self) -> torch.Tensor:
+        """Trainable edge weights"""
         return self._edge_weights
 
-    def show_weights(self, size=7):
+    def show_weights(self, size: float = 7) -> None:
         """Show histogram of trainable weights.
 
-        Input
-        -----
-            size: float
-                Figure size of the matplotlib figure.
+        :param size: Figure size of the matplotlib figure.
         """
-        plt.figure(figsize=(size,size))
-        plt.hist(self._edge_weights.numpy(), density=True, bins=20, align='mid')
-        plt.xlabel('weight value')
-        plt.ylabel('density')
-        plt.grid(True, which='both', axis='both')
-        plt.title('Weight Distribution')
+        plt.figure(figsize=(size, size))
+        plt.hist(self._edge_weights.detach().cpu().numpy(), density=True, bins=20, align="mid")
+        plt.xlabel("weight value")
+        plt.ylabel("density")
+        plt.grid(True, which="both", axis="both")
+        plt.title("Weight Distribution")
 
-    def _mult_weights(self, x):
+    def __call__(
+        self,
+        msg: torch.Tensor,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
         """Multiply messages with trainable weights for weighted BP."""
-        # transpose for simpler broadcasting of training variables
-        x = tf.transpose(x, (1, 0))
-        x = tf.math.multiply(x, self._edge_weights)
-        x = tf.transpose(x, (1, 0))
-        return x
+        if msg.dim() == 2:
+            # Flat format [batch_size, num_edges]
+            msg = msg * self._edge_weights  # broadcasts [bs, num_edges] * [num_edges]
+        elif msg.dim() == 3 and self._has_pcm:
+            # Padded format [batch_size, num_nodes, max_degree]
+            num_nodes = msg.shape[1]
+            max_degree = msg.shape[2]
 
-    def __call__(self, msg, *args):
-        # transpose for simpler broadcasting of training variables
-        # Remark: BP uses internal shape [num_edges, batchsize]
-        msg = tf.ragged.map_flat_values(self._mult_weights, msg)
+            if num_nodes == self._num_vns and max_degree == self._max_vn_degree:
+                gather_idx = self._vn_gather_idx
+            elif num_nodes == self._num_cns and max_degree == self._max_cn_degree:
+                gather_idx = self._cn_gather_idx
+            else:
+                return msg
+
+            weights_padded = self._edge_weights[gather_idx]  # [num_nodes, max_degree]
+
+            # [bs, num_nodes, max_degree] * [1, num_nodes, max_degree]
+            msg = msg * weights_padded.unsqueeze(0)
+
         return msg
+
+

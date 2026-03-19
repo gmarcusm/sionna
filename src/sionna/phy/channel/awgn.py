@@ -1,47 +1,36 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
 """Block for simulating an AWGN channel"""
 
-import tensorflow as tf
-from sionna.phy.block import Block
+from typing import Optional, Union
+import torch
+
+from sionna.phy import Block
+from sionna.phy.config import Precision
 from sionna.phy.utils import expand_to_rank, complex_normal
 
-class AWGN(Block):
-    r"""
-    Add complex AWGN to the inputs with a certain variance
+__all__ = ["AWGN"]
 
-    This layer blocks complex AWGN noise with variance ``no`` to the input.
+
+class AWGN(Block):
+    r"""Add complex AWGN to the inputs with a certain variance.
+
+    This block adds complex AWGN noise with variance ``no`` to the input.
     The noise has variance ``no/2`` per real dimension.
     It can be either a scalar or a tensor which can be broadcast to the shape
     of the input.
 
-    Example
-    --------
+    :param precision: Precision used for internal calculations and outputs.
+        If set to `None`, :attr:`~sionna.phy.config.Config.precision` is used.
+    :param device: Device for computation. If `None`,
+        :attr:`~sionna.phy.config.Config.device` is used.
 
-    Setting-up:
+    :input x: [...], `torch.complex`.
+        Channel input.
 
-    >>> awgn_channel = AWGN()
-
-    Running:
-
-    >>> # x is the channel input
-    >>> # no is the noise variance
-    >>> y = awgn_channel(x, no)
-
-    Parameters
-    ----------
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
-        If set to `None`,
-        :attr:`~sionna.phy.config.Config.precision` is used.
-
-    Input
-    -----
-    x :  Tensor, tf.complex
-        Channel input
-
-    no : Scalar or Tensor, `tf.float`
+    :input no: Scalar or Tensor, `torch.float`.
         Scalar or tensor whose shape can be broadcast to the shape of ``x``.
         The noise power ``no`` is per complex dimension. If ``no`` is a
         scalar, noise of the same variance will be added to the input.
@@ -51,28 +40,53 @@ class AWGN(Block):
         ``x``, then ``no`` will be broadcast to the shape of ``x`` by adding
         dummy dimensions after the last axis.
 
-    Output
-    -------
-        y : Tensor with same shape as ``x``, `tf.complex`
-            Channel output
+    :output y: Tensor with same shape as ``x``, `torch.complex`.
+        Channel output.
+
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        import torch
+        from sionna.phy.channel import AWGN
+
+        awgn_channel = AWGN()
+        x = torch.randn(64, 16, dtype=torch.complex64)
+        no = 0.1
+        y = awgn_channel(x, no)
+        print(y.shape)
+        # torch.Size([64, 16])
     """
 
-    def __init__(self, *, precision=None, **kwargs):
-        super().__init__(precision=precision, **kwargs)
+    def __init__(
+        self,
+        precision: Optional[Precision] = None,
+        device: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(precision=precision, device=device, **kwargs)
 
-    def call(self, x, no):
+    def call(
+        self,
+        x: torch.Tensor,
+        no: Union[float, torch.Tensor],
+    ) -> torch.Tensor:
+        """Apply AWGN to the input."""
+        # Create tensor of complex-valued Gaussian noise with unit variance
+        # Uses smart random that switches to global RNG in compiled mode for graph fusion
+        noise = complex_normal(x.shape, precision=self.precision, device=self.device,
+                               generator=self.torch_rng)
 
-        # Create tensors of real-valued Gaussian noise for each complex dim.
-        noise = complex_normal(tf.shape(x), precision=self.precision)
+        # Convert no to tensor if it's a scalar
+        if not isinstance(no, torch.Tensor):
+            no = torch.tensor(no, dtype=self.dtype, device=self.device)
 
         # Add extra dimensions for broadcasting
-        no = expand_to_rank(no, tf.rank(x), axis=-1)
+        no = expand_to_rank(no, x.dim(), axis=-1)
 
         # Apply variance scaling
-        no = tf.cast(no, self.rdtype)
-        noise *= tf.cast(tf.sqrt(no), noise.dtype)
+        no = no.to(dtype=self.dtype, device=self.device)
+        noise = noise * no.sqrt().to(dtype=self.cdtype)
 
         # Add noise to input
-        y = x + noise
-
-        return y
+        return x + noise

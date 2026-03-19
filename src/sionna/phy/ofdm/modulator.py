@@ -1,124 +1,176 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
-"""Class definition for the OFDM Modulator"""
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+from typing import Optional, Union
 
-import tensorflow as tf
-from tensorflow.signal import ifftshift
+import numpy as np
+import torch
 
 from sionna.phy import Block
-from sionna.phy.utils import flatten_last_dims
+from sionna.phy.config import Precision
 from sionna.phy.signal import ifft
+from sionna.phy.utils import flatten_last_dims
+
+__all__ = ["OFDMModulator"]
 
 
 class OFDMModulator(Block):
-    # pylint: disable=line-too-long
+    r"""Computes the time-domain representation of an OFDM resource grid
+    with (optional) cyclic prefix.
+
+    :param cyclic_prefix_length: Integer or vector of integers indicating the
+        length of the cyclic prefix that is prepended to each OFDM symbol.
+        None of its elements can be larger than the FFT size. Defaults to `0`.
+    :param precision: Precision used for internal calculations and outputs.
+        If set to `None`, :attr:`~sionna.phy.config.Config.precision` is used.
+    :param device: Device for tensor operations. If `None`,
+        :attr:`~sionna.phy.config.Config.device` is used.
+
+    :input inputs: [..., num_ofdm_symbols, fft_size], `torch.complex`.
+        Resource grid in the frequency domain.
+
+    :output x_time: [..., num_ofdm_symbols*(fft_size+cyclic_prefix_length)] or [..., num_ofdm_symbols*fft_size+sum(cyclic_prefix_length)], `torch.complex`.
+        Time-domain OFDM signal.
+
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        import torch
+        from sionna.phy.ofdm import OFDMModulator
+
+        modulator = OFDMModulator(cyclic_prefix_length=16)
+        # Resource grid: [batch, num_ofdm_symbols, fft_size]
+        x_freq = torch.randn(64, 14, 72, dtype=torch.complex64)
+        x_time = modulator(x_freq)
+        print(x_time.shape)
+        # torch.Size([64, 1232])  # 14 * (72 + 16) = 1232
     """
-    Computes the time-domain representation of an OFDM resource grid
-    with (optional) cyclic prefix
 
-    Parameters
-    ----------
-    cyclic_prefix_length : `int` (default 0) | [num_ofdm_symbols], `int`
-        Integer or vector of integers indicating the length of the
-        cyclic prefix that is prepended to each OFDM symbol. None of its
-        elements can be larger than the FFT size.
-
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
-        If set to `None`,
-        :attr:`~sionna.phy.config.Config.precision` is used.
-
-    Input
-    -----
-    : [...,num_ofdm_symbols,fft_size], `tf.complex`
-        Resource grid in the frequency domain
-
-    Output
-    ------
-    : [...,num_ofdm_symbols*(fft_size+cyclic_prefix_length)] or [...,num_ofdm_symbols*fft_size+sum(cyclic_prefix_length)], `tf.complex`
-        Time-domain OFDM signal
-    """
-    def __init__(self, cyclic_prefix_length=0, precision=None, **kwargs):
-        super().__init__(precision=precision, **kwargs)
-        self._cyclic_prefix_length = None
+    def __init__(
+        self,
+        cyclic_prefix_length: Union[int, np.ndarray, torch.Tensor] = 0,
+        precision: Optional[Precision] = None,
+        device: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(precision=precision, device=device, **kwargs)
+        self._cp_length_scalar: Optional[int] = None  # Cached scalar for call()
+        # Register tensors as buffers for CUDA graph compatibility
+        self.register_buffer("_cyclic_prefix_length", None)
+        self.register_buffer("_ind", None)
         self.cyclic_prefix_length = cyclic_prefix_length
 
     @property
-    def cyclic_prefix_length(self):
-        """
-        scalar or [num_ofdm_symbols], int : Get/set the cyclic prefix length
-        """
+    def cyclic_prefix_length(self) -> torch.Tensor:
+        """Get/set the cyclic prefix length (scalar or per-symbol)"""
         return self._cyclic_prefix_length
 
     @cyclic_prefix_length.setter
-    def cyclic_prefix_length(self, value):
-        value = tf.cast(value, tf.int32)
-        if not tf.reduce_all(value>=0):
-            msg = "`cyclic_prefix_length` must be nonnegative."
-            raise ValueError(msg)
-        if not 0<= tf.rank(value)<=1:
-            msg = "`cyclic_prefix_length` must be of rank 0 or 1"
-            raise ValueError(msg)
-        self._cyclic_prefix_length = value
+    def cyclic_prefix_length(self, value: Union[int, np.ndarray, torch.Tensor]) -> None:
+        if isinstance(value, (int, float)):
+            value = torch.tensor([value], dtype=torch.int32, device=self.device)
+        elif isinstance(value, np.ndarray):
+            value = torch.tensor(value, dtype=torch.int32, device=self.device)
+        else:
+            value = value.to(dtype=torch.int32, device=self.device)
 
-    def build(self, input_shape):
+        if not torch.all(value >= 0):
+            raise ValueError("`cyclic_prefix_length` must be nonnegative.")
+        if not 0 <= value.dim() <= 1:
+            raise ValueError("`cyclic_prefix_length` must be of rank 0 or 1.")
+
+        # Store as 0D if scalar, 1D otherwise
+        if value.numel() == 1:
+            # Register as buffer for CUDA graph compatibility
+            self.register_buffer("_cyclic_prefix_length", value.squeeze())
+            # Cache scalar value to avoid .item() during tracing
+            self._cp_length_scalar = int(value.item())
+        else:
+            self.register_buffer("_cyclic_prefix_length", value)
+            self._cp_length_scalar = None
+
+    def build(self, input_shape: tuple) -> None:
+        """Build the modulator based on input shape.
+
+        :param input_shape: Shape of the input tensor
+            `[..., num_ofdm_symbols, fft_size]`
+        """
         num_ofdm_symbols, fft_size = input_shape[-2:]
-        if not tf.reduce_all(self.cyclic_prefix_length<=fft_size):
-            msg = "`cyclic_prefix_length` cannot be larger than `fft_size`."
-            raise ValueError(msg)
-        if len(self.cyclic_prefix_length.shape)==1:
-            if not self.cyclic_prefix_length.shape[0]==num_ofdm_symbols:
-                msg = "`cyclic_prefix_length` must be of size [num_ofdm_symbols]"
-                raise ValueError(msg)
+        cp_len = self._cyclic_prefix_length
 
-            # Compute indices of CP symbols
-            # These are offset by the number of the OFDM symbol
-            # [num_ofdm_symbols, 1]
-            offsets = tf.expand_dims(tf.range(1, num_ofdm_symbols+1)*fft_size,
-                                     1)
-            # [num_ofdm_symbols, None] (ragged tensor)
-            cp_ind = tf.ragged.range(starts=-self.cyclic_prefix_length,
-                                     limits=0) + offsets
+        if not torch.all(cp_len <= fft_size):
+            raise ValueError("`cyclic_prefix_length` cannot be larger than `fft_size`.")
 
-            # Compute indices of symbols containing the actual sequence
-            # [num_ofdm_symbols, fft_size]
-            data_ind = tf.repeat(tf.expand_dims(tf.range(0, fft_size), 0),
-                                 num_ofdm_symbols, 0) + offsets - fft_size
+        if cp_len.dim() == 1:
+            if cp_len.shape[0] != num_ofdm_symbols:
+                raise ValueError(
+                    "`cyclic_prefix_length` must be of size [num_ofdm_symbols]"
+                )
 
-            # Concat CP and sequence indices
-            # [num_ofdm_symbols, None]
-            ind = tf.concat([cp_ind, data_ind], axis=-1)
+            # Compute indices of CP symbols and data symbols
+            # Build the gather indices for variable CP lengths
+            # Convert to list once to avoid .item() calls during tracing
+            cp_lengths = cp_len.tolist()
+            indices_list = []
+            offset = 0
+            for i in range(num_ofdm_symbols):
+                cp_length_i = cp_lengths[i]
+                # CP indices (last cp_length_i samples of the OFDM symbol)
+                cp_start = (i + 1) * fft_size - cp_length_i
+                cp_indices = torch.arange(
+                    cp_start, (i + 1) * fft_size, dtype=torch.int64, device=self.device
+                )
+                # Data indices
+                data_indices = torch.arange(
+                    i * fft_size,
+                    (i + 1) * fft_size,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                indices_list.append(cp_indices)
+                indices_list.append(data_indices)
+                offset += cp_length_i + fft_size
 
-            # Flatten in time domain
-            # [num_ofdm_symbols *fft_size + sum(cyclic_prefix_length)]
-            self._ind = ind.flat_values
+            # Concatenate all indices
+            self.register_buffer("_ind", torch.cat(indices_list))
 
-    def call(self, inputs):
+    def call(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Modulate OFDM resource grid to time-domain signal.
 
+        :param inputs: Resource grid in frequency domain with shape
+            `[..., num_ofdm_symbols, fft_size]`
+        :output x_time: Time-domain OFDM signal with shape
+            `[..., num_ofdm_symbols*(fft_size+cyclic_prefix_length)]` or
+            `[..., num_ofdm_symbols*fft_size+sum(cyclic_prefix_length)]`
+        """
         # Shift DC subcarrier to first position
-        x_freq = ifftshift(inputs, axes=-1)
+        x_freq = torch.fft.ifftshift(inputs, dim=-1)
 
         # Compute IFFT along the last dimension
-        x_time = ifft(x_freq)
+        x_time = ifft(x_freq, precision=self.precision)
 
-        if len(self.cyclic_prefix_length.shape)==1:
+        cp_len = self._cyclic_prefix_length
+
+        if cp_len.dim() == 1:
             # Individual CP length per OFDM symbol
-
             # Flatten last two dimensions
             x_time = flatten_last_dims(x_time, 2)
 
             # Gather full time-domain signal
-            return tf.gather(x_time, self._ind, axis=-1)
-
+            return x_time[..., self._ind]
         else:
             # Same CP length for all OFDM symbols
+            # Use cached scalar to avoid .item() during tracing
+            cp_length = self._cp_length_scalar
 
-            # Obtain cyclic prefix
-            cp = x_time[...,tf.shape(x_time)[-1]-self._cyclic_prefix_length:]
+            if cp_length > 0:
+                # Obtain cyclic prefix
+                cp = x_time[..., -cp_length:]
 
-            # Prepend cyclic prefix
-            x_time = tf.concat([cp, x_time], -1)
+                # Prepend cyclic prefix
+                x_time = torch.cat([cp, x_time], dim=-1)
 
             # Serialize last two dimensions
-            return  flatten_last_dims(x_time, 2)
+            return flatten_last_dims(x_time, 2)

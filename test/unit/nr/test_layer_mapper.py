@@ -1,23 +1,26 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+"""Tests for LayerMapper and LayerDemapper."""
 
-import unittest
+import pytest
 import numpy as np
+import torch
+
 from sionna.phy.nr import LayerMapper, LayerDemapper
 from sionna.phy.utils import hard_decisions
 from sionna.phy.mapping import Mapper, Demapper, BinarySource
 
-class TestLayerMapper(unittest.TestCase):
-    """Tests for LayerMapper"""
 
-    def test_ref(self):
-        """Test against predefined sequences."""
+class TestLayerMapper:
+    """Tests for LayerMapper."""
 
-        # single layer
+    def test_single_layer(self):
+        """Test 1 layer mapping."""
         u = np.array([[1, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 0,
                        0, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 0,
-                       0, 1, 1, 0, 1, 0,1, 1, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1, 0,
+                       0, 1, 1, 0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1, 0,
                        1, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0, 1, 1, 1, 1,
                        0, 1, 1, 1, 0, 0, 0, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1,
                        1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1,
@@ -31,6 +34,21 @@ class TestLayerMapper(unittest.TestCase):
                          1, 0, 1, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 0,
                          0, 1, 1, 1, 1, 1, 0, 1, 0, 0, 1, 1]]])
 
+        mapper = LayerMapper(num_layers=1)
+        u_tensor = torch.tensor(u, dtype=torch.float32)
+        o = mapper(u_tensor)
+        np.testing.assert_array_equal(o.cpu().numpy(), o1)
+
+    def test_two_layers(self):
+        """Test 2 layer mapping."""
+        u = np.array([[1, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 0,
+                       0, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 0,
+                       0, 1, 1, 0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1, 0,
+                       1, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0, 1, 1, 1, 1,
+                       0, 1, 1, 1, 0, 0, 0, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1,
+                       1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1,
+                       0, 1, 0, 0, 1, 1]])
+
         o2 = np.array([[[1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 1, 0, 0, 1, 1,
                          1, 0, 1, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 1, 1,
                          1, 1, 0, 1, 0, 0, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1,
@@ -38,6 +56,21 @@ class TestLayerMapper(unittest.TestCase):
                          1, 1, 0, 1, 1, 1, 1, 0, 1, 0, 0, 1, 0, 0, 1, 1, 1, 1,
                          1, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, 0, 0,
                          1, 1, 1, 0, 0, 1, 0, 1, 1, 1, 1, 0, 1]]])
+
+        mapper = LayerMapper(num_layers=2)
+        u_tensor = torch.tensor(u, dtype=torch.float32)
+        o = mapper(u_tensor)
+        np.testing.assert_array_equal(o.cpu().numpy(), o2)
+
+    def test_three_layers(self):
+        """Test 3 layer mapping."""
+        u = np.array([[1, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 0,
+                       0, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 0,
+                       0, 1, 1, 0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1, 0,
+                       1, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0, 1, 1, 1, 1,
+                       0, 1, 1, 1, 0, 0, 0, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1,
+                       1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1,
+                       0, 1, 0, 0, 1, 1]])
 
         o3 = np.array([[[1, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 1, 1, 1, 1, 0, 1,
                          1, 1, 0, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 0, 1,
@@ -47,37 +80,36 @@ class TestLayerMapper(unittest.TestCase):
                          1, 1, 1, 1, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 1,
                          0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 1, 1, 0, 1]]])
 
-        o4=np.array([[[1, 0, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1,
-                       0, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0], [1, 1, 0, 1, 1, 0, 1,
-                       1, 1, 0, 0, 1, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 0, 1, 0,
-                       1, 1, 1, 0], [0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1,
-                       0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, 0, 1, 1, 0, 1], [1, 0,
-                       1, 1, 0, 1, 0, 1, 1, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0,
-                       1, 0, 1, 1, 0, 0, 1, 1, 1]]])
-
-        # 1 layer
-        mapper = LayerMapper(num_layers=1)
-        o = mapper(u)
-        self.assertTrue(np.array_equal(o.numpy(), o1))
-
-        # 2 layer
-        mapper = LayerMapper(num_layers=2)
-        o = mapper(u)
-        self.assertTrue(np.array_equal(o.numpy(), o2))
-
-        # 3 layer
         mapper = LayerMapper(num_layers=3)
-        o = mapper(u)
-        self.assertTrue(np.array_equal(o.numpy(), o3))
+        u_tensor = torch.tensor(u, dtype=torch.float32)
+        o = mapper(u_tensor)
+        np.testing.assert_array_equal(o.cpu().numpy(), o3)
 
-        # 4 layer
+    def test_four_layers(self):
+        """Test 4 layer mapping."""
+        u = np.array([[1, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 0,
+                       0, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 0,
+                       0, 1, 1, 0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1, 0,
+                       1, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0, 1, 1, 1, 1,
+                       0, 1, 1, 1, 0, 0, 0, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1,
+                       1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1,
+                       0, 1, 0, 0, 1, 1]])
+
+        o4 = np.array([[[1, 0, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1,
+                         0, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0], [1, 1, 0, 1, 1, 0, 1,
+                         1, 1, 0, 0, 1, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 0, 1, 0,
+                         1, 1, 1, 0], [0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1,
+                         0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, 0, 1, 1, 0, 1], [1, 0,
+                         1, 1, 0, 1, 0, 1, 1, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0,
+                         1, 0, 1, 1, 0, 0, 1, 1, 1]]])
+
         mapper = LayerMapper(num_layers=4)
-        o = mapper(u)
-        self.assertTrue(np.array_equal(o.numpy(), o4))
+        u_tensor = torch.tensor(u, dtype=torch.float32)
+        o = mapper(u_tensor)
+        np.testing.assert_array_equal(o.cpu().numpy(), o4)
 
-        ####### dual codeword scenario ######
-
-        # 5 layer (dual codeword)
+    def test_five_layers_dual_cw(self):
+        """Test 5 layer mapping (dual codeword)."""
         u1 = np.array([[0, 1, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 0, 1, 0, 0,
                         0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0,
                         0, 1, 0, 0, 1, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1,
@@ -100,16 +132,18 @@ class TestLayerMapper(unittest.TestCase):
                          1, 1, 1, 1, 1, 0, 1, 0, 1, 0]]])
 
         mapper = LayerMapper(num_layers=5)
-        o = mapper([u1, u2])
-        self.assertTrue(np.array_equal(o.numpy(), o5))
+        u1_tensor = torch.tensor(u1, dtype=torch.float32)
+        u2_tensor = torch.tensor(u2, dtype=torch.float32)
+        o = mapper([u1_tensor, u2_tensor])
+        np.testing.assert_array_equal(o.cpu().numpy(), o5)
 
-        # 6 layer (dual codeword)
+    def test_six_layers_dual_cw(self):
+        """Test 6 layer mapping (dual codeword)."""
         u1 = np.array([[1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1,
                         0, 1, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0,
                         0, 1, 0, 1, 1, 0, 1, 1, 0, 1, 1, 0, 0, 1, 1, 1, 0, 1,
                         1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1,
                         0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1, 0, 0, 0, 1, 1, 0]])
-
 
         u2 = np.array([[0, 1, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 1, 1, 1, 0, 0,
                         0, 1, 0, 0, 1, 1, 0, 0, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0,
@@ -130,19 +164,21 @@ class TestLayerMapper(unittest.TestCase):
                          1, 0, 0, 1, 0]]])
 
         mapper = LayerMapper(num_layers=6)
-        o = mapper([u1, u2])
-        self.assertTrue(np.array_equal(o.numpy(), o6))
+        u1_tensor = torch.tensor(u1, dtype=torch.float32)
+        u2_tensor = torch.tensor(u2, dtype=torch.float32)
+        o = mapper([u1_tensor, u2_tensor])
+        np.testing.assert_array_equal(o.cpu().numpy(), o6)
 
-
-        # 7 layer (dual codeword)
+    def test_seven_layers_dual_cw(self):
+        """Test 7 layer mapping (dual codeword)."""
         u1 = np.array([[1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 1, 1, 1, 1, 0, 1, 0, 1,
-                        1, 1, 1, 1,0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1,
+                        1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1,
                         0, 1, 0, 1, 1, 1, 0, 1, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0,
                         0, 0, 1, 0, 1, 0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1,
                         1, 0, 1, 0, 1, 1, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1]])
 
         u2 = np.array([[0, 0, 1, 1, 1, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0,
-                        1, 1, 1, 1,0, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 0, 1, 1,
+                        1, 1, 1, 1, 0, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 0, 1, 1,
                         0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 1,
                         1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 0, 0, 1, 0, 1, 1,
                         1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 1, 1, 0, 1, 1, 0, 1,
@@ -163,10 +199,13 @@ class TestLayerMapper(unittest.TestCase):
                       0, 0, 0, 1, 1, 1, 1, 0]]])
 
         mapper = LayerMapper(num_layers=7)
-        o = mapper([u1, u2])
-        self.assertTrue(np.array_equal(o.numpy(), o7))
+        u1_tensor = torch.tensor(u1, dtype=torch.float32)
+        u2_tensor = torch.tensor(u2, dtype=torch.float32)
+        o = mapper([u1_tensor, u2_tensor])
+        np.testing.assert_array_equal(o.cpu().numpy(), o7)
 
-        # 8 layer (dual codeword)
+    def test_eight_layers_dual_cw(self):
+        """Test 8 layer mapping (dual codeword)."""
         u1 = np.array([[0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 1, 1, 0,
                         0, 0, 1, 0, 1, 0, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 1, 0,
                         1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1,
@@ -199,95 +238,106 @@ class TestLayerMapper(unittest.TestCase):
                       1]]])
 
         mapper = LayerMapper(num_layers=8)
-        o = mapper([u1, u2])
-        self.assertTrue(np.array_equal(o.numpy(), o8))
+        u1_tensor = torch.tensor(u1, dtype=torch.float32)
+        u2_tensor = torch.tensor(u2, dtype=torch.float32)
+        o = mapper([u1_tensor, u2_tensor])
+        np.testing.assert_array_equal(o.cpu().numpy(), o8)
 
 
-class TestLayerDemapper(unittest.TestCase):
-    """Tests for LayerDeMapper"""
+class TestLayerDemapper:
+    """Tests for LayerDemapper."""
 
-    def test_identity(self):
-        """Test that original sequence can be recovered."""
-
+    @pytest.mark.parametrize("num_layers", [1, 2, 3, 4])
+    def test_identity_single_cw(self, num_layers):
+        """Test that original sequence can be recovered with single codeword."""
         bs = 7
         source = BinarySource()
+        mapper = LayerMapper(num_layers=num_layers)
+        demapper = LayerDemapper(mapper)
 
-        # single cw
-        num_layers = [1,2,3,4]
-        n = np.prod(num_layers)
-        for l in num_layers:
-            mapper = LayerMapper(num_layers=l)
-            demapper = LayerDemapper(mapper)
+        n = 12 * num_layers  # Divisible by all layer counts
+        x = source([bs, n])
+        y = mapper(x)
+        z = demapper(y)
 
-            x = source([bs, n])
-            y = mapper(x)
-            z = demapper(y)
+        np.testing.assert_array_equal(x.cpu().numpy(), z.cpu().numpy())
 
-            self.assertTrue(np.array_equal(x.numpy(), z.numpy()))
+    @pytest.mark.parametrize("num_layers,n0,n1", [
+        (5, 60, 90),
+        (6, 90, 90),
+        (7, 90, 120),
+        (8, 120, 120),
+    ])
+    def test_identity_dual_cw(self, num_layers, n0, n1):
+        """Test recovery with dual codeword configurations."""
+        bs = 7
+        source = BinarySource()
+        mapper = LayerMapper(num_layers=num_layers)
+        demapper = LayerDemapper(mapper)
 
-        # dual cw (only available for PDSCH)
-        num_layers = [5, 6, 7, 8]
-        n0s = [60, 90, 90, 120]
-        n1s = [90, 90, 120, 120]
-        n = np.prod(num_layers)
-        for l, n0, n1 in zip(num_layers, n0s, n1s):
-            mapper = LayerMapper(num_layers=l)
-            demapper = LayerDemapper(mapper)
+        x0 = source([bs, n0])
+        x1 = source([bs, n1])
 
-            x0 = source([bs, n0])
-            x1 = source([bs, n1])
+        y = mapper([x0, x1])
+        z0, z1 = demapper(y)
 
-            y = mapper([x0, x1])
-            z0, z1 = demapper(y)
+        np.testing.assert_array_equal(x0.cpu().numpy(), z0.cpu().numpy())
+        np.testing.assert_array_equal(x1.cpu().numpy(), z1.cpu().numpy())
 
-            self.assertTrue(np.array_equal(x0.numpy(), z0.numpy()))
-            self.assertTrue(np.array_equal(x1.numpy(), z1.numpy()))
-
-    def test_higher_order(self):
-        """Test LRRs are correctly grouped when demapping is applied."""
-
-        bs  = 10
+    @pytest.mark.parametrize("num_layers", [1, 2, 3, 4])
+    def test_higher_order_modulation(self, num_layers):
+        """Test LLRs are correctly grouped with higher-order modulation."""
+        bs = 10
         mod_order = 4
 
         source = BinarySource()
         mapper = Mapper("qam", num_bits_per_symbol=mod_order)
-        demapper = Demapper("maxlog", "qam",num_bits_per_symbol=mod_order)
+        demapper = Demapper("maxlog", "qam", num_bits_per_symbol=mod_order)
 
-        # single cw
-        num_layers = [1,2,3,4]
+        l_mapper = LayerMapper(num_layers=num_layers)
+        l_demapper = LayerDemapper(l_mapper, num_bits_per_symbol=mod_order)
 
-        for l in num_layers:
-            l_mapper = LayerMapper(num_layers=l)
-            l_demapper = LayerDemapper(l_mapper, num_bits_per_symbol=mod_order)
-            u = source((bs, 5, 7, 13*l*mod_order)) # arbitrary dimensions
-            x = mapper(u)
-            x_l = l_mapper(x)
-            llr_l = demapper(x_l, 0.1)
-            l_hat = l_demapper(llr_l)
-            u_hat = hard_decisions(l_hat)
+        u = source((bs, 5, 7, 12 * num_layers * mod_order))
+        x = mapper(u)
+        x_l = l_mapper(x)
+        no = torch.tensor(0.1, device=x_l.device)
+        llr_l = demapper(x_l, no)
+        l_hat = l_demapper(llr_l)
+        u_hat = hard_decisions(l_hat)
 
-            self.assertTrue(np.array_equal(u.numpy(), u_hat.numpy()))
+        np.testing.assert_array_equal(u.cpu().numpy(), u_hat.cpu().numpy())
 
-        # dual cw
-        num_layers = [5, 6, 7, 8]
-        n0s = [60, 90, 90, 120]
-        n1s = [90, 90, 120, 120]
-        n = np.prod(num_layers)
-        for l, n0, n1 in zip(num_layers, n0s, n1s):
-            lmapper = LayerMapper(num_layers=l)
-            ldemapper = LayerDemapper(lmapper, num_bits_per_symbol=mod_order)
+    @pytest.mark.parametrize("num_layers,n0,n1", [
+        (5, 60, 90),
+        (6, 90, 90),
+        (7, 90, 120),
+        (8, 120, 120),
+    ])
+    def test_higher_order_modulation_dual_cw(self, num_layers, n0, n1):
+        """Test higher-order modulation with dual codeword configurations."""
+        bs = 10
+        mod_order = 4
 
-            u0 = source([bs, n0*mod_order*l])
-            u1 = source([bs, n1*mod_order*l])
-            x0 = mapper(u0)
-            x1 = mapper(u1)
+        source = BinarySource()
+        mapper = Mapper("qam", num_bits_per_symbol=mod_order)
+        demapper = Demapper("maxlog", "qam", num_bits_per_symbol=mod_order)
 
-            y = lmapper([x0, x1])
-            llr = demapper(y, 0.01)
-            z0, z1 = ldemapper(llr)
+        l_mapper = LayerMapper(num_layers=num_layers)
+        l_demapper = LayerDemapper(l_mapper, num_bits_per_symbol=mod_order)
 
-            u_hat0 = hard_decisions(z0)
-            u_hat1 = hard_decisions(z1)
+        u0 = source([bs, n0 * mod_order * num_layers])
+        u1 = source([bs, n1 * mod_order * num_layers])
+        x0 = mapper(u0)
+        x1 = mapper(u1)
 
-            self.assertTrue(np.array_equal(u0.numpy(), u_hat0.numpy()))
-            self.assertTrue(np.array_equal(u1.numpy(), u_hat1.numpy()))
+        y = l_mapper([x0, x1])
+        no = torch.tensor(0.01, device=y.device)
+        llr = demapper(y, no)
+        z0, z1 = l_demapper(llr)
+
+        u_hat0 = hard_decisions(z0)
+        u_hat1 = hard_decisions(z1)
+
+        np.testing.assert_array_equal(u0.cpu().numpy(), u_hat0.cpu().numpy())
+        np.testing.assert_array_equal(u1.cpu().numpy(), u_hat1.cpu().numpy())
+

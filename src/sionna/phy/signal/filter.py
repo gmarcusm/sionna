@@ -1,23 +1,36 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
 """Blocks implementing filters"""
 
-import tensorflow as tf
+from typing import Literal, Optional, Union
+
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
+
 from sionna.phy import Block
-from . import convolve, Window, HannWindow, HammingWindow, BlackmanWindow, empirical_aclr
+from sionna.phy.config import Precision
+from .utils import convolve, empirical_aclr
+from .window import Window, HannWindow, HammingWindow, BlackmanWindow
+
+__all__ = [
+    "Filter",
+    "RaisedCosineFilter",
+    "RootRaisedCosineFilter",
+    "SincFilter",
+    "CustomFilter",
+]
+
 
 class Filter(Block):
-    # pylint: disable=line-too-long
-    r"""
-    Abtract class defining a filter of ``length`` K which can be
-    applied to an input ``x`` of length N
+    r"""Abstract class defining a filter of ``length`` K which can be applied to an input ``x`` of length N.
 
-    The filter length K is equal to the filter span in symbols (``span_in_symbols``)
-    multiplied by the oversampling factor (``samples_per_symbol``).
-    If this product is even, a value of one will be added.
+    The filter length K is equal to the filter span in symbols
+    (``span_in_symbols``) multiplied by the oversampling factor
+    (``samples_per_symbol``). If this product is even, a value of one will
+    be added.
 
     The filter is applied through discrete convolution.
 
@@ -34,54 +47,61 @@ class Filter(Block):
     *   "valid": Returns the convolution only at points where ``x`` and the filter completely overlap.
         The length of the output is N - K + 1.
 
-    Parameters
-    ----------
-    span_in_symbols: `int`
-        Filter span as measured by the number of symbols
+    :param span_in_symbols: Filter span as measured by the number of symbols
+    :param samples_per_symbol: Number of samples per symbol, i.e., the
+        oversampling factor
+    :param window: Window that is applied to the filter coefficients.
+        Can be `None`, a :class:`~sionna.phy.signal.Window` instance, or one of
+        ``"hann"``, ``"hamming"``, ``"blackman"``.
+    :param normalize: If `True`, the filter is normalized to have unit
+        power. Defaults to `True`.
+    :param precision: Precision used for internal calculations and outputs.
+        If set to `None`, :attr:`~sionna.phy.config.Config.precision` is used.
+    :param device: Device for computation. If `None`,
+        :attr:`~sionna.phy.config.Config.device` is used.
 
-    samples_per_symbol: `int`
-        Number of samples per symbol, i.e., the oversampling factor
+    :input x: [..., N], `torch.complex` or `torch.float`.
+        Input to which the filter is applied along the last dimension.
 
-    window: `None` (default) | :class:`~sionna.phy.signal.Window` | "hann" | "hamming" | "blackman"
-        Window that is applied to the filter coefficients
+    :input padding: "full" (default) | "valid" | "same".
+        Padding mode for convolving ``x`` and the filter.
 
-    normalize: `bool`, (default `True`)
-        If `True`, the filter is normalized to have unit power.
-
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
-        If set to `None`,
-        :attr:`~sionna.phy.config.Config.precision` is used.
-
-    Input
-    -----
-    x : [...,N], `tf.complex` or `tf.float`
-        Input to which the filter is applied along the last dimension
-
-    padding : "full" (default) | "valid" | "same"
-        Padding mode for convolving ``x`` and the filter
-
-    conjugate : `bool`, (default `False`)
+    :input conjugate: `bool`, (default `False`).
         If `True`, the complex conjugate of the filter is applied.
 
-    Output
-    ------
-    y : [...,M], `tf.complex` or `tf.float`
+    :output y: [..., M], `torch.complex` or `torch.float`.
         Filtered input. The length M depends on the ``padding``.
-    """
-    def __init__(self,
-                 span_in_symbols,
-                 samples_per_symbol,
-                 window=None,
-                 normalize=True,
-                 precision=None,
-                 **kwargs):
-        super().__init__(precision=precision, **kwargs)
 
-        assert span_in_symbols>0, "span_in_symbols must be positive"
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        import torch
+        from sionna.phy.signal import RootRaisedCosineFilter
+
+        rrc = RootRaisedCosineFilter(span_in_symbols=8, samples_per_symbol=4, beta=0.35)
+        x = torch.randn(32, 100)
+        y = rrc(x, padding="same")
+        print(y.shape)
+        # torch.Size([32, 100])
+    """
+
+    def __init__(
+        self,
+        span_in_symbols: int,
+        samples_per_symbol: int,
+        window: Optional[Union[Window, str]] = None,
+        normalize: bool = True,
+        precision: Optional[Precision] = None,
+        device: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(precision=precision, device=device, **kwargs)
+
+        assert span_in_symbols > 0, "span_in_symbols must be positive"
         self._span_in_symbols = span_in_symbols
 
-        assert samples_per_symbol>0, "samples_per_symbol must be positive"
+        assert samples_per_symbol > 0, "samples_per_symbol must be positive"
         self._samples_per_symbol = samples_per_symbol
 
         self.window = window
@@ -89,89 +109,96 @@ class Filter(Block):
         assert isinstance(normalize, bool), "normalize must be bool"
         self._normalize = normalize
 
+        self._coefficients: Optional[torch.Tensor] = None
+
     @property
-    def span_in_symbols(self):
-        """
-        `int` : Filter span in symbols
-        """
+    def span_in_symbols(self) -> int:
+        """Filter span in symbols"""
         return self._span_in_symbols
 
     @property
-    def samples_per_symbol(self):
-        """
-        `int` : Number of samples per symbol, i.e., the oversampling factor
-        """
+    def samples_per_symbol(self) -> int:
+        """Number of samples per symbol, i.e., the oversampling factor"""
         return self._samples_per_symbol
 
     @property
-    def length(self):
-        """
-        `int` : Filter length in samples
-        """
-        l = self._span_in_symbols*self._samples_per_symbol
-        l = 2*(l//2)+1 # Force length to be the next odd number
-        return l
+    def length(self) -> int:
+        """Filter length in samples"""
+        length = self._span_in_symbols * self._samples_per_symbol
+        length = 2 * (length // 2) + 1  # Force length to be the next odd number
+        return length
 
     @property
-    def window(self):
-        """
-        :class:`~sionna.phy.signal.Window` : Get/set window function that
-            is applied to the filter coefficients
-        """
+    def window(self) -> Optional[Window]:
+        """Get/set window function applied to filter coefficients"""
         return self._window
 
     @window.setter
-    def window(self, value):
+    def window(self, value: Optional[Union[Window, str]]) -> None:
         if isinstance(value, str):
-            if value=="hann":
-                self._window = HannWindow()
-            elif value=="hamming":
-                self._window = HammingWindow()
-            elif value=="blackman":
-                self._window = BlackmanWindow()
+            if value == "hann":
+                self._window = HannWindow(precision=self.precision, device=self.device)
+            elif value == "hamming":
+                self._window = HammingWindow(
+                    precision=self.precision, device=self.device
+                )
+            elif value == "blackman":
+                self._window = BlackmanWindow(
+                    precision=self.precision, device=self.device
+                )
             else:
                 raise AssertionError("Invalid window type")
         elif isinstance(value, Window) or value is None:
             self._window = value
         else:
             raise AssertionError("Invalid window type")
+
         if value is not None:
-            assert self._window.precision == self._precision, \
-                "Window and Filter must have the same precision."
+            assert (
+                self._window.precision == self.precision
+            ), "Window and Filter must have the same precision."
             # Run window once to initialize coefficients
-            self._window(tf.ones([self.length], self.cdtype))
+            self._window(
+                torch.ones([self.length], dtype=self.cdtype, device=self.device)
+            )
+
     @property
-    def normalize(self):
-        """
-        `bool` : If `True` the filter is normalized to have unit power.
-        """
+    def normalize(self) -> bool:
+        """If `True` the filter is normalized to have unit power"""
         return self._normalize
 
     @property
-    def coefficients(self):
-        """
-        [K], `tf.float` of `tf.complex` : Set/get raw filter coefficients
-        """
+    def coefficients(self) -> torch.Tensor:
+        """Set/get raw filter coefficients"""
         return self._coefficients
 
     @coefficients.setter
-    def coefficients(self, v):
-        self._coefficients = self._cast_or_check_precision(v)
+    def coefficients(self, v: Union[torch.Tensor, np.ndarray]) -> None:
+        if not isinstance(v, torch.Tensor):
+            v = torch.as_tensor(v, dtype=self.dtype, device=self.device)
+        else:
+            # Preserve gradient if already a tensor with requires_grad
+            # Only convert if dtype or device differs
+            target_dtype = self.cdtype if v.is_complex() else self.dtype
+            if v.dtype != target_dtype or str(v.device) != self.device:
+                v = v.to(dtype=target_dtype, device=self.device)
+        self._coefficients = v
 
     @property
-    def sampling_times(self):
-        """
-        [K], `numpy.float32` : Sampling times in multiples of
-            the symbol duration
-        """
-        n_min = -(self.length//2)
+    def sampling_times(self) -> np.ndarray:
+        """Sampling times in multiples of the symbol duration"""
+        n_min = -(self.length // 2)
         n_max = n_min + self.length
         t = np.arange(n_min, n_max, dtype=np.float32)
         t /= self.samples_per_symbol
         return t
 
-    def show(self, response="impulse", scale="lin"):
-        r"""Plot the impulse or magnitude response
+    def show(
+        self,
+        response: Literal["impulse", "magnitude"] = "impulse",
+        scale: Literal["lin", "db"] = "lin",
+    ) -> None:
+        r"""Plot the impulse or magnitude response.
 
         Plots the impulse response (time domain) or magnitude response
         (frequency domain) of the filter.
@@ -180,14 +207,10 @@ class Filter(Block):
         of 1024 is assumed which is obtained through zero padding of
         the filter coefficients in the time domain.
 
-        Input
-        -----
-        response: "impulse" (default) | "magnitude"
-            Desired response type
-
-        scale: "lin" (default) | "db"
-            y-scale of the magnitude response.
-            Can be "lin" (i.e., linear) or "db" (, i.e., Decibel).
+        :param response: Desired response type.
+            Must be ``"impulse"`` (default) or ``"magnitude"``.
+        :param scale: y-scale of the magnitude response.
+            Can be ``"lin"`` (i.e., linear) or ``"db"`` (i.e., Decibel).
         """
         assert response in ["impulse", "magnitude"], "Invalid response"
 
@@ -199,52 +222,52 @@ class Filter(Block):
 
         # Ensure unit L2-norm of the coefficients
         if self.normalize:
-            energy = tf.reduce_sum(tf.square(tf.abs(h)))
-            h = h / tf.cast(tf.sqrt(energy), h.dtype)
+            energy = torch.sum(torch.abs(h) ** 2)
+            h = h / torch.sqrt(energy)
 
-        if response=="impulse":
-            plt.figure(figsize=(12,6))
-            plt.plot(self.sampling_times, np.real(h))
-            if self.coefficients.dtype.is_complex:
-                plt.plot(self.sampling_times, np.imag(h))
+        h_np = h.detach().cpu().numpy()
+
+        if response == "impulse":
+            plt.figure(figsize=(12, 6))
+            plt.plot(self.sampling_times, np.real(h_np))
+            if self.coefficients.is_complex():
+                plt.plot(self.sampling_times, np.imag(h_np))
                 plt.legend(["Real part", "Imaginary part"])
             plt.title("Impulse response")
             plt.grid()
             plt.xlabel(r"Normalized time $(t/T)$")
             plt.ylabel(r"$h(t)$")
             plt.xlim(self.sampling_times[0], self.sampling_times[-1])
-
         else:
             assert scale in ["lin", "db"], "Invalid scale"
             fft_size = max(1024, h.shape[-1])
-            h = np.fft.fft(h, fft_size)
-            h = np.fft.fftshift(h)
-            h = np.abs(h)
-            plt.figure(figsize=(12,6))
-            if scale=="db":
-                h = np.maximum(h, 1e-10)
-                h = 10*np.log10(h)
+            h_fft = np.fft.fft(h_np, fft_size)
+            h_fft = np.fft.fftshift(h_fft)
+            h_fft = np.abs(h_fft)
+            plt.figure(figsize=(12, 6))
+            if scale == "db":
+                h_fft = np.maximum(h_fft, 1e-10)
+                h_fft = 10 * np.log10(h_fft)
                 plt.ylabel(r"$|H(f)|$ (dB)")
             else:
                 plt.ylabel(r"$|H(f)|$")
-            f = np.linspace(-self._samples_per_symbol/2,
-                            self._samples_per_symbol/2, fft_size)
-            plt.plot(f, h)
+            f = np.linspace(
+                -self._samples_per_symbol / 2, self._samples_per_symbol / 2, fft_size
+            )
+            plt.plot(f, h_fft)
             plt.title("Magnitude response")
             plt.grid()
             plt.xlabel(r"Normalized frequency $(f/W)$")
             plt.xlim(f[0], f[-1])
 
     @property
-    def aclr(self):
-        """ACLR of the filter
+    def aclr(self) -> torch.Tensor:
+        """`torch.float` -- ACLR of the filter in linear scale.
 
         This ACLR corresponds to what one would obtain from using
         this filter as pulse shaping filter on an i.i.d. sequence of symbols.
         The in-band is assumed to range from [-0.5, 0.5] in normalized
         frequency.
-
-        `tf.float` : ACLR in linear scale
         """
         h = self.coefficients
 
@@ -254,18 +277,24 @@ class Filter(Block):
 
         # Ensure unit L2-norm of the coefficients
         if self.normalize:
-            energy = tf.reduce_sum(tf.square(tf.abs(h)))
-            h = h / tf.cast(tf.sqrt(energy), h.dtype)
+            energy = torch.sum(torch.abs(h) ** 2)
+            h = h / torch.sqrt(energy)
 
         fft_size = 1024
-        n = fft_size - tf.shape(h)[-1]
-        z = tf.zeros([n], h.dtype)
-        c = tf.cast(tf.concat([h, z], -1), tf.complex64)
-        return empirical_aclr(c,
-                              oversampling=self._samples_per_symbol,
-                              precision=self.precision)
+        n = fft_size - h.shape[-1]
+        z = torch.zeros([n], dtype=h.dtype, device=h.device)
+        c = torch.cat([h, z], dim=-1).to(self.cdtype)
 
-    def call(self, x, padding='full', conjugate=False):
+        return empirical_aclr(
+            c, oversampling=self._samples_per_symbol, precision=self.precision
+        )
+
+    def call(
+        self,
+        x: torch.Tensor,
+        padding: Literal["full", "same", "valid"] = "full",
+        conjugate: bool = False,
+    ) -> torch.Tensor:
         h = self.coefficients
 
         # Apply window
@@ -274,21 +303,19 @@ class Filter(Block):
 
         # Ensure unit L2-norm of the coefficients
         if self.normalize:
-            energy = tf.reduce_sum(tf.square(tf.abs(h)))
-            h = h / tf.cast(tf.sqrt(energy), h.dtype)
+            energy = torch.sum(torch.abs(h) ** 2)
+            h = h / torch.sqrt(energy)
 
         # (Optionally) compute the complex conjugate
-        if conjugate and h.dtype.is_complex:
-            h = tf.math.conj(h)
+        if conjugate and h.is_complex():
+            h = torch.conj(h)
 
         y = convolve(x, h, padding=padding, precision=self.precision)
         return y
 
+
 class RaisedCosineFilter(Filter):
-    # pylint: disable=line-too-long
-    r"""
-    Block for applying a raised-cosine filter of ``length`` K
-    to an input ``x`` of length N
+    r"""Block for applying a raised-cosine filter of ``length`` K to an input ``x`` of length N.
 
     The raised-cosine filter is defined by
 
@@ -301,16 +328,18 @@ class RaisedCosineFilter(Filter):
 
     where :math:`\beta` is the roll-off factor and :math:`T` the symbol duration.
 
-    The filter length K is equal to the filter span in symbols (``span_in_symbols``)
-    multiplied by the oversampling factor (``samples_per_symbol``).
-    If this product is even, a value of one will be added.
+    The filter length K is equal to the filter span in symbols
+    (``span_in_symbols``) multiplied by the oversampling factor
+    (``samples_per_symbol``). If this product is even, a value of one will
+    be added.
 
     The filter is applied through discrete convolution.
 
     An optional windowing function ``window`` can be applied to the filter.
 
-    The `dtype` of the output is `tf.float` if both ``x`` and the filter coefficients have dtype `tf.float`.
-    Otherwise, the dtype of the output is `tf.complex`.
+    The dtype of the output is `torch.float` if both ``x`` and the filter
+    coefficients have dtype `torch.float`. Otherwise, the dtype of the output
+    is `torch.complex`.
 
     Three padding modes are available for applying the filter:
 
@@ -323,93 +352,100 @@ class RaisedCosineFilter(Filter):
     *   "valid": Returns the convolution only at points where ``x`` and the filter completely overlap.
         The length of the output is N - K + 1.
 
-    Parameters
-    ----------
-    span_in_symbols: `int`
-        Filter span as measured by the number of symbols
-
-    samples_per_symbol: `int`
-        Number of samples per symbol, i.e., the oversampling factor
-
-    beta : `float`
-        Roll-off factor.
+    :param span_in_symbols: Filter span as measured by the number of symbols
+    :param samples_per_symbol: Number of samples per symbol, i.e., the
+        oversampling factor
+    :param beta: Roll-off factor.
         Must be in the range :math:`[0,1]`.
+    :param window: Window that is applied to the filter coefficients.
+        Can be `None`, a :class:`~sionna.phy.signal.Window` instance, or one of
+        ``"hann"``, ``"hamming"``, ``"blackman"``.
+    :param normalize: If `True`, the filter is normalized to have unit
+        power. Defaults to `True`.
+    :param precision: Precision used for internal calculations and outputs.
+        If set to `None`, :attr:`~sionna.phy.config.Config.precision` is used.
+    :param device: Device for computation. If `None`,
+        :attr:`~sionna.phy.config.Config.device` is used.
 
-    window: `None` (default) | :class:`~sionna.phy.signal.Window` | "hann" | "hamming" | "blackman"
-        Window that is applied to the filter coefficients
+    :input x: [..., N], `torch.complex` or `torch.float`.
+        Input to which the filter is applied along the last dimension.
 
-    normalize: `bool`, (default `True`)
-        If `True`, the filter is normalized to have unit power.
+    :input padding: "full" (default) | "valid" | "same".
+        Padding mode for convolving ``x`` and the filter.
 
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
-        If set to `None`,
-        :attr:`~sionna.phy.config.Config.precision` is used.
-
-    Input
-    -----
-    x : [...,N], `tf.complex` or `tf.float`
-        Input to which the filter is applied along the last dimension
-
-    padding : "full" (default) | "valid" | "same"
-        Padding mode for convolving ``x`` and the filter
-
-    conjugate : `bool`, (default `False`)
+    :input conjugate: `bool`, (default `False`).
         If `True`, the complex conjugate of the filter is applied.
 
-    Output
-    ------
-    y : [...,M], `tf.complex` or `tf.float`
+    :output y: [..., M], `torch.complex` or `torch.float`.
         Filtered input. The length M depends on the ``padding``.
+
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        import torch
+        from sionna.phy.signal import RaisedCosineFilter
+
+        rc = RaisedCosineFilter(span_in_symbols=8, samples_per_symbol=4, beta=0.35)
+        x = torch.randn(32, 100)
+        y = rc(x, padding="same")
+        print(y.shape)
+        # torch.Size([32, 100])
     """
-    def __init__(self,
-                 span_in_symbols,
-                 samples_per_symbol,
-                 beta,
-                 window=None,
-                 normalize=True,
-                 precision=None,
-                 **kwargs):
 
-        super().__init__(span_in_symbols,
-                         samples_per_symbol,
-                         window=window,
-                         normalize=normalize,
-                         precsion=precision,
-                         **kwargs)
+    def __init__(
+        self,
+        span_in_symbols: int,
+        samples_per_symbol: int,
+        beta: float,
+        window: Optional[Union[Window, str]] = None,
+        normalize: bool = True,
+        precision: Optional[Precision] = None,
+        device: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            span_in_symbols,
+            samples_per_symbol,
+            window=window,
+            normalize=normalize,
+            precision=precision,
+            device=device,
+            **kwargs,
+        )
 
-        assert 0 <= beta <= 1, "beta must be from the intervall [0,1]"
+        assert 0 <= beta <= 1, "beta must be from the interval [0, 1]"
         self._beta = beta
-        self.coefficients = self._raised_cosine(self.sampling_times,
-                                                1.0,
-                                                self.beta)
+        self.coefficients = self._raised_cosine(self.sampling_times, 1.0, self.beta)
 
     @property
-    def beta(self):
-        """
-        `float` : Roll-off factor
-        """
+    def beta(self) -> float:
+        """Roll-off factor"""
         return self._beta
 
-    def _raised_cosine(self, t, symbol_duration, beta):
+    def _raised_cosine(
+        self, t: np.ndarray, symbol_duration: float, beta: float
+    ) -> np.ndarray:
         """Raised-cosine filter from Wikipedia
         https://en.wikipedia.org/wiki/Raised-cosine_filter"""
         h = np.zeros([len(t)], np.float32)
         for i, tt in enumerate(t):
             tt = np.abs(tt)
-            if beta>0 and (tt-np.abs(symbol_duration/2/beta)==0):
-                h[i] = np.pi/4/symbol_duration*np.sinc(1/2/beta)
+            if beta > 0 and (tt - np.abs(symbol_duration / 2 / beta) == 0):
+                h[i] = np.pi / 4 / symbol_duration * np.sinc(1 / 2 / beta)
             else:
-                h[i] = 1./symbol_duration*np.sinc(tt/symbol_duration)\
-                    * np.cos(np.pi*beta*tt/symbol_duration)\
-                    /(1-(2*beta*tt/symbol_duration)**2)
+                h[i] = (
+                    1.0
+                    / symbol_duration
+                    * np.sinc(tt / symbol_duration)
+                    * np.cos(np.pi * beta * tt / symbol_duration)
+                    / (1 - (2 * beta * tt / symbol_duration) ** 2)
+                )
         return h
 
+
 class RootRaisedCosineFilter(Filter):
-    # pylint: disable=line-too-long
-    r"""
-    Block for applying a root-raised-cosine filter of ``length`` K
-    to an input ``x`` of length N
+    r"""Block for applying a root-raised-cosine filter of ``length`` K to an input ``x`` of length N.
 
     The root-raised-cosine filter is defined by
 
@@ -423,16 +459,18 @@ class RootRaisedCosineFilter(Filter):
 
     where :math:`\beta` is the roll-off factor and :math:`T` the symbol duration.
 
-    The filter length K is equal to the filter span in symbols (``span_in_symbols``)
-    multiplied by the oversampling factor (``samples_per_symbol``).
-    If this product is even, a value of one will be added.
+    The filter length K is equal to the filter span in symbols
+    (``span_in_symbols``) multiplied by the oversampling factor
+    (``samples_per_symbol``). If this product is even, a value of one will
+    be added.
 
     The filter is applied through discrete convolution.
 
     An optional windowing function ``window`` can be applied to the filter.
 
-    The `dtype` of the output is `tf.float` if both ``x`` and the filter coefficients have dtype `tf.float`.
-    Otherwise, the dtype of the output is `tf.complex`.
+    The dtype of the output is `torch.float` if both ``x`` and the filter
+    coefficients have dtype `torch.float`. Otherwise, the dtype of the output
+    is `torch.complex`.
 
     Three padding modes are available for applying the filter:
 
@@ -445,117 +483,143 @@ class RootRaisedCosineFilter(Filter):
     *   "valid": Returns the convolution only at points where ``x`` and the filter completely overlap.
         The length of the output is N - K + 1.
 
-    Parameters
-    ----------
-    span_in_symbols: `int`
-        Filter span as measured by the number of symbols
-
-    samples_per_symbol: `int`
-        Number of samples per symbol, i.e., the oversampling factor
-
-    beta : `float`
-        Roll-off factor.
+    :param span_in_symbols: Filter span as measured by the number of symbols
+    :param samples_per_symbol: Number of samples per symbol, i.e., the
+        oversampling factor
+    :param beta: Roll-off factor.
         Must be in the range :math:`[0,1]`.
+    :param window: Window that is applied to the filter coefficients.
+        Can be `None`, a :class:`~sionna.phy.signal.Window` instance, or one of
+        ``"hann"``, ``"hamming"``, ``"blackman"``.
+    :param normalize: If `True`, the filter is normalized to have unit
+        power. Defaults to `True`.
+    :param precision: Precision used for internal calculations and outputs.
+        If set to `None`, :attr:`~sionna.phy.config.Config.precision` is used.
+    :param device: Device for computation. If `None`,
+        :attr:`~sionna.phy.config.Config.device` is used.
 
-    window: `None` (default) | :class:`~sionna.phy.signal.Window` | "hann" | "hamming" | "blackman"
-        Window that is applied to the filter coefficients
+    :input x: [..., N], `torch.complex` or `torch.float`.
+        Input to which the filter is applied along the last dimension.
 
-    normalize: `bool`, (default `True`)
-        If `True`, the filter is normalized to have unit power.
+    :input padding: "full" (default) | "valid" | "same".
+        Padding mode for convolving ``x`` and the filter.
 
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
-        If set to `None`,
-        :attr:`~sionna.phy.config.Config.precision` is used.
-
-    Input
-    -----
-    x : [...,N], `tf.complex` or `tf.float`
-        Input to which the filter is applied along the last dimension
-
-    padding : "full" (default) | "valid" | "same"
-        Padding mode for convolving ``x`` and the filter
-
-    conjugate : `bool`, (default `False`)
+    :input conjugate: `bool`, (default `False`).
         If `True`, the complex conjugate of the filter is applied.
 
-    Output
-    ------
-    y : [...,M], `tf.complex` or `tf.float`
+    :output y: [..., M], `torch.complex` or `torch.float`.
         Filtered input. The length M depends on the ``padding``.
+
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        import torch
+        from sionna.phy.signal import RootRaisedCosineFilter
+
+        rrc = RootRaisedCosineFilter(span_in_symbols=8, samples_per_symbol=4, beta=0.35)
+        x = torch.randn(32, 100)
+        y = rrc(x, padding="same")
+        print(y.shape)
+        # torch.Size([32, 100])
     """
-    def __init__(self,
-                 span_in_symbols,
-                 samples_per_symbol,
-                 beta,
-                 window=None,
-                 normalize=True,
-                 precision=None,
-                 **kwargs):
 
-        super().__init__(span_in_symbols,
-                         samples_per_symbol,
-                         window=window,
-                         normalize=normalize,
-                         precision=precision,
-                         **kwargs)
+    def __init__(
+        self,
+        span_in_symbols: int,
+        samples_per_symbol: int,
+        beta: float,
+        window: Optional[Union[Window, str]] = None,
+        normalize: bool = True,
+        precision: Optional[Precision] = None,
+        device: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            span_in_symbols,
+            samples_per_symbol,
+            window=window,
+            normalize=normalize,
+            precision=precision,
+            device=device,
+            **kwargs,
+        )
 
-        assert 0 <= beta <= 1, "beta must be from the intervall [0,1]"
+        assert 0 <= beta <= 1, "beta must be from the interval [0, 1]"
         self._beta = beta
-        self.coefficients = self._root_raised_cosine(self.sampling_times,
-                                                     1.0,
-                                                     self.beta)
+        self.coefficients = self._root_raised_cosine(
+            self.sampling_times, 1.0, self.beta
+        )
 
     @property
-    def beta(self):
-        """
-        `float`: Roll-off factor
-        """
+    def beta(self) -> float:
+        """Roll-off factor"""
         return self._beta
 
-    def _root_raised_cosine(self, t, symbol_duration, beta):
+    def _root_raised_cosine(
+        self, t: np.ndarray, symbol_duration: float, beta: float
+    ) -> np.ndarray:
         """Root-raised-cosine filter from Wikipedia
-            https://en.wikipedia.org/wiki/Root-raised-cosine_filter"""
+        https://en.wikipedia.org/wiki/Root-raised-cosine_filter"""
         h = np.zeros([len(t)], np.float32)
         for i, tt in enumerate(t):
             tt = np.abs(tt)
-            if tt==0:
-                h[i] = 1/symbol_duration*(1+beta*(4/np.pi-1))
-            elif beta>0 and (tt-np.abs(symbol_duration/4/beta)==0):
-                h[i] = beta/symbol_duration/np.sqrt(2)\
-                    * ((1+2/np.pi)*np.sin(np.pi/4/beta) + \
-                                            (1-2/np.pi)*np.cos(np.pi/4/beta))
+            if tt == 0:
+                h[i] = 1 / symbol_duration * (1 + beta * (4 / np.pi - 1))
+            elif beta > 0 and (tt - np.abs(symbol_duration / 4 / beta) == 0):
+                h[i] = (
+                    beta
+                    / symbol_duration
+                    / np.sqrt(2)
+                    * (
+                        (1 + 2 / np.pi) * np.sin(np.pi / 4 / beta)
+                        + (1 - 2 / np.pi) * np.cos(np.pi / 4 / beta)
+                    )
+                )
             else:
-                h[i] = 1/symbol_duration\
-                / (np.pi*tt/symbol_duration*(1-(4*beta*tt/symbol_duration)**2))\
-                * (np.sin(np.pi*tt/symbol_duration*(1-beta)) + \
-                4*beta*tt/symbol_duration\
-                *np.cos(np.pi*tt/symbol_duration*(1+beta)))
+                h[i] = (
+                    1
+                    / symbol_duration
+                    / (
+                        np.pi
+                        * tt
+                        / symbol_duration
+                        * (1 - (4 * beta * tt / symbol_duration) ** 2)
+                    )
+                    * (
+                        np.sin(np.pi * tt / symbol_duration * (1 - beta))
+                        + 4
+                        * beta
+                        * tt
+                        / symbol_duration
+                        * np.cos(np.pi * tt / symbol_duration * (1 + beta))
+                    )
+                )
         return h
 
+
 class SincFilter(Filter):
-    # pylint: disable=line-too-long
-    r"""
-    Block for applying a sinc filter of ``length`` K
-    to an input ``x`` of length N
+    r"""Block for applying a sinc filter of ``length`` K to an input ``x`` of length N.
 
     The sinc filter is defined by
 
     .. math::
         h(t) = \frac{1}{T}\text{sinc}\left(\frac{t}{T}\right)
 
-    where :math:`T` the symbol duration.
+    where :math:`T` is the symbol duration.
 
-    The filter length K is equal to the filter span in symbols (``span_in_symbols``)
-    multiplied by the oversampling factor (``samples_per_symbol``).
-    If this product is even, a value of one will be added.
+    The filter length K is equal to the filter span in symbols
+    (``span_in_symbols``) multiplied by the oversampling factor
+    (``samples_per_symbol``). If this product is even, a value of one will
+    be added.
 
     The filter is applied through discrete convolution.
 
     An optional windowing function ``window`` can be applied to the filter.
 
-    The `dtype` of the output is `tf.float` if both ``x`` and the filter coefficients have dtype `tf.float`.
-    Otherwise, the dtype of the output is `tf.complex`.
+    The dtype of the output is `torch.float` if both ``x`` and the filter
+    coefficients have dtype `torch.float`. Otherwise, the dtype of the output
+    is `torch.complex`.
 
     Three padding modes are available for applying the filter:
 
@@ -568,78 +632,87 @@ class SincFilter(Filter):
     *   "valid": Returns the convolution only at points where ``x`` and the filter completely overlap.
         The length of the output is N - K + 1.
 
-    Parameters
-    ----------
-    span_in_symbols: `int`
-        Filter span as measured by the number of symbols
+    :param span_in_symbols: Filter span as measured by the number of symbols
+    :param samples_per_symbol: Number of samples per symbol, i.e., the
+        oversampling factor
+    :param window: Window that is applied to the filter coefficients.
+        Can be `None`, a :class:`~sionna.phy.signal.Window` instance, or one of
+        ``"hann"``, ``"hamming"``, ``"blackman"``.
+    :param normalize: If `True`, the filter is normalized to have unit
+        power. Defaults to `True`.
+    :param precision: Precision used for internal calculations and outputs.
+        If set to `None`, :attr:`~sionna.phy.config.Config.precision` is used.
+    :param device: Device for computation. If `None`,
+        :attr:`~sionna.phy.config.Config.device` is used.
 
-    samples_per_symbol: `int`
-        Number of samples per symbol, i.e., the oversampling factor
+    :input x: [..., N], `torch.complex` or `torch.float`.
+        Input to which the filter is applied along the last dimension.
 
-    window: `None` (default) | :class:`~sionna.phy.signal.Window` | "hann" | "hamming" | "blackman"
-        Window that is applied to the filter coefficients
+    :input padding: "full" (default) | "valid" | "same".
+        Padding mode for convolving ``x`` and the filter.
 
-    normalize: `bool`, (default `True`)
-        If `True`, the filter is normalized to have unit power
-
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
-        If set to `None`,
-        :attr:`~sionna.phy.config.Config.precision` is used.
-
-    Input
-    -----
-    x : [...,N], `tf.complex` or `tf.float`
-        Input to which the filter is applied along the last dimension
-
-    padding : "full" (default) | "valid" | "same"
-        Padding mode for convolving ``x`` and the filter
-
-    conjugate : `bool`, (default `False`)
+    :input conjugate: `bool`, (default `False`).
         If `True`, the complex conjugate of the filter is applied.
 
-    Output
-    ------
-    y : [...,M], `tf.complex` or `tf.float`
+    :output y: [..., M], `torch.complex` or `torch.float`.
         Filtered input. The length M depends on the ``padding``.
-    """
-    def __init__(self,
-                 span_in_symbols,
-                 samples_per_symbol,
-                 window=None,
-                 normalize=True,
-                 precision=None,
-                 **kwargs):
 
-        super().__init__(span_in_symbols,
-                         samples_per_symbol,
-                         window=window,
-                         normalize=normalize,
-                         precision=precision,
-                         **kwargs)
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        import torch
+        from sionna.phy.signal import SincFilter
+
+        sinc = SincFilter(span_in_symbols=8, samples_per_symbol=4)
+        x = torch.randn(32, 100)
+        y = sinc(x, padding="same")
+        print(y.shape)
+        # torch.Size([32, 100])
+    """
+
+    def __init__(
+        self,
+        span_in_symbols: int,
+        samples_per_symbol: int,
+        window: Optional[Union[Window, str]] = None,
+        normalize: bool = True,
+        precision: Optional[Precision] = None,
+        device: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            span_in_symbols,
+            samples_per_symbol,
+            window=window,
+            normalize=normalize,
+            precision=precision,
+            device=device,
+            **kwargs,
+        )
 
         self.coefficients = self._sinc(self.sampling_times, 1.0)
 
-    def _sinc(self, t, symbol_duration):
+    def _sinc(self, t: np.ndarray, symbol_duration: float) -> np.ndarray:
         """Sinc filter"""
-        return 1/symbol_duration*np.sinc(t/symbol_duration)
+        return 1 / symbol_duration * np.sinc(t / symbol_duration)
+
 
 class CustomFilter(Filter):
-    # pylint: disable=line-too-long
-    r"""
-    Block for applying a custom filter of ``length`` K
-    to an input ``x`` of length N
+    r"""Block for applying a custom filter of ``length`` K to an input ``x`` of length N.
 
-    The filter length K is equal to the filter span in symbols (``span_in_symbols``)
-    multiplied by the oversampling factor (``samples_per_symbol``).
-    If this product is even, a value of one will be added.
+    The filter length K is equal to the filter span in symbols
+    (``span_in_symbols``) multiplied by the oversampling factor
+    (``samples_per_symbol``). If this product is even, a value of one will
+    be added.
 
     The filter is applied through discrete convolution.
 
     An optional windowing function ``window`` can be applied to the filter.
 
-    The `dtype` of the output is `tf.float` if both ``x`` and the filter coefficients have dtype `tf.float`.
-    Otherwise, the dtype of the output is `tf.complex`.
+    The dtype of the output is `torch.float` if both ``x`` and the filter
+    coefficients have dtype `torch.float`. Otherwise, the dtype of the output
+    is `torch.complex`.
 
     Three padding modes are available for applying the filter:
 
@@ -652,62 +725,78 @@ class CustomFilter(Filter):
     *   "valid": Returns the convolution only at points where ``x`` and the filter completely overlap.
         The length of the output is N - K + 1.
 
-    Parameters
-    ----------
-    samples_per_symbol: `int`
-        Number of samples per symbol, i.e., the oversampling factor
+    :param samples_per_symbol: Number of samples per symbol, i.e., the
+        oversampling factor
+    :param coefficients: [K], `torch.float` or `torch.complex` --
+        Filter coefficients. The number of coefficients must be odd.
+    :param window: Window that is applied to the filter coefficients.
+        Can be `None`, a :class:`~sionna.phy.signal.Window` instance, or one of
+        ``"hann"``, ``"hamming"``, ``"blackman"``.
+    :param normalize: If `True`, the filter is normalized to have unit
+        power. Defaults to `True`.
+    :param precision: Precision used for internal calculations and outputs.
+        If set to `None`, :attr:`~sionna.phy.config.Config.precision` is used.
+    :param device: Device for computation. If `None`,
+        :attr:`~sionna.phy.config.Config.device` is used.
 
-    coefficients: [K], `tf.float` or `tf.complex`
-        Filter coefficients
+    :input x: [..., N], `torch.complex` or `torch.float`.
+        Input to which the filter is applied along the last dimension.
 
-    window: `None` (default) | :class:`~sionna.phy.signal.Window` | "hann" | "hamming" | "blackman"
-        Window that is applied to the filter coefficients
+    :input padding: "full" (default) | "valid" | "same".
+        Padding mode for convolving ``x`` and the filter.
 
-    normalize: `bool`, (default `True`)
-        If `True`, the filter is normalized to have unit power.
-
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
-        If set to `None`,
-        :attr:`~sionna.phy.config.Config.precision` is used.
-
-    Input
-    -----
-    x : [...,N], `tf.complex` or `tf.float`
-        Input to which the filter is applied along the last dimension
-
-    padding : "full" (default) | "valid" | "same"
-        Padding mode for convolving ``x`` and the filter
-
-    conjugate : `bool`, (default `False`)
+    :input conjugate: `bool`, (default `False`).
         If `True`, the complex conjugate of the filter is applied.
 
-    Output
-    ------
-    y : [...,M], `tf.complex` or `tf.float`
+    :output y: [..., M], `torch.complex` or `torch.float`.
         Filtered input. The length M depends on the ``padding``.
+
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        import torch
+        from sionna.phy.signal import CustomFilter
+
+        coefficients = torch.randn(33)
+        filt = CustomFilter(samples_per_symbol=4, coefficients=coefficients)
+        x = torch.randn(32, 100)
+        y = filt(x, padding="same")
+        print(y.shape)
+        # torch.Size([32, 100])
     """
-    def __init__(self,
-                 samples_per_symbol,
-                 coefficients,
-                 window=None,
-                 normalize=True,
-                 precision=None,
-                 **kwargs):
 
-        assert samples_per_symbol>0, "samples_per_symbol must be positive"
+    def __init__(
+        self,
+        samples_per_symbol: int,
+        coefficients: Union[torch.Tensor, np.ndarray],
+        window: Optional[Union[Window, str]] = None,
+        normalize: bool = True,
+        precision: Optional[Precision] = None,
+        device: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        assert samples_per_symbol > 0, "samples_per_symbol must be positive"
 
-        l = coefficients.shape[-1]
-        assert l%2==1, "The number of coefficients must be odd"
-        span_in_symbols = l//samples_per_symbol
+        if isinstance(coefficients, np.ndarray):
+            coeff_len = coefficients.shape[-1]
+        else:
+            coeff_len = coefficients.shape[-1]
 
-        super().__init__(span_in_symbols,
-                         samples_per_symbol,
-                         window=window,
-                         normalize=normalize,
-                         precision=precision,
-                         **kwargs)
+        assert coeff_len % 2 == 1, "The number of coefficients must be odd"
+        span_in_symbols = coeff_len // samples_per_symbol
+
+        super().__init__(
+            span_in_symbols,
+            samples_per_symbol,
+            window=window,
+            normalize=normalize,
+            precision=precision,
+            device=device,
+            **kwargs,
+        )
 
         self.coefficients = coefficients
-        assert self.length == l, \
-            f"""`coefficients` must have length {self.length}"""
+        assert (
+            self.length == coeff_len
+        ), f"`coefficients` must have length {self.length}"

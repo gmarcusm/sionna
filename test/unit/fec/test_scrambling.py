@@ -1,713 +1,592 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+"""Unit tests for sionna.phy.fec.scrambling module."""
 
-import unittest
 import numpy as np
-import tensorflow as tf
+import pytest
+import torch
+
 from sionna.phy import config
 from sionna.phy.fec.scrambling import Descrambler, Scrambler, TB5GScrambler
-from sionna.phy.nr import generate_prng_seq
+from sionna.phy.nr.utils import generate_prng_seq
 
-class TestScrambler(unittest.TestCase):
 
-    def test_sequence_dimension(self):
-        """Test against correct dimensions of the sequence"""
-        seq_lengths = [1, 100, 256, 1e4]
-        batch_sizes = [1, 100, 256, 1e4]
+class TestScrambler:
+    """Tests for the Scrambler class."""
 
-        # keep_State=True
-        for seq_length in seq_lengths:
-            # init new scrambler for new sequence size;
-            # only different batch_sizes are allowed in this mode
-            s = Scrambler(binary=False)
-            for batch_size in batch_sizes:
-                llr = config.tf_rng.uniform(
-                                [tf.cast(batch_size,dtype=tf.int32),
-                                 tf.cast(seq_length, dtype=tf.int32)])
-                # build scrambler
-                x = s(llr).numpy()
-                self.assertTrue(np.array_equal(np.array(x.shape),
-                                [int(batch_size), int(seq_length)]))
-        # keep_State=False
-        s = Scrambler(binary=False, keep_state=False)
-        for seq_length in seq_lengths:
-            for batch_size in batch_sizes:
-                llr = config.tf_rng.uniform(
-                                    [tf.cast(batch_size,dtype=tf.int32),
-                                    tf.cast(seq_length, dtype=tf.int32)])
-                # build scrambler
-                x = s(llr).numpy()
-                self.assertTrue(np.array_equal(np.array(x.shape),
-                               [int(batch_size), int(seq_length)]))
+    @pytest.mark.parametrize("seq_length", [1, 100, 256, 10000])
+    @pytest.mark.parametrize("batch_size", [1, 100, 256])
+    def test_sequence_dimension_keep_state_true(self, device, seq_length, batch_size):
+        """Test against correct dimensions of the sequence with keep_state=True."""
+        s = Scrambler(binary=False, keep_state=True, device=device)
+        llr = torch.rand(batch_size, seq_length, device=device)
+        x = s(llr)
+        assert list(x.shape) == [batch_size, seq_length]
 
-        # test non-batch dimension
-        llr = tf.zeros([100,])
-        x = s(llr).numpy()
-        self.assertTrue(x.shape==(100,))
+    @pytest.mark.parametrize("seq_length", [1, 100, 256])
+    @pytest.mark.parametrize("batch_size", [1, 100])
+    def test_sequence_dimension_keep_state_false(self, device, seq_length, batch_size):
+        """Test against correct dimensions of the sequence with keep_state=False."""
+        s = Scrambler(binary=False, keep_state=False, device=device)
+        llr = torch.rand(batch_size, seq_length, device=device)
+        x = s(llr)
+        assert list(x.shape) == [batch_size, seq_length]
 
-    def test_sequence_offset(self):
-        """Test that scrambling sequence has no offset, i.e., equal likely 0s
-        and 1s"""
-        seq_length = int(1e4)
-        batch_size = int(1e2)
-        for seed in (None, 1337, 1234, 1003): # test some initial seeds
-            for keep_state in (False, True):
-                s = Scrambler(seed=seed, keep_state=keep_state, binary=True)
-                llr = config.tf_rng.uniform(
-                            [tf.cast(batch_size, dtype=tf.int32),
-                            tf.cast(seq_length, dtype=tf.int32)])
-                # build scrambler
-                s(llr)
-                # generate a random sequence
-                x = s(tf.zeros_like(llr))
-                self.assertAlmostEqual(np.mean(x),
-                                       0.5,
-                                       places=2)
+    def test_sequence_dimension_no_batch(self, device):
+        """Test non-batch dimension."""
+        s = Scrambler(binary=False, keep_state=False, device=device)
+        llr = torch.zeros(100, device=device)
+        x = s(llr)
+        assert x.shape == (100,)
 
-    def test_sequence_batch(self):
-        """Test that scrambling sequence is random per batch sample iff
-        keep_batch_dims=True."""
+    @pytest.mark.parametrize("seed", [None, 1337, 1234, 1003])
+    @pytest.mark.parametrize("keep_state", [True, False])
+    def test_sequence_offset(self, device, seed, keep_state):
+        """Test that scrambling sequence has no offset (equal likely 0s and 1s)."""
+        seq_length = 10000
+        batch_size = 100
+        s = Scrambler(seed=seed, keep_state=keep_state, binary=True, device=device)
+        llr = torch.rand(batch_size, seq_length, device=device)
+        s(llr)  # Build scrambler
+        # Generate a random sequence
+        x = s(torch.zeros_like(llr))
+        assert abs(x.float().mean().item() - 0.5) < 0.02
 
-        seq_length = int(1e6)
-        batch_size = int(1e1)
-        llr = config.tf_rng.uniform([batch_size, seq_length])
+    @pytest.mark.parametrize("keep_state", [True, False])
+    def test_sequence_batch(self, device, keep_state):
+        """Test that scrambling sequence is random per batch sample."""
+        seq_length = 100000
+        batch_size = 10
+        llr = torch.rand(batch_size, seq_length, device=device)
 
-        for keep_state in (False, True):
-            s = Scrambler(keep_batch_constant=False,
-                          keep_state=keep_state,
-                          binary=True)
-            # generate a random sequence
-            x = s(tf.zeros_like(llr))
-            for i in range(batch_size-1):
-                for j in range(i+1,batch_size):
-                    # each batch sample must be different
-                    self.assertAlmostEqual(np.mean(np.abs(x[i,:]-x[j,:])),
-                                           0.5,
-                                           places=2)
-        # test that the pattern is the same of option keep_batch_constant==True
-        for keep_state in (False, True):
-            s = Scrambler(keep_batch_constant=True,
-                          keep_state=keep_state,
-                          binary=True)
-            # generate a random sequence
-            x = s(tf.zeros_like(llr))
-            for i in range(batch_size-1):
-                for j in range(i+1,batch_size):
-                    # each batch sample is the same
-                    self.assertTrue(np.sum(np.abs(x[i,:]-x[j,:]))==0)
+        s = Scrambler(
+            keep_batch_constant=False,
+            keep_state=keep_state,
+            binary=True,
+            device=device,
+        )
+        x = s(torch.zeros_like(llr))
+        # Each batch sample must be different
+        for i in range(batch_size - 1):
+            for j in range(i + 1, batch_size):
+                diff_mean = torch.abs(x[i, :] - x[j, :]).float().mean().item()
+                assert abs(diff_mean - 0.5) < 0.02
 
-    def test_sequence_realization(self):
-        """Test that scrambling sequences are random for each new realization.
-        """
+    @pytest.mark.parametrize("keep_state", [True, False])
+    def test_sequence_batch_constant(self, device, keep_state):
+        """Test that scrambling is the same for all batch samples when
+        keep_batch_constant=True."""
+        seq_length = 100000
+        batch_size = 10
+        llr = torch.rand(batch_size, seq_length, device=device)
 
-        seq_length = int(1e5)
-        batch_size = int(1e2)
-        s = Scrambler(keep_state=False, binary=True)
-        llr = config.tf_rng.uniform([batch_size, seq_length])
-        # generate a random sequence
-        x1 = s(tf.zeros_like(llr))
-        x2 = s(tf.zeros_like(llr))
-        self.assertAlmostEqual(np.mean(np.abs(x1-x2)), 0.5, places=3)
+        s = Scrambler(
+            keep_batch_constant=True, keep_state=keep_state, binary=True, device=device
+        )
+        x = s(torch.zeros_like(llr))
+        # Each batch sample is the same
+        for i in range(batch_size - 1):
+            for j in range(i + 1, batch_size):
+                assert torch.sum(torch.abs(x[i, :] - x[j, :])).item() == 0
 
-    def test_inverse(self):
-        """Test that scrambling can be inverted/removed.
-        2x scrambling must result in the original sequence (for binary and
-         LLRs).
-        """
-        seq_length = int(1e5)
-        batch_size = int(1e2)
+    def test_sequence_realization(self, device):
+        """Test that scrambling sequences are random for each new realization."""
+        seq_length = 100000
+        batch_size = 100
+        s = Scrambler(keep_state=False, binary=True, device=device)
+        llr = torch.rand(batch_size, seq_length, device=device)
+        # Generate random sequences
+        x1 = s(torch.zeros_like(llr))
+        x2 = s(torch.zeros_like(llr))
+        diff_mean = torch.abs(x1 - x2).float().mean().item()
+        assert abs(diff_mean - 0.5) < 0.01
 
-        #check binary scrambling
-        b = config.tf_rng.uniform([tf.cast(batch_size, dtype=tf.int32),
-                                   tf.cast(seq_length, dtype=tf.int32)],
-                                   minval=0, maxval=1)
-        for keep_batch in (False, True):
-            s = Scrambler(binary=True,
-                          keep_batch_constant=keep_batch,
-                          keep_state=True)
-            # only works if keep_state=True
-            b = tf.cast(tf.greater(0.5, b), dtype=tf.float32)
-            x = s(b)
-            x = s(x)
-            self.assertTrue(np.array_equal(x.numpy(), b.numpy()))
+    @pytest.mark.parametrize("keep_batch", [True, False])
+    def test_inverse_binary(self, device, keep_batch):
+        """Test that binary scrambling can be inverted (2x scrambling returns original)."""
+        seq_length = 100000
+        batch_size = 100
 
-            #check soft-value scrambling (flip sign)
-            s = Scrambler(binary=False,
-                          keep_batch_constant=keep_batch,
-                          keep_state=True)
-            llr = config.tf_rng.uniform([tf.cast(batch_size, dtype=tf.int32),
-                                     tf.cast(seq_length, dtype=tf.int32)])
-            x = s(llr)
-            x = s(x)
-            self.assertTrue(np.array_equal(x.numpy(), llr.numpy()))
+        b = torch.rand(batch_size, seq_length, device=device)
+        b = (b > 0.5).float()
 
-    def test_llr(self):
-        """Test that scrambling works for soft-values (sign flip)."""
-        s = Scrambler(binary=False, seed=12345)
-        b = tf.ones([100,200])
+        s = Scrambler(
+            binary=True, keep_batch_constant=keep_batch, keep_state=True, device=device
+        )
         x = s(b)
-        s2 = Scrambler(binary=True, seed=12345)
-        res = -2. * s2(tf.zeros_like(x)) + 1
-        self.assertTrue(np.array_equal(x.numpy(), res.numpy()))
+        x = s(x)
+        assert torch.equal(x, b)
 
+    @pytest.mark.parametrize("keep_batch", [True, False])
+    def test_inverse_llr(self, device, keep_batch):
+        """Test that LLR scrambling can be inverted (2x scrambling returns original)."""
+        seq_length = 100000
+        batch_size = 100
 
-    def test_keep_state(self):
-        """Test that keep_state works as expected.
-        Iff keep_state==True, the scrambled sequences must be constant."""
-        seq_length = int(1e5)
-        batch_size = int(1e2)
-        llr = config.tf_rng.uniform([tf.cast(batch_size, dtype=tf.int32),
-                                     tf.cast(seq_length, dtype=tf.int32)],
-                                     minval=-100, maxval=100)
-        s = Scrambler(binary=True, keep_state=True)
-        res1 = s(tf.zeros_like(llr))
-        res2 = s(tf.zeros_like(llr))
+        llr = torch.rand(batch_size, seq_length, device=device)
 
-        self.assertTrue(np.array_equal(res1.numpy(), res2.numpy()))
+        s = Scrambler(
+            binary=False, keep_batch_constant=keep_batch, keep_state=True, device=device
+        )
+        x = s(llr)
+        x = s(x)
+        assert torch.allclose(x, llr)
 
-        # also check that the sequence is unique with keep_state=False
-        s = Scrambler(binary=True, keep_state=False)
-        _ = s(llr)
-        res1 = s(tf.zeros_like(llr))
-        _ = s(llr)
-        res2 = s(tf.zeros_like(llr))
+    def test_llr(self, device):
+        """Test that scrambling works for soft-values (sign flip)."""
+        s = Scrambler(binary=False, seed=12345, device=device)
+        b = torch.ones(100, 200, device=device)
+        x = s(b)
+        s2 = Scrambler(binary=True, seed=12345, device=device)
+        res = -2.0 * s2(torch.zeros_like(x)) + 1
+        assert torch.equal(x, res)
 
-        self.assertFalse(np.array_equal(res1.numpy(), res2.numpy()))
+    def test_keep_state(self, device):
+        """Test that keep_state works as expected."""
+        seq_length = 100000
+        batch_size = 100
+        llr = torch.rand(batch_size, seq_length, device=device)
 
+        s = Scrambler(binary=True, keep_state=True, device=device)
+        res1 = s(torch.zeros_like(llr))
+        res2 = s(torch.zeros_like(llr))
+        assert torch.equal(res1, res2)
 
-    def test_tf_fun(self):
-        """Test that graph mode and XLA works as expected"""
+        # Check that sequence is unique with keep_state=False
+        s = Scrambler(binary=True, keep_state=False, device=device)
+        s(llr)
+        res1 = s(torch.zeros_like(llr))
+        s(llr)
+        res2 = s(torch.zeros_like(llr))
+        assert not torch.equal(res1, res2)
 
-        @tf.function()
-        def run_graph(llr):
-            return s(llr)
+    def test_torch_compile(self, device):
+        """Test that torch.compile works as expected."""
+        s = Scrambler(keep_state=True, device=device)
 
-        @tf.function(jit_compile=True)
-        def run_graph_xla(llr):
-            return s(llr)
+        @torch.compile
+        def run_scramble(b):
+            return s(b)
 
-        for keep_state in (False, True):
-            s = Scrambler(keep_state=keep_state)
-            b = tf.ones([100,200])
-            x1 = run_graph(b)
-            x2 = run_graph_xla(b)
-            # again with different batch_size
-            b = tf.ones([101,200])
-            x1 = run_graph(b)
-            x2 = run_graph_xla(b)
-            # and different sequence length
-            b = tf.ones([101,201])
-            x1 = run_graph(b)
-            x2 = run_graph_xla(b)
+        b = torch.ones(100, 200, device=device)
+        x1 = run_scramble(b)
+        # Again with different batch_size
+        b = torch.ones(101, 200, device=device)
+        x2 = run_scramble(b)
 
-            self.assertTrue(np.any(np.not_equal(x1.numpy(),b.numpy())))
-            self.assertTrue(np.any(np.not_equal(x2.numpy(),b.numpy())))
+        assert torch.any(x1 != 1)
+        assert torch.any(x2 != 1)
 
-    def test_seed(self):
+    def test_seed(self, device):
         """Test that seed generates reproducible results."""
-        seq_length = int(1e5)
-        batch_size = int(1e2)
-        b = tf.zeros([batch_size, seq_length])
+        seq_length = 100000
+        batch_size = 100
+        b = torch.zeros(batch_size, seq_length, device=device)
 
-        s1 = Scrambler(seed=1337, binary=True, keep_state=False)
+        s1 = Scrambler(seed=1337, binary=True, keep_state=False, device=device)
         res_s1_1 = s1(b)
         res_s1_2 = s1(b)
-        # new realization per call
-        self.assertFalse(np.array_equal(res_s1_1.numpy(), res_s1_2.numpy()))
+        # New realization per call
+        assert not torch.equal(res_s1_1, res_s1_2)
 
-        # if keep_state=True, the same seed should lead to the same sequence
-        s2 = Scrambler(seed=1337, binary=True, keep_state=True)
+        # If keep_state=True, the same seed should lead to the same sequence
+        s2 = Scrambler(seed=1337, binary=True, keep_state=True, device=device)
         res_s2_1 = s2(b)
-        s3 = Scrambler(seed=1337)
+        s3 = Scrambler(seed=1337, device=device)
         res_s3_1 = s3(b)
-        # same seed lead to same sequence
-        self.assertTrue(np.array_equal(res_s2_1.numpy(), res_s3_1.numpy()))
+        assert torch.equal(res_s2_1, res_s3_1)
 
-         # but with random seed it gives a new sequence for each init
-        s4 = Scrambler(seed=None, binary=True, keep_state=True)
-        res_s4_1 = s2(b)
-        s5 = Scrambler(seed=None)
-        res_s5_1 = s5(b)
-        # same seed lead to same sequence
-        self.assertFalse(np.array_equal(res_s4_1.numpy(), res_s5_1.numpy()))
-
-        # for keep_State=False, even the same seed leads to new results
-        s6 = Scrambler(seed=1337, binary=True, keep_state=False)
-        res_s6_1 = s6(b)
-        # different seed generates new sequence
-        self.assertFalse(np.array_equal(res_s6_1.numpy(), res_s2_1.numpy()))
-
-        # init with same seed as previous random seed
-        s7 = Scrambler(seed=None, binary=True, keep_state=True)
-        res_s7_1 = s7(b)
-        s8 = Scrambler(seed=s7.seed, binary=True, keep_state=True)
-        res_s8_1 = s8(b)
-        # same seed lead to same sequence
-        self.assertTrue(np.array_equal(res_s7_1.numpy(), res_s8_1.numpy()))
-
-        # test that seed can be also provided to call
+        # Test that seed can also be provided to call
         seed = 987654
-        s9 = Scrambler(seed=45234, keep_state=False)
-        s10 = Scrambler(seed=76543, keep_state=True)
-        x1 = s9(x=b, seed=seed).numpy()
-        x2 = s9(x=b, seed=seed+1).numpy()
-        x3 = s9(x=b, seed=seed).numpy()
-        x4 = s10(x=b, seed=seed).numpy()
-        self.assertFalse(np.array_equal(x1, x2)) # different seed
-        self.assertTrue(np.array_equal(x1, x3)) # same seed
-        self.assertTrue(np.array_equal(x1, x4)) # same seed (keep_state=f)
+        s9 = Scrambler(seed=45234, keep_state=False, device=device)
+        s10 = Scrambler(seed=76543, keep_state=True, device=device)
+        x1 = s9(x=b, seed=seed)
+        x2 = s9(x=b, seed=seed + 1)
+        x3 = s9(x=b, seed=seed)
+        x4 = s10(x=b, seed=seed)
+        assert not torch.equal(x1, x2)  # Different seed
+        assert torch.equal(x1, x3)  # Same seed
+        assert torch.equal(x1, x4)  # Same seed
 
-        # test that random seed allows inverse
-        x5 = s9(x=b, seed=seed)
-        x6 = s9(x=b, seed=seed).numpy()
-        # same seed
-        self.assertTrue(np.array_equal(x5, x6)) # identity
-        # different seed
-        x7 = s9(x=b, seed=seed+1)
-        self.assertFalse(np.array_equal(x5, x7)) # identity
-        # same seed again
-        x8 = s9(x=b, seed=seed+1)
-        self.assertTrue(np.array_equal(x7, x8)) # identity
-
-    def test_dtype(self):
+    @pytest.mark.parametrize("dt_in", [torch.float32, torch.float64])
+    @pytest.mark.parametrize(
+        "p_scr,dt_scr", [("single", torch.float32), ("double", torch.float64)]
+    )
+    @pytest.mark.parametrize(
+        "p_des,dt_des", [("single", torch.float32), ("double", torch.float64)]
+    )
+    def test_dtype(self, device, dt_in, p_scr, dt_scr, p_des, dt_des):
         """Test that variable dtypes are supported."""
-        seq_length = int(1e1)
-        batch_size = int(1e2)
+        seq_length = 10
+        batch_size = 100
 
-        precisions = ["single", "double"]
-        dt_supported = [tf.float32, tf.float64]
-        for dt_in in dt_supported:
-            for p_scr, dt_scr in zip(precisions, dt_supported):
-                for p_des,dt_des in zip(precisions, dt_supported):
-                    b = tf.zeros([batch_size, seq_length], dtype=dt_in)
-                    s1 = Scrambler(precision=p_scr)
-                    s2 = Descrambler(s1, precision=p_des)
-                    x = s1(b)
-                    y = s2(x)
-                    assert (x.dtype==dt_scr)
-                    assert (y.dtype==dt_des)
-
-    def test_descrambler(self):
-        """"Test that descrambler works as expected."""
-        seq_length = int(1e2)
-        batch_size = int(1e1)
-
-        b = tf.zeros([batch_size, seq_length])
-        s1 = Scrambler()
-        s2 = Descrambler(s1)
+        b = torch.zeros(batch_size, seq_length, dtype=dt_in, device=device)
+        s1 = Scrambler(precision=p_scr, device=device)
+        s2 = Descrambler(s1, precision=p_des, device=device)
         x = s1(b)
         y = s2(x)
-        assert (np.array_equal(b.numpy(), y.numpy()))
+        assert x.dtype == dt_scr
+        assert y.dtype == dt_des
 
-        x = s1(b, seed=1234)
+    def test_descrambler(self, device):
+        """Test that descrambler works as expected."""
+        seq_length = 100
+        batch_size = 10
+
+        b = torch.zeros(batch_size, seq_length, device=device)
+        s1 = Scrambler(device=device)
+        s2 = Descrambler(s1, device=device)
+        x = s1(b)
         y = s2(x)
-        assert (not np.array_equal(b.numpy(), y.numpy()))
+        assert torch.equal(b, y)
 
-        # check if seed is correctly retrieved from scrambler
-        s3 = Scrambler(seed=12345)
-        s4 = Descrambler(s3)
+        # Check if seed is correctly retrieved from scrambler
+        s3 = Scrambler(seed=12345, device=device)
+        s4 = Descrambler(s3, device=device)
         x = s3(b)
         y = s4(x)
-        assert (np.array_equal(b.numpy(), y.numpy()))
+        assert torch.equal(b, y)
 
-    def test_descrambler_nonbin(self):
-        """"Test that descrambler works with non-binary."""
-        seq_length = int(1e2)
-        batch_size = int(1e1)
+    def test_descrambler_nonbin(self, device):
+        """Test that descrambler works with non-binary."""
+        seq_length = 100
+        batch_size = 10
 
-        b = tf.zeros([batch_size, seq_length])
+        b = torch.zeros(batch_size, seq_length, device=device)
 
-        # scrambler binary, but descrambler non-binary
-        scrambler = Scrambler(seed=1235456, binary=True)
-        descrambler = Descrambler(scrambler, binary=False)
-        # with explicit seed
+        # Scrambler binary, but descrambler non-binary
+        scrambler = Scrambler(seed=1235456, binary=True, device=device)
+        descrambler = Descrambler(scrambler, binary=False, device=device)
         s = 8764
         y = scrambler(b, seed=s)
-        z = descrambler(2*y-1, seed=s) # bspk
-        z = 0.5 * (1 + z) # remove bpsk
-        assert (np.array_equal(b.numpy(), z.numpy()))
-        #without explicit seed
-        y = scrambler(b)
-        z = descrambler(2*y-1) # bspk
-        z = 0.5 * (1 + z) # remove bpsk
-        assert (np.array_equal(b.numpy(), z.numpy()))
+        z = descrambler(2 * y - 1, seed=s)  # BPSK
+        z = 0.5 * (1 + z)  # Remove BPSK
+        assert torch.allclose(b, z)
 
-        # scrambler non-binary, but descrambler
-        scrambler = Scrambler(seed=1235456, binary=False)
-        descrambler = Descrambler(scrambler, binary=True)
-        s = 546342
-        y = scrambler(2*b-1, seed=s) # bspk
-        y = 0.5*(1 + y) # remove bpsk
-        z = descrambler(y, seed=s)
-        assert (np.array_equal(b.numpy(), z.numpy()))
-        #without explicit seed
-        y = scrambler(2*b-1) # bspk
-        y = 0.5*(1 + y) # remove bpsk
-        z = descrambler(y)
-        y = 1 + y # remove bpsk
-        assert (np.array_equal(b.numpy(), z.numpy()))
-
-    def test_scrambler_binary(self):
-        """Test that binary flag can be used as input"""
-        seq_length = int(1e2)
-        batch_size = int(1e1)
-
-        b = tf.ones([batch_size, seq_length])
-
-        # scrambler binary, but descrambler non-binary
-
-        scrambler = Scrambler(seed=1245, binary=True)
-
-        s = 1234
-        x1 = scrambler(b) # binary scrambling
-        x2 = scrambler(b, seed=s) # binary scrambling different seed
-        x3 = scrambler(b, seed=s, binary=True) # binary scrambling different seed
-        x4 = scrambler(b, seed=s, binary=False) # non-binary scrambling different seed
-
-        assert (not np.array_equal(x1.numpy(), x2.numpy())) # different seed
-        assert (np.array_equal(x2.numpy(), x3.numpy())) # same seed
-        # same but "bpsk modulated"
-        assert (not np.array_equal(x1.numpy(), 0.5*(1+x4.numpy())))
-
-    def test_explicit_sequence(self):
+    @pytest.mark.parametrize("shape", [[10, 123], [123]])
+    def test_explicit_sequence(self, device, shape):
         """Test that explicit scrambling sequence can be provided."""
-
         bs = 10
         seq_length = 123
 
-        # with/ without implicit broadcasting
-        shapes = [[bs, seq_length], [seq_length]]
-        for s in shapes:
-            seq = np.ones(s)
+        seq = torch.ones(shape, device=device)
+        x = torch.zeros(bs, seq_length, device=device)
+        scrambler1 = Scrambler(seed=1245, sequence=seq, binary=True, device=device)
+        y1 = scrambler1(x)
 
-            x = np.zeros([bs, seq_length])
-            scrambler1 = Scrambler(seed=1245, sequence=seq, binary=True)
-            y1 = scrambler1(x)
+        # For all-zero input, output sequence equals scrambling sequence
+        if len(shape) == 1:
+            y = y1[0, :]
+        else:
+            y = y1
+        assert torch.equal(seq, y)
 
-            # for all-zero input, output sequence equals scrambling sequence
-            if len(s)==1:
-                y = y1.numpy()[0,:] # if implicit broadcasting is tested
-            else:
-                y = y1
-            self.assertTrue(np.array_equal(seq, y))
+        # Check that seed has no influence
+        scrambler2 = Scrambler(seed=1323, sequence=seq, binary=True, device=device)
+        y2 = scrambler2(x)
+        assert torch.equal(y1, y2)
 
-            # check that seed has no influence
-            scrambler2 = Scrambler(seed=1323, sequence=seq, binary=True)
-            y2 = scrambler2(x)
-            self.assertTrue(np.array_equal(y1.numpy(), y2.numpy()))
+    @pytest.mark.parametrize("binary", [True, False])
+    def test_explicit_sequence_descrambler(self, device, binary):
+        """Test descrambler with explicit scrambling sequence."""
+        bs = 10
+        seq_length = 123
 
-        # test descrambler with new random sequence
-        seq = generate_prng_seq(seq_length, 42)
+        seq_np = generate_prng_seq(seq_length, 42)
+        seq = torch.tensor(seq_np, dtype=torch.float32, device=device)
 
-        for b in [True, False]:
-            scrambler = Scrambler(sequence=seq, binary=b)
-            descrambler = Descrambler(scrambler, binary=b)
-            x = np.ones([bs, seq_length])
-            y = scrambler(x)
-            y2 = scrambler(x, seed=1337) # explicit seed should not have any impact
-            z = descrambler(y)
+        scrambler = Scrambler(sequence=seq, binary=binary, device=device)
+        descrambler = Descrambler(scrambler, binary=binary, device=device)
+        x = torch.ones(bs, seq_length, device=device)
+        y = scrambler(x)
+        y2 = scrambler(x, seed=1337)  # Explicit seed should not have any impact
+        z = descrambler(y)
 
-            self.assertFalse(np.array_equal(x, y.numpy()))
-            self.assertTrue(np.array_equal(x, z.numpy()))
-            self.assertTrue(np.array_equal(y.numpy(), y2.numpy()))
+        assert not torch.equal(x, y)
+        assert torch.allclose(x, z)
+        assert torch.equal(y, y2)
 
 
-class TestTB5GScrambler(unittest.TestCase):
+class TestTB5GScrambler:
+    """Tests for the TB5GScrambler class."""
 
-    def test_sequence_dimension(self):
-        """Test against correct dimensions of the sequence"""
-        seq_lengths = [1, 100, 256, 1e4]
-        batch_sizes = [1, 100, 256, 1e4]
+    @pytest.mark.parametrize("seq_length", [1, 100, 256, 10000])
+    @pytest.mark.parametrize("batch_size", [1, 100])
+    def test_sequence_dimension(self, device, seq_length, batch_size):
+        """Test against correct dimensions of the sequence."""
+        s = TB5GScrambler(device=device)
+        llr = torch.rand(batch_size, seq_length, device=device)
+        x = s(llr)
+        assert list(x.shape) == [batch_size, seq_length]
 
-        s = TB5GScrambler()
-        for seq_length in seq_lengths:
-            for batch_size in batch_sizes:
-                llr = config.tf_rng.uniform([tf.cast(batch_size, dtype=tf.int32),
-                                         tf.cast(seq_length, dtype=tf.int32)])
-                x = s(llr).numpy()
-                self.assertTrue(np.array_equal(np.array(x.shape),
-                                [int(batch_size), int(seq_length)]))
+    def test_sequence_dimension_no_batch(self, device):
+        """Test non-batch dimension."""
+        s = TB5GScrambler(device=device)
+        llr = torch.zeros(100, device=device)
+        x = s(llr)
+        assert x.shape == (100,)
 
-        # test non-batch dimension
-        llr = tf.zeros([100,])
-        x = s(llr).numpy()
-        self.assertTrue(x.shape==(100,))
+    def test_sequence_batch(self, device):
+        """Test that scrambling sequence is the same for all batch samples."""
+        seq_length = 1000
+        batch_size = 100
 
-    def test_sequence_batch(self):
-        """Test that scrambling sequence the same for all batch samples."""
+        s = TB5GScrambler(binary=True, device=device)
+        x = s(torch.zeros(batch_size, seq_length, device=device))
 
-        seq_length = int(1e3)
-        batch_size = int(100)
+        for i in range(batch_size - 1):
+            for j in range(i + 1, batch_size):
+                assert torch.sum(torch.abs(x[i, :] - x[j, :])).item() == 0
 
-        s = TB5GScrambler(binary=True)
-
-        # generate a random sequence
-        x = s(tf.zeros((batch_size, seq_length)))
-        for i in range(batch_size-1):
-            for j in range(i+1,batch_size):
-                # ensure that each batch sample is the same
-                self.assertTrue(np.sum(np.abs(x[i,:]-x[j,:]))==0)
-
-    def test_sequence_realization(self):
-        """Test that scrambling sequences are random for different init values.
-        """
-        seq_length = int(1e2)
-        batch_size = int(10)
+    def test_sequence_realization(self, device):
+        """Test that scrambling sequences are different for different init values."""
+        seq_length = 100
+        batch_size = 10
         n_rnti_ref = 1337
         n_id_ref = 42
-        s = TB5GScrambler(n_rnti_ref, n_id_ref, binary=True)
-        x_ref = s(tf.zeros((batch_size, seq_length)))
 
-        for _ in range(100): # randomly init new scramblers
-            n_rnti=config.np_rng.integers(0, 2**16-1)
-            n_id=config.np_rng.integers(0, 2**10-1)
-            if n_rnti==n_rnti_ref and n_id==n_id_ref:
-                continue # skip evaluation if ref init parameters are selected
-            s = TB5GScrambler(n_rnti, n_id, binary=True)
-            # generate a random sequence
-            x = s(tf.zeros((batch_size, seq_length)))
-            # and the sequence must be different
-            self.assertFalse(np.array_equal(x_ref.numpy(), x.numpy()))
+        s_ref = TB5GScrambler(n_rnti_ref, n_id_ref, binary=True, device=device)
+        x_ref = s_ref(torch.zeros(batch_size, seq_length, device=device))
 
-    def test_inverse(self):
-        """Test that scrambling can be inverted/removed.
-           2x scrambling must result in the original sequence (for binary and
-           LLRs)."""
+        # Randomly init new scramblers
+        for _ in range(10):
+            n_rnti = int(config.np_rng.integers(0, 2**16 - 1))
+            n_id = int(config.np_rng.integers(0, 2**10 - 1))
+            if n_rnti == n_rnti_ref and n_id == n_id_ref:
+                continue
+            s = TB5GScrambler(n_rnti, n_id, binary=True, device=device)
+            x = s(torch.zeros(batch_size, seq_length, device=device))
+            assert not torch.equal(x_ref, x)
 
-        seq_length = int(1e3)
-        batch_size = int(1e2)
+    def test_inverse_binary(self, device):
+        """Test that binary scrambling can be inverted."""
+        seq_length = 1000
+        batch_size = 100
 
-        #check binary scrambling
-        b = config.tf_rng.uniform([batch_size, seq_length], minval=0, maxval=1)
-        s = TB5GScrambler(binary=True)
-        b = tf.cast(tf.greater(0.5, b), dtype=tf.float32)
+        b = torch.rand(batch_size, seq_length, device=device)
+        b = (b > 0.5).float()
+        s = TB5GScrambler(binary=True, device=device)
         x = s(b)
         x = s(x)
-        self.assertTrue(np.array_equal(x.numpy(), b.numpy()))
+        assert torch.equal(x, b)
 
-        #check soft-value scrambling (flip sign)
-        s = TB5GScrambler(binary=False)
-        llr = config.tf_rng.uniform([batch_size, seq_length])
+    def test_inverse_llr(self, device):
+        """Test that LLR scrambling can be inverted."""
+        seq_length = 1000
+        batch_size = 100
+
+        llr = torch.rand(batch_size, seq_length, device=device)
+        s = TB5GScrambler(binary=False, device=device)
         x = s(llr)
         x = s(x)
-        self.assertTrue(np.array_equal(x.numpy(), llr.numpy()))
+        assert torch.allclose(x, llr)
 
-    def test_tf_fun(self):
-        """Test that graph mode and XLA works as expected"""
+    def test_torch_compile(self, device):
+        """Test that torch.compile works as expected."""
+        s = TB5GScrambler(device=device)
 
-        @tf.function()
-        def run_graph(llr):
-            return s(llr)
+        @torch.compile
+        def run_scramble(b):
+            return s(b)
 
-        @tf.function(jit_compile=True)
-        def run_graph_xla(llr):
-            return s(llr)
+        b = torch.ones(10, 200, device=device)
+        x1 = run_scramble(b)
+        # Again with different batch_size
+        b = torch.ones(11, 200, device=device)
+        x2 = run_scramble(b)
 
-        s = TB5GScrambler()
-        b = tf.ones([10,200])
-        x1 = run_graph(b)
-        x2 = run_graph_xla(b)
-        # again with different batch_size
-        b = tf.ones([11,200])
-        x1 = run_graph(b)
-        x2 = run_graph_xla(b)
-        # and different sequence length
-        b = tf.ones([11,201])
-        x1 = run_graph(b)
-        x2 = run_graph_xla(b)
+        assert torch.any(x1 != 1)
+        assert torch.any(x2 != 1)
 
-        self.assertTrue(np.any(np.not_equal(x1.numpy(),b.numpy())))
-        self.assertTrue(np.any(np.not_equal(x2.numpy(),b.numpy())))
-
-    def test_dtype(self):
+    @pytest.mark.parametrize("dt_in", [torch.float32, torch.float64])
+    @pytest.mark.parametrize(
+        "p_scr,dt_scr", [("single", torch.float32), ("double", torch.float64)]
+    )
+    @pytest.mark.parametrize(
+        "p_des,dt_des", [("single", torch.float32), ("double", torch.float64)]
+    )
+    def test_dtype(self, device, dt_in, p_scr, dt_scr, p_des, dt_des):
         """Test that variable dtypes are supported."""
-        seq_length = int(1e1)
-        batch_size = int(1e2)
+        seq_length = 10
+        batch_size = 100
 
-        precisions = ["single", "double"]
-        dt_supported = [tf.float32, tf.float64]
-        for dt_in in dt_supported:
-            for p_scr, dt_scr in zip(precisions, dt_supported):
-                for p_des,dt_des in zip(precisions, dt_supported):
-                    b = tf.zeros([batch_size, seq_length], dtype=dt_in)
-                    s1 = TB5GScrambler(precision=p_scr)
-                    s2 = Descrambler(s1, precision=p_des)
-                    x = s1(b)
-                    y = s2(x)
-                    assert (x.dtype==dt_scr)
-                    assert (y.dtype==dt_des)
-
-    def test_descrambler(self):
-        """"Test that descrambler works as expected."""
-        seq_length = int(1e2)
-        batch_size = int(1e1)
-
-        b = tf.zeros([batch_size, seq_length])
-        s1 = TB5GScrambler()
-        s2 = Descrambler(s1)
+        b = torch.zeros(batch_size, seq_length, dtype=dt_in, device=device)
+        s1 = TB5GScrambler(precision=p_scr, device=device)
+        s2 = Descrambler(s1, precision=p_des, device=device)
         x = s1(b)
         y = s2(x)
-        assert (np.array_equal(b.numpy(), y.numpy()))
+        assert x.dtype == dt_scr
+        assert y.dtype == dt_des
 
-    def test_descrambler_nonbin(self):
-        """"Test that descrambler works with non-binary."""
-        seq_length = int(1e2)
-        batch_size = int(1e1)
+    def test_descrambler(self, device):
+        """Test that descrambler works as expected."""
+        seq_length = 100
+        batch_size = 10
 
-        b = tf.zeros([batch_size, seq_length])
+        b = torch.zeros(batch_size, seq_length, device=device)
+        s1 = TB5GScrambler(device=device)
+        s2 = Descrambler(s1, device=device)
+        x = s1(b)
+        y = s2(x)
+        assert torch.equal(b, y)
 
-        # scrambler binary, but descrambler non-binary
-        scrambler = Scrambler(binary=True)
-        descrambler = Descrambler(scrambler, binary=False)
+    def test_scrambler_binary(self, device):
+        """Test that binary flag can be used as input."""
+        seq_length = 100
+        batch_size = 10
 
-        y = scrambler(b)
-        z = descrambler(2*y-1) # bspk
-        z = 1 + z # remove bpsk
-        assert (np.array_equal(b.numpy(), z.numpy()))
+        b = torch.ones(batch_size, seq_length, device=device)
+        scrambler = TB5GScrambler(binary=True, device=device)
 
-        # scrambler non-binary, but descrambler
-        scrambler = Scrambler(binary=False)
-        descrambler = Descrambler(scrambler, binary=True)
-        y = scrambler(2*b-1) # bspk
-        y = 0.5*(1 + y) # remove bpsk
-        z = descrambler(y)
-        y = 1 + y # remove bpsk
-        assert (np.array_equal(b.numpy(), z.numpy()))
+        x1 = scrambler(b)  # Binary scrambling
+        x2 = scrambler(b)  # Binary scrambling
+        x3 = scrambler(b, binary=True)  # Binary scrambling
+        x4 = scrambler(b, binary=False)  # Non-binary scrambling
 
-    def test_scrambler_binary(self):
-        """Test that binary flag can be used as input"""
-        seq_length = int(1e2)
-        batch_size = int(1e1)
+        assert torch.equal(x1, x2)
+        assert torch.equal(x2, x3)
+        assert torch.allclose(x1, 0.5 * (1 + x4))
 
-        b = tf.ones([batch_size, seq_length])
-
-        # scrambler binary, but descrambler non-binary
-
-        scrambler = TB5GScrambler(binary=True)
-
-        x1 = scrambler(b) # binary scrambling
-        x2 = scrambler(b) # binary scrambling
-        x3 = scrambler(b, binary=True) # binary scrambling
-        x4 = scrambler(b, binary=False) # non-binary scrambling
-
-        assert (np.array_equal(x1.numpy(), x2.numpy()))
-        assert (np.array_equal(x2.numpy(), x3.numpy()))
-        assert (np.array_equal(x1.numpy(), 0.5*(1+x4.numpy())))
-
-
-    def test_5gnr_reference(self):
+    def test_5gnr_reference(self, device):
         """Test against 5G NR reference."""
-
         bs = 2
-        l = 100
+        length = 100
 
-        # check valid inputs
+        # Check valid inputs
         n_rs = [0, 10, 65535]
         n_ids = [0, 10, 1023]
         s_old = None
         for n_r in n_rs:
-            for n_id  in n_ids:
-                s = TB5GScrambler(n_id=n_id, n_rnti=n_r)(tf.zeros((bs, l)))
-                # verify that new sequence is unique
+            for n_id in n_ids:
+                s = TB5GScrambler(n_id=n_id, n_rnti=n_r, device=device)(
+                    torch.zeros(bs, length, device=device)
+                )
                 if s_old is not None:
-                    self.assertFalse(np.array_equal(s, s_old))
+                    assert not torch.equal(s, s_old)
                 s_old = s
 
-        # test against invalid inputs
-        n_rs = [-1, 1.2, 65536] # invalid
-        n_ids = [0, 10, 1023] # valid
-        for n_r in n_rs:
-            for n_id in n_ids:
-                with self.assertRaises(ValueError):
-                    s = TB5GScrambler(n_id=n_id, n_rnti=n_r)(tf.zeros((bs, l)))
-
-        n_rs = [0, 10, 65535] # valid
-        n_ids = [-1, 1.2, 1024] # invalid
-        for n_r in n_rs:
-            for n_id  in n_ids:
-                with self.assertRaises(ValueError):
-                    s = TB5GScrambler(n_id=n_id, n_rnti=n_r)(tf.zeros((bs, l)))
-
-        # test against reference example
+        # Test against reference example
         n_rnti = 20001
         n_id = 41
-        l = 100
-        s_ref = np.array([0., 1., 1., 1., 1., 0., 0., 0., 0., 1., 0., 1., 0.,
-                          1., 1., 1., 0., 0., 0., 1., 1., 1., 0., 0., 0., 1.,
-                          1., 0., 0., 1., 1., 1., 0., 1., 0., 0., 1., 1., 1.,
-                          0., 1., 0., 0., 0., 0., 0., 1., 1., 1., 0., 1., 1.,
-                          0., 1., 1., 0., 0., 0., 1., 0., 0., 1., 0., 0., 1.,
-                          0., 0., 0., 0., 0., 0., 1., 1., 1., 0., 1., 0., 0.,
-                          1., 1., 0., 1., 1., 1., 0., 0., 0., 0., 0., 1., 0.,
-                          1., 1., 1., 1., 1., 1., 1., 0., 0.])
-        s = TB5GScrambler(n_id=n_id, n_rnti=n_rnti)(tf.zeros((1, l)))
-        s = tf.squeeze(s, axis=0) # remove batch-dim
-        self.assertTrue(np.array_equal(s, s_ref))
+        s_ref = np.array(
+            [
+                0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0,
+                1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0,
+                1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0,
+                0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0,
+                0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0,
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0,
+                1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0,
+                1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0,
+            ]
+        )
+        s = TB5GScrambler(n_id=n_id, n_rnti=n_rnti, device=device)(
+            torch.zeros(1, length, device=device)
+        )
+        s = s.squeeze(0).cpu().numpy()
+        assert np.array_equal(s, s_ref)
 
-        # and test against wrong parameters
-        s = TB5GScrambler(n_id=n_id, n_rnti=n_rnti+1)(tf.zeros((1, l)))
-        s = tf.squeeze(s, axis=0) # remove batch-dim
-        self.assertFalse(np.array_equal(s, s_ref))
-        s = TB5GScrambler(n_id=n_id+1, n_rnti=n_rnti)(tf.zeros((1, l)))
-        s = tf.squeeze(s, axis=0) # remove batch-dim
-        self.assertFalse(np.array_equal(s, s_ref))
+        # And test against wrong parameters
+        s = TB5GScrambler(n_id=n_id, n_rnti=n_rnti + 1, device=device)(
+            torch.zeros(1, length, device=device)
+        )
+        s = s.squeeze(0).cpu().numpy()
+        assert not np.array_equal(s, s_ref)
 
-        # test that PUSCH and PDSCH are the same for single cw mode
-        s_ref = TB5GScrambler(n_id=n_id,
-                              n_rnti=n_rnti,
-                              channel_type="PUSCH")(tf.zeros((1, l)))
+        # Test that PUSCH and PDSCH are the same for single cw mode
+        s_ref = TB5GScrambler(
+            n_id=n_id, n_rnti=n_rnti, channel_type="PUSCH", device=device
+        )(torch.zeros(1, length, device=device))
 
         # cw_idx has no impact in uplink
-        s = TB5GScrambler(n_id=n_id,
-                        n_rnti=n_rnti,
-                        codeword_index=1,
-                        channel_type="PUSCH")(tf.zeros((1, l)))
-        self.assertTrue(np.array_equal(s_ref, s))
+        s = TB5GScrambler(
+            n_id=n_id,
+            n_rnti=n_rnti,
+            codeword_index=1,
+            channel_type="PUSCH",
+            device=device,
+        )(torch.zeros(1, length, device=device))
+        assert torch.equal(s_ref, s)
 
-        # downlink equals uplink for cw_idx=0
-        s = TB5GScrambler(n_id=n_id,
-                        n_rnti=n_rnti,
-                        codeword_index=0,
-                        channel_type="PDSCH")(tf.zeros((1, l)))
-        self.assertTrue(np.array_equal(s_ref, s))
+        # Downlink equals uplink for cw_idx=0
+        s = TB5GScrambler(
+            n_id=n_id,
+            n_rnti=n_rnti,
+            codeword_index=0,
+            channel_type="PDSCH",
+            device=device,
+        )(torch.zeros(1, length, device=device))
+        assert torch.equal(s_ref, s)
 
-        # downlink is different uplink for cw_idx=1
-        s = TB5GScrambler(n_id=n_id,
-                          n_rnti=n_rnti,
-                          codeword_index=1,
-                          channel_type="PDSCH")(tf.zeros((1, l)))
-        self.assertFalse(np.array_equal(s_ref, s))
+        # Downlink is different from uplink for cw_idx=1
+        s = TB5GScrambler(
+            n_id=n_id,
+            n_rnti=n_rnti,
+            codeword_index=1,
+            channel_type="PDSCH",
+            device=device,
+        )(torch.zeros(1, length, device=device))
+        assert not torch.equal(s_ref, s)
 
+    @pytest.mark.parametrize("n_r", [-1, 1.2, 65536])
+    @pytest.mark.parametrize("n_id", [0, 10, 1023])
+    def test_5gnr_invalid_n_rnti(self, device, n_r, n_id):
+        """Test that invalid n_rnti values raise ValueError."""
+        with pytest.raises(ValueError):
+            TB5GScrambler(n_id=n_id, n_rnti=n_r, device=device)
 
-    def test_multi_user(self):
-        """Test multi-stream functionality.
-        If n_rnti and n_id are provided as list of ints, the axis=-2 dimension
-        is interpreted as independent stream."""
+    @pytest.mark.parametrize("n_r", [0, 10, 65535])
+    @pytest.mark.parametrize("n_id", [-1, 1.2, 1024])
+    def test_5gnr_invalid_n_id(self, device, n_r, n_id):
+        """Test that invalid n_id values raise ValueError."""
+        with pytest.raises(ValueError):
+            TB5GScrambler(n_id=n_id, n_rnti=n_r, device=device)
 
-        seq_length = int(1e3)
+    def test_multi_user(self, device):
+        """Test multi-stream functionality."""
+        seq_length = 1000
         batch_size = 13
 
         n_rntis = [1, 38282, 1337, 36443]
         n_ids = [123, 42, 232, 134]
 
-        u = tf.zeros([batch_size, 2, len(n_rntis), seq_length])
-        s_ref = np.zeros([batch_size, 2, len(n_rntis), seq_length])
+        u = torch.zeros(batch_size, 2, len(n_rntis), seq_length, device=device)
+        s_ref = torch.zeros_like(u)
 
-        # generate batch of multiple streams individually
-        for idx,(n_rnti, n_id) in enumerate(zip(n_rntis, n_ids)):
-            s_ref[..., idx,:] = TB5GScrambler(n_id=n_id,
-                              n_rnti=n_rnti)(u[...,0,:]).numpy()
+        # Generate batch of multiple streams individually
+        for idx, (n_rnti, n_id) in enumerate(zip(n_rntis, n_ids)):
+            scrambler = TB5GScrambler(n_id=n_id, n_rnti=n_rnti, device=device)
+            s_ref[..., idx, :] = scrambler(u[..., 0, :])
 
-        # run scrambler one-shot with list of n_rnti/n_id
-        scrambler = TB5GScrambler(n_id=n_ids,
-                                  n_rnti=n_rntis)
-        s = scrambler(u).numpy()
+        # Run scrambler one-shot with list of n_rnti/n_id
+        scrambler = TB5GScrambler(n_id=n_ids, n_rnti=n_rntis, device=device)
+        s = scrambler(u)
 
-        # scrambling sequences should be equivalent
-        self.assertTrue(np.array_equal(s, s_ref))
+        # Scrambling sequences should be equivalent
+        assert torch.equal(s, s_ref)
 
-        # also test descrambler
-        u_hat = Descrambler(scrambler)(s).numpy()
+        # Also test descrambler
+        u_hat = Descrambler(scrambler, device=device)(s)
+        assert torch.equal(u_hat, torch.zeros_like(u_hat))
 
-        self.assertTrue(np.array_equal(u_hat, np.zeros_like(u_hat)))
+
+class TestDescrambler:
+    """Tests for the Descrambler class."""
+
+    def test_invalid_scrambler(self):
+        """Test that descrambler raises error for invalid scrambler."""
+        with pytest.raises(TypeError):
+            Descrambler("not_a_scrambler")
+
+    def test_docstring_example(self):
+        """Verify the docstring example works correctly."""
+        scrambler = Scrambler(seed=42, keep_state=True)
+        descrambler = Descrambler(scrambler, binary=False)
+
+        llrs = torch.randn(10, 100, device=scrambler.device)
+        scrambled = scrambler(llrs, binary=False)
+        unscrambled = descrambler(scrambled)
+        assert torch.allclose(llrs, unscrambled)
+

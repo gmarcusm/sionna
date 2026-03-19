@@ -1,16 +1,30 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
-"""Classes and functions related to MIMO channel equalization"""
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+"""Classes and functions related to MIMO channel equalization."""
 
-import tensorflow as tf
-from sionna.phy import config, dtypes
+from typing import Optional, Tuple
+import torch
+
+from sionna.phy.config import config, dtypes, Precision
 from sionna.phy.utils import expand_to_rank, matrix_pinv
 from sionna.phy.mimo.utils import whiten_channel
 
-def lmmse_matrix(h, s=None, precision=None):
-    # pylint: disable=line-too-long
-    r"""MIMO LMMSE Equalization matrix
+__all__ = [
+    "lmmse_matrix",
+    "lmmse_equalizer",
+    "zf_equalizer",
+    "mf_equalizer",
+]
+
+
+def lmmse_matrix(
+    h: torch.Tensor,
+    s: Optional[torch.Tensor] = None,
+    precision: Optional[Precision] = None,
+) -> torch.Tensor:
+    r"""MIMO LMMSE Equalization matrix.
 
     This function computes the LMMSE equalization matrix for a MIMO link,
     assuming the following model:
@@ -27,7 +41,7 @@ def lmmse_matrix(h, s=None, precision=None):
     :math:`\mathbb{E}\left[\mathbf{x}\mathbf{x}^{\mathsf{H}}\right]=\mathbf{I}_K` and
     :math:`\mathbb{E}\left[\mathbf{n}\mathbf{n}^{\mathsf{H}}\right]=\mathbf{S}`.
 
-    This function returns the LLMSE equalization matrix:
+    This function returns the LMMSE equalization matrix:
 
     .. math::
 
@@ -40,67 +54,75 @@ def lmmse_matrix(h, s=None, precision=None):
 
         \mathbf{G} = \left(\mathbf{H}^{\mathsf{H}}\mathbf{H} + \mathbf{I}\right)^{-1}\mathbf{H}^{\mathsf{H}} .
 
-    Input
-    -----
+    :param h: Channel matrices with shape [..., M, K]
+    :param s: Noise covariance matrices with shape [..., M, M].
+        If `None`, the noise is assumed to be white with unit variance.
+    :param precision: Precision used for internal calculations and outputs.
+        If set to `None`, :attr:`~sionna.phy.config.Config.precision` is used.
 
-    h : [...,M,K], `tf.complex`
-        Channel matrices
+    :output g: [..., K, M], `torch.complex`. LMMSE equalization matrices.
 
-    s : `None` (default) | [...,M,M], `tf.complex`
-        Noise covariance matrices. If `None`, the noise is assumed to be white
-        with unit variance.
+    .. rubric:: Examples
 
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
-        If set to `None`,
-        :attr:`~sionna.phy.config.Config.precision` is used.
+    .. code-block:: python
 
-    Output
-    ------
-    g : [...,K,M], `tf.complex`
-        LLMSE equalization matrices
-
+        h = torch.complex(torch.randn(4, 2), torch.randn(4, 2))
+        g = lmmse_matrix(h)
+        # g.shape = torch.Size([2, 4])
     """
-    # Cast inputs
+    # Determine dtype
     if precision is None:
-        cdtype = config.tf_cdtype
+        cdtype = config.cdtype
     else:
-        cdtype = dtypes[precision]["tf"]["cdtype"]
-    h = tf.cast(h, dtype=cdtype)
+        cdtype = dtypes[precision]["torch"]["cdtype"]
+
+    h = h.to(dtype=cdtype)
+    s_none = s is None
+
     if s is not None:
-        s = tf.cast(s, dtype=cdtype)
-        s_none = False
+        s = s.to(dtype=cdtype)
     else:
-        s = expand_to_rank(tf.eye(h.shape[-1], dtype=h.dtype), tf.rank(h), 0)
-        s_none = True
+        # Identity matrix with proper batch dimensions
+        k = h.shape[-1]
+        s = torch.eye(k, dtype=cdtype, device=h.device)
+        s = expand_to_rank(s, h.dim(), 0)
 
     if not s_none:
-        #------------------------------------#
-        # Compute g = h^* @ (h @ h^* + s)^-1 #
-        #------------------------------------#
-        # hhs = h @ h^* + s.
-        # Note that hhs^* = hhs, hence it admits a Cholesky decomposition
-        hhs = tf.matmul(h, h, adjoint_b=True) + s
+        # Compute g = h^H @ (h @ h^H + s)^-1
+        # hhs = h @ h^H + s
+        # Note that hhs^H = hhs, hence it admits a Cholesky decomposition
+        hhs = h @ h.mH + s
 
-        # Solve hhs @ g_t = h in the unknown g_t
-        chol = tf.linalg.cholesky(hhs)
-        g_t = tf.linalg.cholesky_solve(chol, h)
+        # Solve hhs @ g_t = h for g_t using Cholesky
+        # Use cholesky_ex with check_errors=False for CUDA graph compatibility
+        chol, _ = torch.linalg.cholesky_ex(hhs, check_errors=False)
+        # cholesky_solve: solve L L^H x = b
+        # First solve L y = h, then L^H g_t = y
+        y = torch.linalg.solve_triangular(chol, h, upper=False)
+        g_t = torch.linalg.solve_triangular(chol.mH, y, upper=True)
 
-        # Compute g = g_t^* = (hhs^-1 @ h)^* = h^* @ hhs^-1
-        g = tf.linalg.adjoint(g_t)
+        # Compute g = g_t^H = (hhs^-1 @ h)^H = h^H @ hhs^-1
+        g = g_t.mH
     else:
-        #------------------------------------#
-        # Compute g = (h^* @ h + I)^-1 @ h^* #
-        #------------------------------------#
-        hhs = tf.matmul(h, h, adjoint_a=True) + s
-        chol = tf.linalg.cholesky(hhs)
-        g = tf.linalg.cholesky_solve(chol, tf.linalg.adjoint(h))
+        # Compute g = (h^H @ h + I)^-1 @ h^H
+        hhs = h.mH @ h + s
+        # Use cholesky_ex with check_errors=False for CUDA graph compatibility
+        chol, _ = torch.linalg.cholesky_ex(hhs, check_errors=False)
+        h_h = h.mH
+        y = torch.linalg.solve_triangular(chol, h_h, upper=False)
+        g = torch.linalg.solve_triangular(chol.mH, y, upper=True)
 
     return g
 
-def lmmse_equalizer(y, h, s, whiten_interference=True, precision=None):
-    # pylint: disable=line-too-long
-    r""" MIMO LMMSE Equalizer
+
+def lmmse_equalizer(
+    y: torch.Tensor,
+    h: torch.Tensor,
+    s: torch.Tensor,
+    whiten_interference: bool = True,
+    precision: Optional[Precision] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""MIMO LMMSE Equalizer.
 
     This function implements LMMSE equalization for a MIMO link, assuming the
     following model:
@@ -118,7 +140,7 @@ def lmmse_equalizer(y, h, s, whiten_interference=True, precision=None):
     :math:`\mathbb{E}\left[\mathbf{n}\mathbf{n}^{\mathsf{H}}\right]=\mathbf{S}`.
 
     The estimated symbol vector :math:`\hat{\mathbf{x}}\in\mathbb{C}^K` is given as
-    (Lemma B.19) [BHS2017]_ :
+    (Lemma B.19) :cite:p:`BHS2017` :
 
     .. math::
 
@@ -151,90 +173,82 @@ def lmmse_equalizer(y, h, s, whiten_interference=True, precision=None):
     The function returns :math:`\hat{\mathbf{x}}` and
     :math:`\boldsymbol{\sigma}^2=\left[\sigma^2_0,\dots, \sigma^2_{K-1}\right]^{\mathsf{T}}`.
 
-    Input
-    -----
-    y : [...,M], `tf.complex`
-        Received signals
+    :param y: Received signals with shape [..., M]
+    :param h: Channel matrices with shape [..., M, K]
+    :param s: Noise covariance matrices with shape [..., M, M]
+    :param whiten_interference: If `True`, the interference is first whitened
+        before equalization. In this case, an alternative expression for the
+        receive filter is used that can be numerically more stable.
+    :param precision: Precision used for internal calculations and outputs.
+        If set to `None`, :attr:`~sionna.phy.config.Config.precision` is used.
 
-    h : [...,M,K], `tf.complex`
-        Channel matrices
+    :output x_hat: [..., K], `torch.complex`. Estimated symbol vectors.
+    :output no_eff: [..., K], `torch.float`. Effective noise variance for each stream.
 
-    s : [...,M,M], `tf.complex`
-        Noise covariance matrices
+    .. rubric:: Examples
 
-    whiten_interference : `bool`, (default `True`)
-        If `True`, the interference is first whitened before equalization.
-        In this case, an alternative expression for the receive filter is used that
-        can be numerically more stable.
+    .. code-block:: python
 
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
-        If set to `None`,
-        :attr:`~sionna.phy.config.Config.precision` is used.
-
-    Output
-    ------
-    x_hat : [...,K], `tf.complex`
-        Estimated symbol vectors
-
-    no_eff : `tf.float`
-        Effective noise variance estimates
+        y = torch.complex(torch.randn(4), torch.randn(4))
+        h = torch.complex(torch.randn(4, 2), torch.randn(4, 2))
+        s = torch.eye(4, dtype=torch.complex64)
+        x_hat, no_eff = lmmse_equalizer(y, h, s)
     """
-    # Cast inputs
+    # Determine dtype
     if precision is None:
-        cdtype = config.tf_cdtype
+        cdtype = config.cdtype
     else:
-        cdtype = dtypes[precision]["tf"]["cdtype"]
-    y = tf.cast(y, dtype=cdtype)
-    h = tf.cast(h, dtype=cdtype)
-    s = tf.cast(s, dtype=cdtype)
+        cdtype = dtypes[precision]["torch"]["cdtype"]
 
-    # We assume the model:
-    # y = Hx + n, where E[nn']=S.
-    # E[x]=E[n]=0
+    y = y.to(dtype=cdtype)
+    h = h.to(dtype=cdtype)
+    s = s.to(dtype=cdtype)
+
+    # LMMSE estimate of x:
+    # x_hat = diag(GH)^(-1) @ G @ y
+    # with G = H^H @ (H @ H^H + S)^(-1)
     #
-    # The LMMSE estimate of x is given as:
-    # x_hat = diag(GH)^(-1)Gy
-    # with G=H'(HH'+S)^(-1).
-    #
-    # This leads us to the per-symbol model;
-    #
+    # This leads to the per-symbol model:
     # x_hat_k = x_k + e_k
     #
     # The elements of the residual noise vector e have variance:
-    # diag(E[ee']) = diag(GH)^(-1) - I
+    # diag(E[ee^H]) = diag(GH)^(-1) - I
+
     if not whiten_interference:
         # Compute equalizer matrix G
         g = lmmse_matrix(h, s, precision=precision)
     else:
         # Whiten channel
-        y, h = whiten_channel(y, h, s, return_s=False) # pylint: disable=unbalanced-tuple-unpacking
+        y, h = whiten_channel(y, h, s, return_s=False)
 
         # Compute equalizer matrix G
         g = lmmse_matrix(h, s=None, precision=precision)
 
     # Compute G @ y
-    y = tf.expand_dims(y, -1)
-    gy = tf.squeeze(tf.matmul(g, y), axis=-1)
+    gy = (g @ y.unsqueeze(-1)).squeeze(-1)
 
     # Compute G @ H
-    gh = tf.matmul(g, h)
+    gh = g @ h
 
     # Compute diag(G @ H)
-    d = tf.linalg.diag_part(gh)
+    d = torch.diagonal(gh, dim1=-2, dim2=-1)
 
     # Compute x_hat = diag(G @ H)^-1 @ G @ y
     x_hat = gy / d
 
     # Compute residual error variance
-    one = tf.cast(1, dtype=d.dtype)
-    no_eff = tf.math.real(one/d - one)
+    no_eff = (1.0 / d - 1.0).real
 
     return x_hat, no_eff
 
-def zf_equalizer(y, h, s, precision=None):
-    # pylint: disable=line-too-long
-    r"""Applies MIMO ZF Equalizer
+
+def zf_equalizer(
+    y: torch.Tensor,
+    h: torch.Tensor,
+    s: torch.Tensor,
+    precision: Optional[Precision] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""MIMO ZF Equalizer.
 
     This function implements zero-forcing (ZF) equalization for a MIMO link, assuming the
     following model:
@@ -252,7 +266,7 @@ def zf_equalizer(y, h, s, precision=None):
     :math:`\mathbb{E}\left[\mathbf{n}\mathbf{n}^{\mathsf{H}}\right]=\mathbf{S}`.
 
     The estimated symbol vector :math:`\hat{\mathbf{x}}\in\mathbb{C}^K` is given as
-    (Eq. 4.10) [BHS2017]_ :
+    (Eq. 4.10) :cite:p:`BHS2017` :
 
     .. math::
 
@@ -281,70 +295,64 @@ def zf_equalizer(y, h, s, precision=None):
     The function returns :math:`\hat{\mathbf{x}}` and
     :math:`\boldsymbol{\sigma}^2=\left[\sigma^2_0,\dots, \sigma^2_{K-1}\right]^{\mathsf{T}}`.
 
-    Input
-    -----
-    y : [...,M], `tf.complex`
-        Received signals
+    :param y: Received signals with shape [..., M]
+    :param h: Channel matrices with shape [..., M, K]
+    :param s: Noise covariance matrices with shape [..., M, M]
+    :param precision: Precision used for internal calculations and outputs.
+        If set to `None`, :attr:`~sionna.phy.config.Config.precision` is used.
 
-    h : [...,M,K], `tf.complex`
-        Channel matrices
+    :output x_hat: [..., K], `torch.complex`. Estimated symbol vectors.
+    :output no_eff: [..., K], `torch.float`. Effective noise variance for each stream.
 
-    s : [...,M,M], `tf.complex`
-        Noise covariance matrices
+    .. rubric:: Examples
 
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
-        If set to `None`,
-        :attr:`~sionna.phy.config.Config.precision` is used.
+    .. code-block:: python
 
-    Output
-    ------
-    x_hat : [...,K], `tf.complex`
-        Estimated symbol vectors
-
-    no_eff : tf.float
-        Effective noise variance estimates
+        y = torch.complex(torch.randn(8), torch.randn(8))
+        h = torch.complex(torch.randn(8, 4), torch.randn(8, 4))
+        s = torch.eye(8, dtype=torch.complex64)
+        x_hat, no_eff = zf_equalizer(y, h, s)
     """
-    # Cast inputs
+    # Determine dtype
     if precision is None:
-        cdtype = config.tf_cdtype
+        cdtype = config.cdtype
     else:
-        cdtype = dtypes[precision]["tf"]["cdtype"]
-    y = tf.cast(y, dtype=cdtype)
-    h = tf.cast(h, dtype=cdtype)
-    s = tf.cast(s, dtype=cdtype)
+        cdtype = dtypes[precision]["torch"]["cdtype"]
 
-    # We assume the model:
-    # y = Hx + n, where E[nn']=S.
-    # E[x]=E[n]=0
+    y = y.to(dtype=cdtype)
+    h = h.to(dtype=cdtype)
+    s = s.to(dtype=cdtype)
+
+    # ZF estimate of x:
+    # x_hat = G @ y
+    # with G = (H^H @ H)^(-1) @ H^H (Moore-Penrose pseudoinverse)
     #
-    # The ZF estimate of x is given as:
-    # x_hat = Gy
-    # with G=(H'H')^(-1)H'.
-    #
-    # This leads us to the per-symbol model;
-    #
+    # This leads to the per-symbol model:
     # x_hat_k = x_k + e_k
     #
     # The elements of the residual noise vector e have variance:
-    # E[ee'] = GSG'
+    # E[e @ e^H] = G @ S @ G^H
 
-    # Compute G
+    # Compute G (pseudoinverse)
     g = matrix_pinv(h)
 
     # Compute x_hat
-    y = tf.expand_dims(y, -1)
-    x_hat = tf.squeeze(tf.matmul(g, y), axis=-1)
+    x_hat = (g @ y.unsqueeze(-1)).squeeze(-1)
 
     # Compute residual error variance
-    gsg = tf.matmul(tf.matmul(g, s), g, adjoint_b=True)
-    no_eff = tf.math.real(tf.linalg.diag_part(gsg))
+    gsg = g @ s @ g.mH
+    no_eff = torch.diagonal(gsg, dim1=-2, dim2=-1).real
 
     return x_hat, no_eff
 
-def mf_equalizer(y, h, s, precision=None):
-    # pylint: disable=line-too-long
-    r"""MIMO Matched Filter (MF) Equalizer
+
+def mf_equalizer(
+    y: torch.Tensor,
+    h: torch.Tensor,
+    s: torch.Tensor,
+    precision: Optional[Precision] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""MIMO Matched Filter (MF) Equalizer.
 
     This function implements matched filter (MF) equalization for a
     MIMO link, assuming the following model:
@@ -362,7 +370,7 @@ def mf_equalizer(y, h, s, precision=None):
     :math:`\mathbb{E}\left[\mathbf{n}\mathbf{n}^{\mathsf{H}}\right]=\mathbf{S}`.
 
     The estimated symbol vector :math:`\hat{\mathbf{x}}\in\mathbb{C}^K` is given as
-    (Eq. 4.11) [BHS2017]_ :
+    (Eq. 4.11) :cite:p:`BHS2017` :
 
     .. math::
 
@@ -396,68 +404,61 @@ def mf_equalizer(y, h, s, precision=None):
     The function returns :math:`\hat{\mathbf{x}}` and
     :math:`\boldsymbol{\sigma}^2=\left[\sigma^2_0,\dots, \sigma^2_{K-1}\right]^{\mathsf{T}}`.
 
-    Input
-    -----
-    y : [...,M], `tf.complex`
-        Received signals
+    :param y: Received signals with shape [..., M]
+    :param h: Channel matrices with shape [..., M, K]
+    :param s: Noise covariance matrices with shape [..., M, M]
+    :param precision: Precision used for internal calculations and outputs.
+        If set to `None`, :attr:`~sionna.phy.config.Config.precision` is used.
 
-    h : [...,M,K], `tf.complex`
-        Channel matrices
+    :output x_hat: [..., K], `torch.complex`. Estimated symbol vectors.
+    :output no_eff: [..., K], `torch.float`. Effective noise variance for each stream.
 
-    s : [...,M,M], `tf.complex`
-        Noise covariance matrices
+    .. rubric:: Examples
 
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
-        If set to `None`,
-        :attr:`~sionna.phy.config.Config.precision` is used.
+    .. code-block:: python
 
-    Output
-    ------
-    x_hat : [...,K], `tf.complex`
-        Estimated symbol vectors
-
-    no_eff : tf.float
-        Effective noise variance estimates
+        y = torch.complex(torch.randn(8), torch.randn(8))
+        h = torch.complex(torch.randn(8, 4), torch.randn(8, 4))
+        s = torch.eye(8, dtype=torch.complex64)
+        x_hat, no_eff = mf_equalizer(y, h, s)
     """
-    # Cast inputs
+    # Determine dtype
     if precision is None:
-        cdtype = config.tf_cdtype
+        cdtype = config.cdtype
     else:
-        cdtype = dtypes[precision]["tf"]["cdtype"]
-    y = tf.cast(y, dtype=cdtype)
-    h = tf.cast(h, dtype=cdtype)
-    s = tf.cast(s, dtype=cdtype)
+        cdtype = dtypes[precision]["torch"]["cdtype"]
 
-    # We assume the model:
-    # y = Hx + n, where E[nn']=S.
-    # E[x]=E[n]=0
+    y = y.to(dtype=cdtype)
+    h = h.to(dtype=cdtype)
+    s = s.to(dtype=cdtype)
+
+    # MF estimate of x:
+    # x_hat = G @ y
+    # with G = diag(H^H @ H)^-1 @ H^H
     #
-    # The MF estimate of x is given as:
-    # x_hat = Gy
-    # with G=diag(H'H)^-1 H'.
-    #
-    # This leads us to the per-symbol model;
-    #
+    # This leads to the per-symbol model:
     # x_hat_k = x_k + e_k
     #
     # The elements of the residual noise vector e have variance:
-    # E[ee'] = (I-GH)(I-GH)' + GSG'
+    # E[e @ e^H] = (I - G @ H) @ (I - G @ H)^H + G @ S @ G^H
 
     # Compute G
-    hth = tf.matmul(h, h, adjoint_a=True)
-    d = tf.linalg.diag(tf.cast(1, h.dtype)/tf.linalg.diag_part(hth))
-    g = tf.matmul(d, h, adjoint_b=True)
+    hth = h.mH @ h
+    d = torch.diag_embed(1.0 / torch.diagonal(hth, dim1=-2, dim2=-1))
+    g = d @ h.mH
 
     # Compute x_hat
-    y = tf.expand_dims(y, -1)
-    x_hat = tf.squeeze(tf.matmul(g, y), axis=-1)
+    x_hat = (g @ y.unsqueeze(-1)).squeeze(-1)
 
     # Compute residual error variance
-    gsg = tf.matmul(tf.matmul(g, s), g, adjoint_b=True)
-    gh = tf.matmul(g, h)
-    i = expand_to_rank(tf.eye(gsg.shape[-2], dtype=gsg.dtype), tf.rank(gsg), 0)
+    gsg = g @ s @ g.mH
+    gh = g @ h
+    k = gh.shape[-1]
+    i = torch.eye(k, dtype=gsg.dtype, device=gsg.device)
+    i = expand_to_rank(i, gsg.dim(), 0)
 
-    no_eff = tf.abs(tf.linalg.diag_part(tf.matmul(i-gh, i-gh, adjoint_b=True) + gsg))
+    i_minus_gh = i - gh
+    no_eff = torch.abs(torch.diagonal(i_minus_gh @ i_minus_gh.mH + gsg, dim1=-2, dim2=-1))
 
     return x_hat, no_eff
+

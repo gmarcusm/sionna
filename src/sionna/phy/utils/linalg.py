@@ -1,11 +1,17 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
-"""Functions extending TensorFlow linear algebra operations"""
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+"""Linear algebra utilities."""
 
-import tensorflow as tf
+from __future__ import annotations
 
-def inv_cholesky(tensor):
+import torch
+
+__all__ = ["inv_cholesky", "matrix_pinv"]
+
+
+def inv_cholesky(tensor: torch.Tensor) -> torch.Tensor:
     r"""Inverse of the Cholesky decomposition of a matrix
 
     Given a batch of :math:`M \times M` Hermitian positive definite
@@ -14,24 +20,30 @@ def inv_cholesky(tensor):
     the Cholesky decomposition, such that
     :math:`\mathbf{A}=\mathbf{L}\mathbf{L}^{\textsf{H}}`.
 
-    Input
-    -----
-    tensor : [..., M, M], `tf.float` | `tf.complex`
-        Input tensor of rank greater than one
+    :param tensor: [..., M, M], `torch.float` | `torch.complex`.
+        Input tensor of rank greater than one.
 
-    Output
-    ------
-    : [..., M, M], `tf.float` | `tf.complex`
+    :output inv_chol: [..., M, M], `torch.float` | `torch.complex`.
         A tensor of the same shape and type as ``tensor`` containing
-        the inverse of the Cholesky decomposition of its last two dimensions
-    """
-    l = tf.linalg.cholesky(tensor)
-    rhs = tf.eye(num_rows=tf.shape(l)[-1],
-                 batch_shape=tf.shape(l)[:-2],
-                 dtype=l.dtype)
-    return tf.linalg.triangular_solve(l, rhs, lower=True)
+        the inverse of the Cholesky decomposition of its last two dimensions.
 
-def matrix_pinv(tensor):
+    .. rubric:: Examples
+
+    >>> import torch
+    >>> from sionna.phy.utils.linalg import inv_cholesky
+    >>> a = torch.eye(2)
+    >>> inv_cholesky(a)
+    tensor([[1., 0.],
+            [0., 1.]])
+    """
+    chol_factor = torch.linalg.cholesky_ex(tensor, check_errors=False)[0]
+    dim = chol_factor.shape[-1]
+    identity = torch.eye(dim, dtype=chol_factor.dtype, device=chol_factor.device)
+    identity = identity.expand(*chol_factor.shape[:-2], dim, dim)
+    return torch.linalg.solve_triangular(chol_factor, identity, upper=False)
+
+
+def matrix_pinv(tensor: torch.Tensor) -> torch.Tensor:
     r"""Computes the Moore–Penrose (or pseudo) inverse of a matrix
 
     Given a batch of :math:`M \times K` matrices :math:`\mathbf{A}` with rank
@@ -42,18 +54,24 @@ def matrix_pinv(tensor):
     The two inner dimensions are assumed to correspond to the matrix rows
     and columns, respectively.
 
-    Input
-    -----
-    tensor : [..., M, K], `tf.Tensor`
-        Input tensor of rank greater than or equal to two
+    :param tensor: [..., M, K], `torch.float` | `torch.complex`.
+        Input tensor of rank greater than or equal to two.
 
-    Output
-    ------
-    : [..., M, K], `tf.Tensor`
-        A tensor of the same shape and type as ``tensor`` containing
-        the matrix pseudo inverse of its last two dimensions
+    :output pinv: [..., K, M], `torch.float` | `torch.complex`.
+        A tensor containing the matrix pseudo inverse of the last two
+        dimensions of ``tensor``.
+
+    .. rubric:: Examples
+
+    >>> import torch
+    >>> from sionna.phy.utils.linalg import matrix_pinv
+    >>> a = torch.randn(4, 2)
+    >>> matrix_pinv(a).shape
+    torch.Size([2, 4])
     """
-    tensor_tensor_h = tf.matmul(tensor, tensor, adjoint_a=True)
-    l = tf.linalg.cholesky(tensor_tensor_h)
-    return tf.linalg.cholesky_solve(l, tf.linalg.adjoint(tensor))
-
+    tensor_h = tensor.mH  # conjugate transpose
+    gram = tensor_h @ tensor
+    chol = torch.linalg.cholesky_ex(gram, check_errors=False)[0]
+    # Solve (L L^H) X^T = A^H via two triangular solves
+    y = torch.linalg.solve_triangular(chol, tensor_h, upper=False)
+    return torch.linalg.solve_triangular(chol.mH, y, upper=True)

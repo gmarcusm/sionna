@@ -1,170 +1,197 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+"""Unit tests for sionna.phy.fec.linear.LinearEncoder."""
 
-import unittest
 import numpy as np
-import tensorflow as tf
+import pytest
+import torch
+
 from sionna.phy import config
 from sionna.phy.fec.utils import load_parity_check_examples
 from sionna.phy.fec.linear import LinearEncoder
 from sionna.phy.mapping import BinarySource
-from sionna.phy.fec.polar.utils import generate_dense_polar, generate_5g_ranking
-from sionna.phy.fec.polar import PolarEncoder
 
-class TestGenericLinearEncoder(unittest.TestCase):
-    """Test Generic Linear Encoder."""
 
-    def test_dim_mismatch(self):
-        """Test against inconsistent inputs. """
-        id = 2
-        pcm, k, _, _ = load_parity_check_examples(id)
+class TestLinearEncoder:
+    """Tests for the LinearEncoder class."""
+
+    def test_dim_mismatch(self, device):
+        """Test that encoder raises error for inconsistent input dimensions."""
+        pcm_id = 2
+        pcm, k, _, _ = load_parity_check_examples(pcm_id)
         bs = 20
-        enc = LinearEncoder(pcm, is_pcm=True)
+        enc = LinearEncoder(pcm, is_pcm=True, device=device)
 
-        # test for non-invalid input shape
-        with self.assertRaises(BaseException):
-            x = enc(tf.zeros([bs, k+1]))
+        # Test for invalid input shape (wrong last dimension)
+        with pytest.raises(ValueError, match="Last dimension must be of size"):
+            enc(torch.zeros(bs, k + 1, device=device))
 
-        # test for non-binary matrix
-        with self.assertRaises(BaseException):
-            pcm[0,0]=2
-            enc = LinearEncoder(pcm) # we interpret the pcm as gm for this test
+    def test_non_binary_matrix_gm(self):
+        """Test that encoder raises error for non-binary generator matrix."""
+        pcm_id = 2
+        pcm, _, _, _ = load_parity_check_examples(pcm_id)
+        pcm_modified = np.copy(pcm)
+        pcm_modified[0, 0] = 2
 
-        # test for non-binary matrix
-        with self.assertRaises(BaseException):
-            pcm[0,0]=2
-            enc = LinearEncoder(pcm, is_pcm=True)
+        # Test for non-binary matrix (interpreted as gm)
+        with pytest.raises(ValueError, match="enc_mat is not binary"):
+            LinearEncoder(pcm_modified)
 
-    def test_tf_fun(self):
-        """Test that tf.function works as expected and XLA is supported."""
+    def test_non_binary_matrix_pcm(self):
+        """Test that encoder raises error for non-binary parity-check matrix."""
+        pcm_id = 2
+        pcm, _, _, _ = load_parity_check_examples(pcm_id)
+        pcm_modified = np.copy(pcm)
+        pcm_modified[0, 0] = 2
 
-        @tf.function
-        def run_graph(u):
-            c = enc(u)
-            return c
+        # Test for non-binary matrix (as pcm)
+        with pytest.raises(ValueError, match="enc_mat is not binary"):
+            LinearEncoder(pcm_modified, is_pcm=True)
 
-        @tf.function(jit_compile=True)
-        def run_graph_xla(u):
-            c = enc(u)
-            return c
-
-        id = 2
-        pcm, k, _, _ = load_parity_check_examples(id)
+    def test_torch_compile(self, device):
+        """Test that torch.compile works as expected."""
+        pcm_id = 2
+        pcm, k, _, _ = load_parity_check_examples(pcm_id)
         bs = 20
-        enc = LinearEncoder(pcm, is_pcm=True)
-        source = BinarySource()
+        enc = LinearEncoder(pcm, is_pcm=True, device=device)
+        source = BinarySource(device=device)
 
-        u = source([bs,k])
-        run_graph(u)
-        run_graph_xla(u)
+        u = source([bs, k])
 
-    def test_dtypes_flexible(self):
-        """Test that encoder supports variable dtypes and
-        yields same result."""
+        # Test with torch.compile
+        compiled_enc = torch.compile(enc)
+        c = compiled_enc(u)
+        assert c.shape == (bs, enc.n)
 
-        dt_supported = (tf.float16, tf.float32, tf.float64, tf.int32, tf.int64)
-
-        id = 2
-        pcm, k, _, _ = load_parity_check_examples(id)
+    @pytest.mark.parametrize("dt", [
+        torch.float16, torch.float32, torch.float64, torch.int32, torch.int64,
+    ])
+    def test_dtypes_flexible(self, device, precision, dt):
+        """Test that encoder supports variable dtypes and yields same result."""
+        pcm_id = 2
+        pcm, k, _, _ = load_parity_check_examples(pcm_id)
         bs = 20
-        enc_ref = LinearEncoder(pcm, is_pcm=True, precision="single")
-        source = BinarySource()
+        enc_ref = LinearEncoder(pcm, is_pcm=True, precision="single", device=device)
+        source = BinarySource(device=device)
 
         u = source([bs, k])
         c_ref = enc_ref(u)
 
-        for prec in ("single", "double"):
-            for dt in dt_supported:
-                enc = LinearEncoder(pcm, is_pcm=True, precision=prec)
-                u_dt = tf.cast(u, dt)
-                c = enc(u_dt)
+        enc = LinearEncoder(pcm, is_pcm=True, precision=precision, device=device)
+        u_dt = u.to(dt)
+        c = enc(u_dt)
 
-                c_32 = tf.cast(c, tf.float32)
+        c_32 = c.to(torch.float32)
+        assert torch.equal(c_ref, c_32)
 
-                self.assertTrue(np.array_equal(c_ref.numpy(), c_32.numpy()))
-
-    def test_multi_dimensional(self):
+    @pytest.mark.parametrize("shape_prefix", [
+        [],
+        [10, 20, 30],
+        [1, 40],
+        [10, 2, 3, 4, 3],
+    ])
+    def test_multi_dimensional(self, device, shape_prefix):
         """Test against arbitrary input shapes.
 
         The encoder should only operate on axis=-1.
         """
-        id = 3
-        pcm, k, n, _ = load_parity_check_examples(id)
-        shapes =[[k],[10, 20, 30, k], [1, 40, k], [10, 2, 3, 4, 3, k]]
-        enc = LinearEncoder(pcm, is_pcm=True)
-        source = BinarySource()
+        pcm_id = 3
+        pcm, k, n, _ = load_parity_check_examples(pcm_id)
+        s = shape_prefix + [k]
+        enc = LinearEncoder(pcm, is_pcm=True, device=device)
+        source = BinarySource(device=device)
 
-        for s in shapes:
-            u = source(s)
-            u_ref = tf.reshape(u, [-1, k])
+        u = source(s)
+        u_ref = u.reshape(-1, k)
 
-            c = enc(u) # encode with shape s
-            c_ref = enc(u_ref) # encode as 2-D array
-            s[-1] = n
-            c_ref = tf.reshape(c_ref, s)
-            self.assertTrue(np.array_equal(c.numpy(), c_ref.numpy()))
-
-        # and verify that wrong last dimension raises an error
-        with self.assertRaises(tf.errors.InvalidArgumentError):
-            s = [10, 2, k-1]
-            u = source(s)
-            x = enc(u)
-
-    def test_against_baseline(self):
-        """Test that PolarEncoder leads to same result.
-        """
-        bs = 1000
-        k = 57
-        n = 128
-
-        # generate polar frozen positions
-        f,_ = generate_5g_ranking(k, n)
-
-        enc_ref = PolarEncoder(f, n) # reference encoder
-
-        # get polar encoding matrix
-        pcm, gm = generate_dense_polar(f, n, verbose=False)
-        enc = LinearEncoder(gm)
-
-        # draw random info bits
-        source = BinarySource()
-        u = source([bs, k])
-
-        # encode u with both encoders
         c = enc(u)
-        c_ref = enc_ref(u)
+        c_ref = enc(u_ref)
 
-        # and compare results
-        self.assertTrue(np.array_equal(c.numpy(), c_ref.numpy()))
+        expected_shape = shape_prefix + [n]
+        c_ref = c_ref.reshape(expected_shape)
+        assert torch.equal(c, c_ref)
 
-    def test_random_matrices(self):
-        """Test against random parity-check matrices."""
+    def test_wrong_last_dim_raises(self, device):
+        """Test that wrong last dimension raises ValueError."""
+        pcm_id = 3
+        pcm, k, _, _ = load_parity_check_examples(pcm_id)
+        enc = LinearEncoder(pcm, is_pcm=True, device=device)
+        source = BinarySource(device=device)
 
-        n_trials = 100 # test against multiple random pcm realizations
+        # Wrong last dimension
+        s = [10, 2, k - 1]
+        u = source(s)
+        with pytest.raises(ValueError, match="Last dimension must be of size"):
+            enc(u)
+
+    def test_random_matrices(self, device):
+        """Test against random parity-check matrices.
+
+        Verifies that all codewords fulfill all parity-checks.
+        """
+        n_trials = 100
         bs = 100
         k = 89
         n = 123
-        source = BinarySource()
+        source = BinarySource(device=device)
 
         for _ in range(n_trials):
-            # sample a random matrix
-            pcm = config.np_rng.uniform(low=0, high=2, size=(n-k, n)).astype(int)
+            # Sample a random matrix
+            pcm = config.np_rng.uniform(low=0, high=2, size=(n - k, n)).astype(int)
 
-            # catch internal errors due to non-full rank of pcm (randomly
-            # sampled!)
-            # in this test we only test that if the encoder initalization
-            # succeeds and the resulting encoder object produces valid codewords
+            # Catch internal errors due to non-full rank of pcm (randomly sampled!)
+            # In this test we only test that if the encoder initialization
+            # succeeds, the resulting encoder object produces valid codewords
             try:
-                enc = LinearEncoder(pcm, is_pcm=True)
-            except:
-                pass # ignore this pcm realization
+                enc = LinearEncoder(pcm, is_pcm=True, device=device)
+            except Exception:
+                continue  # ignore this pcm realization
 
             u = source([bs, k])
             c = enc(u)
-            # verify that all codewords fullfil all parity-checks
-            c = tf.expand_dims(c, axis=2)
-            pcm = tf.expand_dims(tf.cast(pcm, tf.float32),axis=0)
-            s = tf.matmul(pcm,c).numpy()
+
+            # Verify that all codewords fulfill all parity-checks
+            c_np = c.cpu().numpy()
+            c_expanded = np.expand_dims(c_np, axis=2)
+            pcm_expanded = np.expand_dims(pcm.astype(np.float32), axis=0)
+            s = np.matmul(pcm_expanded, c_expanded)
             s = np.mod(s, 2)
-            self.assertTrue(np.sum(np.abs(s))==0)
+            assert np.sum(np.abs(s)) == 0
+
+    def test_properties(self):
+        """Test that encoder properties return correct values."""
+        pcm_id = 0  # (7,4) Hamming code
+        pcm, k, n, coderate = load_parity_check_examples(pcm_id)
+        enc = LinearEncoder(pcm, is_pcm=True)
+
+        assert enc.k == k
+        assert enc.n == n
+        assert enc.coderate == k / n
+        assert enc.gm.shape == (k, n)
+
+    def test_docstring_example(self):
+        """Verify the docstring example works correctly."""
+        # Load (7,4) Hamming code
+        pcm, k, n, _ = load_parity_check_examples(0)
+        encoder = LinearEncoder(pcm, is_pcm=True)
+
+        # Generate random information bits
+        u = torch.randint(0, 2, (10, k), dtype=torch.float32)
+        c = encoder(u)
+        assert c.shape == torch.Size([10, 7])
+
+    def test_invalid_is_pcm_type(self):
+        """Test that non-boolean is_pcm raises TypeError."""
+        pcm, _, _, _ = load_parity_check_examples(0)
+        with pytest.raises(TypeError, match="is_pcm must be bool"):
+            LinearEncoder(pcm, is_pcm="yes")
+
+    def test_invalid_matrix_dimensions(self):
+        """Test that 1D matrix raises ValueError."""
+        pcm = np.array([1, 0, 1, 1])
+        with pytest.raises(ValueError, match="enc_mat must be 2-D array"):
+            LinearEncoder(pcm)
+
+

@@ -1,156 +1,145 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
-"""Blocks for Convolutional Code Viterbi Decoding."""
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+"""Convolutional code Viterbi and BCJR decoding."""
+
+from typing import Optional, Tuple, Union
+import warnings
 
 import numpy as np
-import tensorflow as tf
+import torch
+
 from sionna.phy import Block
 from sionna.phy.fec.utils import int2bin, int_mod_2
-from sionna.phy.fec.conv.utils import polynomial_selector, Trellis
+from sionna.phy.fec.conv.utils import resolve_gen_poly, Trellis
+
+
+__all__ = ["ViterbiDecoder", "BCJRDecoder"]
 
 
 class ViterbiDecoder(Block):
-    # pylint: disable=line-too-long
-    r"""Applies Viterbi decoding to a sequence of noisy codeword bits
+    r"""Applies Viterbi decoding to a sequence of noisy codeword bits.
 
-    Implements the Viterbi decoding algorithm [Viterbi]_ that returns an
+    Implements the Viterbi decoding algorithm :cite:p:`Viterbi` that returns an
     estimate of the information bits for a noisy convolutional codeword.
-    Takes as input either LLR values (`method` = `soft_llr`) or hard bit values
-    (`method` = `hard`) and returns a hard decided estimation of the information
-    bits.
+    Takes as input either LLR values (``method`` = ``'soft_llr'``) or hard
+    bit values (``method`` = ``'hard'``) and returns a hard decided estimation
+    of the information bits.
 
-    Parameters
-    ----------
-    encoder: :class:`~sionna.phy.fec.conv.encoding.ConvEncoder`
-        If ``encoder`` is provided as input, the following input parameters
-        are not required and will be ignored: ``gen_poly``, ``rate``,
-        ``constraint_length``, ``rsc``, ``terminate``. They will be inferred
-        from the ``encoder``  object itself. If ``encoder`` is `None`, the
-        above parameters must be provided explicitly.
-
-    gen_poly: tuple | None
-        tuple of strings with each string being a 0, 1 sequence. If `None`,
-        ``rate`` and ``constraint_length`` must be provided.
-
-    rate: float, 1/2 | 1/3
-        Valid values are 1/3 and 0.5. Only required if ``gen_poly`` is `None`.
-
-    constraint_length: int, 3....8
-        Valid values are between 3 and 8 inclusive. Only required if
-        ``gen_poly`` is `None`.
-
-    rsc: `bool`, (default `False`)
-        Boolean flag indicating whether the encoder is recursive-systematic for
-        given generator polynomials.
+    :param encoder: If ``encoder`` is provided as input, the following input
+        parameters are not required and will be ignored: ``gen_poly``,
+        ``rate``, ``constraint_length``, ``rsc``, ``terminate``. They will be
+        inferred from the ``encoder`` object itself. If `None`, the above
+        parameters must be provided explicitly.
+    :param gen_poly: Tuple of strings with each string being a 0,1 sequence.
+        If `None`, ``rate`` and ``constraint_length`` must be provided.
+    :param rate: Valid values are 1/3 and 0.5. Only required if ``gen_poly``
+        is `None`.
+    :param constraint_length: Valid values are between 3 and 8 inclusive.
+        Only required if ``gen_poly`` is `None`.
+    :param rsc: Boolean flag indicating whether the encoder is
+        recursive-systematic for given generator polynomials.
         `True` indicates encoder is recursive-systematic.
         `False` indicates encoder is feed-forward non-systematic.
-
-    terminate: `bool`, (default `False`)
-        Boolean flag indicating whether the codeword is terminated.
+        Defaults to `False`.
+    :param terminate: Boolean flag indicating whether the codeword is
+        terminated.
         `True` indicates codeword is terminated to all-zero state.
         `False` indicates codeword is not terminated.
+        Defaults to `False`.
+    :param method: Valid values are ``'soft_llr'`` or ``'hard'``. In computing
+        path metrics, ``'soft_llr'`` expects channel LLRs as input.
+        ``'hard'`` assumes a binary symmetric channel (BSC) with 0/1 values
+        as inputs. In case of ``'hard'``, inputs will be quantized to 0/1
+        values.
+    :param return_info_bits: Boolean flag indicating whether only the
+        information bits or all codeword bits are returned. Defaults to `True`.
+    :param precision: Precision used for internal calculations and outputs.
+        If `None`, :attr:`~sionna.phy.config.Config.precision` is used.
+    :param device: Device for computation (e.g., 'cpu', 'cuda:0').
+        If `None`, :attr:`~sionna.phy.config.Config.device` is used.
 
-    method: str, `soft_llr` | `hard`
-        Valid values are `soft_llr` or `hard`. In computing path
-        metrics, `soft_llr` expects channel LLRs as input
-        `hard` assumes a `binary symmetric channel` (BSC) with 0/1 values are
-        inputs. In case of `hard`, `inputs` will be quantized to 0/1 values.
+    :input inputs: [..., n], `torch.float`.
+        Tensor containing the (noisy) channel output symbols where ``n``
+        denotes the codeword length.
 
-    return_info_bots: `bool`, (default `True`)
-        Boolean flag indicating whether only the information bits or all
-        codeword bits are returned.
+    :output output: [..., rate \* n], `torch.float`.
+        Binary tensor containing the estimates of the information bit tensor.
 
-    precision : `None` (default) | 'single' | 'double'
-        Precision used for internal calculations and outputs.
-        If set to `None`, :py:attr:`~sionna.phy.config.precision` is used.
+    .. rubric:: Notes
 
-    Input
-    -----
-    inputs: [...,n], tf.float
-        Tensor containing the (noisy) channel output symbols where `n`
-        denotes the codeword length
-
-    Output
-    ------
-    : [...,rate*n], tf.float
-        Binary tensor containing the estimates of the information bit tensor
-
-    Note
-    ----
     A full implementation of the decoder rather than a windowed approach
-    is used. For a given codeword of duration `T`, the path metric is
-    computed from time `0` to `T` and the path with optimal metric at time
-    `T` is selected. The optimal path is then traced back from `T` to `0`
-    to output the estimate of the information bit vector used to encode.
-    For larger codewords, note that the current method is sub-optimal
+    is used. For a given codeword of duration ``T``, the path metric is
+    computed from time ``0`` to ``T`` and the path with optimal metric at
+    time ``T`` is selected. The optimal path is then traced back from ``T``
+    to ``0`` to output the estimate of the information bit vector used to
+    encode. For larger codewords, note that the current method is sub-optimal
     in terms of memory utilization and latency.
+    This method is also excluded from ``torch.compile`` using
+    ``@torch.compiler.disable`` because the Viterbi algorithm's inherently
+    sequential structure (forward pass, traceback, output extraction) causes
+    extremely long compilation times due to loop unrolling.
+
+    .. rubric:: Examples
+
+
+    .. code-block:: python
+
+        from sionna.phy.fec.conv import ViterbiDecoder
+
+        decoder = ViterbiDecoder(rate=0.5, constraint_length=5)
+        llr = torch.randn(10, 200)  # Received LLRs
+        u_hat = decoder(llr)
+        print(u_hat.shape)
+        # torch.Size([10, 100])
     """
 
-    def __init__(self,
-                 *,
-                 encoder=None,
-                 gen_poly=None,
-                 rate=1/2,
-                 constraint_length=3,
-                 rsc=False,
-                 terminate=False,
-                 method='soft_llr',
-                 return_info_bits=True,
-                 precision=None,
-                 **kwargs):
-
-        super().__init__(precision=precision, **kwargs)
+    def __init__(
+        self,
+        *,
+        encoder: Optional["ConvEncoder"] = None,
+        gen_poly: Optional[Tuple[str, ...]] = None,
+        rate: float = 1/2,
+        constraint_length: int = 3,
+        rsc: bool = False,
+        terminate: bool = False,
+        method: str = 'soft_llr',
+        return_info_bits: bool = True,
+        precision: Optional[str] = None,
+        device: Optional[str] = None,
+        **kwargs,
+    ):
+        super().__init__(precision=precision, device=device, **kwargs)
 
         if encoder is not None:
             self._gen_poly = encoder.gen_poly
             self._trellis = encoder.trellis
             self._terminate = encoder.terminate
+            if self._trellis.device != self.device:
+                self._trellis.to(self.device)
         else:
-            valid_rates = (1/2, 1/3)
-            valid_constraint_length = (3, 4, 5, 6, 7, 8)
-
-            if gen_poly is not None:
-                if not all(isinstance(poly, str) for poly in gen_poly):
-                    raise TypeError("Each polynomial must be a string.")
-                if not all(len(poly)==len(gen_poly[0]) for poly in gen_poly):
-                    raise ValueError("Each polynomial must be of same length.")
-                if not all(all(
-                char in ['0','1'] for char in poly) for poly in gen_poly):
-                    msg = "Each polynomial must be a string of 0's and 1's."
-                    raise ValueError(msg)
-                self._gen_poly = gen_poly
-            else:
-                valid_rates = (1/2, 1/3)
-                valid_constraint_length = (3, 4, 5, 6, 7, 8)
-
-                if constraint_length not in valid_constraint_length:
-                    msg = "Constraint length must be between 3 and 8."
-                    raise ValueError(msg)
-                if rate not in valid_rates:
-                    raise ValueError("Rate must be 1/3 or 1/2.")
-                self._gen_poly = polynomial_selector(rate, constraint_length)
-
-            # init Trellis parameters
-            self._trellis = Trellis(self.gen_poly, rsc=rsc)
+            self._gen_poly = resolve_gen_poly(gen_poly, rate,
+                                              constraint_length)
+            self._trellis = Trellis(self.gen_poly, rsc=rsc, device=self.device)
             self._terminate = terminate
 
-        self._coderate_desired = 1/len(self.gen_poly)
-        self._mu = len(self._gen_poly[0])-1
+        self._coderate_desired = 1 / len(self.gen_poly)
+        self._mu = self._trellis.mu
+
         if method not in ('soft_llr', 'hard'):
-            raise ValueError("method must be `soft_llr` or `hard`.")
+            raise ValueError("method must be 'soft_llr' or 'hard'.")
 
         # conv_k denotes number of input bit streams
-        # can only be 1 in current implementation
+        # Can only be 1 in current implementation
         self._conv_k = self._trellis.conv_k
 
         # conv_n denotes number of output bits for conv_k input bits
         self._conv_n = self._trellis.conv_n
 
-        # for conv codes, the code dimensions are unknown during initialization
+        # For conv codes, the code dimensions are unknown during initialization
         self._k = None
         self._n = None
-        # num_syms denote number of encoding periods or state transitions.
         self._num_syms = None
 
         self._ni = 2**self._conv_k
@@ -159,256 +148,284 @@ class ViterbiDecoder(Block):
 
         self._method = method
         self._return_info_bits = return_info_bits
-        # If i->j state transition emits symbol k, tf.gather with ipst_op_idx
-        # gathers (i,k) element from input in row j.
-        self.ipst_op_idx = self._mask_by_tonode()
 
-    #########################################
-    # Public methods and properties
-    #########################################
+        # If i->j state transition emits symbol k, gather with ipst_op_idx
+        # gathers (i,k) element from input in row j.
+        self._ipst_op_idx = None
+
+        # Pre-computed output bit patterns for branch metric calculation
+        # Register buffer placeholder for CUDAGraph compatibility
+        self.register_buffer("_op_bits", None)
 
     @property
-    def gen_poly(self):
-        """Generator polynomial used by the encoder"""
+    def gen_poly(self) -> Tuple[str, ...]:
+        """Generator polynomial used by the encoder."""
         return self._gen_poly
 
     @property
-    def coderate(self):
-        """Rate of the code used in the encoder"""
+    def coderate(self) -> float:
+        """Rate of the code used in the encoder."""
         if self.terminate and self._n is None:
-            print("Note that, due to termination, the true coderate is lower "\
-                  "than the returned design rate. "\
-                  "The exact true rate is dependent on the value of n and "\
-                  "hence cannot be computed before the first call().")
+            warnings.warn(
+                "Due to termination, the true coderate is lower "
+                "than the returned design rate. "
+                "The exact true rate is dependent on the value of n and "
+                "hence cannot be computed before the first call().")
             self._coderate = self._coderate_desired
         elif self.terminate and self._n is not None:
-            k = self._coderate_desired*self._n - self._mu
-            self._coderate = k/self._n
+            k = self._coderate_desired * self._n - self._mu
+            self._coderate = k / self._n
+        else:
+            self._coderate = self._coderate_desired
         return self._coderate
 
     @property
-    def trellis(self):
-        """Trellis object used during encoding"""
+    def trellis(self) -> Trellis:
+        """Trellis object used during encoding."""
         return self._trellis
 
     @property
-    def terminate(self):
-        """Indicates if the encoder is terminated during codeword generation"""
+    def terminate(self) -> bool:
+        """Indicates if the encoder is terminated during codeword generation."""
         return self._terminate
 
     @property
-    def k(self):
-        """Number of information bits per codeword"""
+    def k(self) -> Optional[int]:
+        """Number of information bits per codeword."""
         if self._k is None:
-            print("Note: The value of k cannot be computed before the first " \
-                  "call().")
+            warnings.warn("The value of k cannot be computed before the "
+                          "first call().")
         return self._k
 
     @property
-    def n(self):
-        """Number of codeword bits"""
+    def n(self) -> Optional[int]:
+        """Number of codeword bits."""
         if self._n is None:
-            print("Note: The value of n cannot be computed before the first " \
-                  "call().")
+            warnings.warn("The value of n cannot be computed before the "
+                          "first call().")
         return self._n
 
-    #########################
-    # Utility functions
-    #########################
+    def _mask_by_tonode(self) -> torch.Tensor:
+        """Creates index matrix for gathering by to-node.
 
-    def _mask_by_tonode(self):
-        r"""
-         _Ns x _No index matrix, each element of shape (2,)
-         where num_ops = 2**conv_n
-         When applied as tf.gather index on a Ns x  num_ops matrix
-         ((i,j) denoting metric for prev_st=i and output=j)
-         the output is matrix sorted by next_state. Row i in output
-         denotes the 2 possible metrics for transition to state i.
+        Returns Ns x Ni x 2 index matrix. When applied as gather index on a
+        Ns x num_ops matrix ((i,j) denoting metric for prev_st=i and output=j)
+        the output is matrix sorted by next_state. Row i in output
+        denotes the 2 possible metrics for transition to state i.
         """
         cnst = self._ns * self._ni
-        from_nodes_vec = tf.reshape(self._trellis.from_nodes,(cnst,))
-        op_idx = tf.reshape(self._trellis.op_by_tonode, (cnst,))
-        st_op_idx = tf.transpose(tf.stack([from_nodes_vec, op_idx]))
-        st_op_idx = tf.reshape(st_op_idx[None,:,:],(self._ns, self._ni, 2))
-
+        from_nodes_vec = self._trellis.from_nodes.reshape(cnst)
+        op_idx = self._trellis.op_by_tonode.reshape(cnst)
+        st_op_idx = torch.stack([from_nodes_vec, op_idx], dim=-1)
+        st_op_idx = st_op_idx.reshape(self._ns, self._ni, 2)
         return st_op_idx
 
-    def _update_fwd(self, init_cm, bm_mat):
-        state_vec = tf.tile(tf.range(self._ns, dtype=tf.int32)[None,:],
-                            [tf.shape(init_cm)[0], 1])
-        ipst_op_mask = tf.tile(self.ipst_op_idx[None,:],
-                               [tf.shape(init_cm)[0], 1, 1, 1])
+    def _bmcalc(self, y: torch.Tensor) -> torch.Tensor:
+        """Calculate branch metrics for a given noisy codeword tensor.
 
-        cm_ta = tf.TensorArray(self.rdtype, size=self._num_syms,
-                               dynamic_size=False, clear_after_read=False)
-        tb_ta = tf.TensorArray(tf.int32, size=self._num_syms,
-                               dynamic_size=False, clear_after_read=False)
-
-        prev_cm = init_cm
-        for idx in tf.range(0, self._n, self._conv_n):
-            sym = idx//self._conv_n
-            metrics_t = bm_mat[..., sym]
-            # Ns x No matrix- (s,j) is path_metric at state s with transition
-            # op=j
-            sum_metric = prev_cm[:,:,None] + metrics_t[:,None,:]
-            sum_metric_bytonode = tf.gather_nd(sum_metric, ipst_op_mask,
-                                               batch_dims=1)
-
-            tb_state_idx = tf.math.argmin(sum_metric_bytonode, axis=2)
-            tb_state_idx = tf.cast(tb_state_idx, tf.int32)
-
-            # Transition to states argmin state index
-            from_st_idx = tf.transpose(tf.stack([state_vec, tb_state_idx]),
-                                       perm=[1, 2, 0])
-
-            tb_states = tf.gather_nd(self._trellis.from_nodes, from_st_idx)
-            cum_t = tf.math.reduce_min(sum_metric_bytonode, axis=2)
-
-            cm_ta = cm_ta.write(sym, cum_t)
-            tb_ta = tb_ta.write(sym, tb_states)
-
-            prev_cm = cum_t
-
-        return cm_ta, tb_ta
-
-
-    def _op_bits_path(self, paths):
-        r"""
-        Given a path, compute the input bit stream that results in the path.
-        Used in call() where the input is optimal path (seq of states) such
-        as the path returned by _return_optimal.
+        For each time period t, computes the distance of symbol vector y[t]
+        from each possible output symbol. The distance metric is L2 distance
+        if decoder parameter method is 'soft'. The distance metric is L1
+        distance if parameter method is 'hard'.
         """
-        paths = tf.cast(paths, tf.int32)
-        ip_bits = tf.TensorArray(tf.int32,
-                                  size=paths.shape[-1]-1,
-                                  dynamic_size=False,
-                                  clear_after_read=False)
-        dec_syms = tf.TensorArray(tf.int32,
-                                  size=paths.shape[-1]-1,
-                                  dynamic_size=False,
-                                  clear_after_read=False)
-        ni = self._trellis.ni
-        ip_sym_mask = tf.range(ni)[None, :]
+        batch_size = y.shape[0]
+        # Reshape y to [bs, num_syms, conv_n]
+        y_reshaped = y.reshape(batch_size, -1, self._conv_n)
+        num_syms = y_reshaped.shape[1]
 
-        for sym in tf.range(1, paths.shape[-1]):
+        # op_bits: [no, conv_n] - pre-computed in build()
+        # Expand for broadcasting: [1, 1, no, conv_n]
+        op_bits_exp = self._op_bits.unsqueeze(0).unsqueeze(0)
 
-            # gather index from paths to enable XLA
-            # replaces p_idx = paths[:,sym-1:sym+1]
-            p_idx = tf.gather(paths, [sym-1, sym], axis=-1)
-            dec_ = tf.gather_nd(self._trellis.op_mat, p_idx)
+        # y_reshaped: [bs, num_syms, 1, conv_n]
+        y_exp = y_reshaped.unsqueeze(2)
 
-            dec_syms = dec_syms.write(sym-1, value=dec_)
-            # bs x ni boolean tensor. Each row has a True and False. True
-            # corresponds to input_bit which produced the next state (t=sym)
-            match_st = tf.math.equal(
-                tf.gather(self._trellis.to_nodes,paths[:, sym-1]),
-                tf.tile(paths[:, sym][:, None], [1, 2])
-                )
-
-            # tf.boolean_mask throws error in XLA mode
-            #ip_bit = tf.boolean_mask(ip_sym_mask, match_st)
-
-            ip_bit_ = tf.where(match_st,
-                               ip_sym_mask,
-                               tf.zeros_like(ip_sym_mask))
-            ip_bit = tf.reduce_sum(ip_bit_, axis=-1)
-            ip_bits = ip_bits.write(sym-1, ip_bit)
-
-        ip_bit_vec_est = tf.transpose(ip_bits.stack())
-        ip_sym_vec_est = tf.transpose(dec_syms.stack())
-
-        return ip_bit_vec_est, ip_sym_vec_est
-
-    def _optimal_path(self, cm_, tb_):
-        r"""
-        Compute optimal path (state at each time t) given tensors cm_ & tb_
-        of shapes (None, Ns, T). Output is of shape (None, T)
-        cm_: cumulative metrics for each state at time t(0 to T)
-        tb_: traceback state for each state at time t(0 to T)
-        """
-        # tb and ca are of shape (batch x self._ns x num_syms)
-        assert(tb_.get_shape()[1] == self._ns), "Invalid shape."
-        optst_ta = tf.TensorArray(tf.int32, size=tb_.shape[-1],
-                                  dynamic_size=False,
-                                  clear_after_read=False)
-        if self._terminate:
-            opt_term_state = tf.zeros((tf.shape(cm_)[0],), tf.int32)
-        else:
-            opt_term_state =tf.cast(tf.argmin(cm_[:, :, -1], axis=1), tf.int32)
-        optst_ta = optst_ta.write(tb_.shape[-1]-1,opt_term_state)
-
-        for sym in tf.range(tb_.shape[-1]-1, 0, -1):
-            opt_st = optst_ta.read(sym)[:,None]
-
-            idx_ = tf.concat([tf.range(tf.shape(cm_)[0])[:,None], opt_st],
-                             axis=1)
-            opt_st_tminus1 = tf.gather_nd(tb_[:, :, sym], idx_)
-
-            optst_ta = optst_ta.write(sym-1, opt_st_tminus1)
-
-        return tf.transpose(optst_ta.stack())
-
-    def _bmcalc(self, y):
-        """
-        Calculate branch metrics for a given noisy codeword tensor.
-        For each time period t, _bmcalc computes the distance of symbol
-        vector y[t] from each possible output symbol.
-        The distance metric is L2 distance if decoder parameter `method` is
-        "soft".
-
-        The distance metric is L1 distance if parameter `method` is "hard".
-        """
-
-        op_bits = np.stack(
-                    [int2bin(op, self._conv_n) for op in range(self._no)])
-        op_mat = tf.cast(tf.tile(op_bits, [1,self._num_syms]), self.rdtype)
-        op_mat = tf.expand_dims(op_mat, axis=0)
-        y = tf.expand_dims(y, axis=1)
-        if self._method=='soft_llr':
-            op_mat_sign = 1 - 2.*op_mat
-            llr_sign = -1. * tf.math.multiply(y, op_mat_sign)
-            llr_sign = tf.reshape(llr_sign,
-                (-1, self._no, self._num_syms, self._conv_n))
+        if self._method == 'soft_llr':
+            op_mat_sign = 1 - 2. * op_bits_exp  # [1, 1, no, conv_n]
+            llr_sign = -1. * y_exp * op_mat_sign  # [bs, num_syms, no, conv_n]
             # Sum of LLR*(sign of bit) for each symbol
-            bm = tf.math.reduce_sum(llr_sign, axis=-1)
-
-        else: # method == 'hard'
-            diffabs = tf.math.abs(y-op_mat)
-            diffabs = tf.reshape(diffabs,
-                                 (-1, self._no, self._num_syms, self._conv_n))
+            bm = llr_sign.sum(dim=-1)  # [bs, num_syms, no]
+            bm = bm.permute(0, 2, 1)  # [bs, no, num_syms]
+        else:  # method == 'hard'
+            diffabs = torch.abs(y_exp - op_bits_exp)  # [bs, num_syms, no, conv_n]
             # Manhattan distance of symbols
-            bm = tf.math.reduce_sum(diffabs, axis=-1)
+            bm = diffabs.sum(dim=-1)  # [bs, num_syms, no]
+            bm = bm.permute(0, 2, 1)  # [bs, no, num_syms]
 
         return bm
 
-    ########################
-    # Sionna Block functions
-    ########################
+    def _update_fwd(
+        self,
+        init_cm: torch.Tensor,
+        bm_mat: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass computing cumulative metrics and traceback states."""
+        batch_size = init_cm.shape[0]
 
-    def build(self, input_shape):
+        cm_list = []
+        tb_list = []
+
+        # Pre-compute gather indices for vectorized gather-by-tonode
+        # _ipst_op_idx[to_st, inp_idx, :] = (from_st, op_sym)
+        from_st_idx = self._ipst_op_idx[:, :, 0]  # [ns, ni]
+        op_sym_idx = self._ipst_op_idx[:, :, 1]  # [ns, ni]
+
+        prev_cm = init_cm
+        for sym in range(self._num_syms):
+            metrics_t = bm_mat[..., sym]  # [bs, no]
+
+            # Ns x No matrix - (s,j) is path_metric at state s with
+            # transition op=j
+            sum_metric = prev_cm.unsqueeze(2) + metrics_t.unsqueeze(1)
+            # [bs, ns, no]
+
+            # Vectorized gather by to-node using advanced indexing
+            # sum_metric_bytonode[b, to_st, inp_idx] = sum_metric[b, from_st, op_sym]
+            sum_metric_bytonode = sum_metric[:, from_st_idx, op_sym_idx]
+
+            # Get minimum metric and corresponding predecessor index
+            tb_state_idx = sum_metric_bytonode.argmin(dim=2)  # [bs, ns]
+
+            # Vectorized: get the actual from-states for traceback
+            # from_nodes[to_st, :] gives possible predecessors for each to_st
+            # tb_state_idx[:, to_st] selects which predecessor (0 or 1)
+            # Result: tb_states[b, to_st] = from_nodes[to_st, tb_state_idx[b, to_st]]
+            from_nodes_exp = self._trellis.from_nodes.unsqueeze(0).expand(
+                batch_size, -1, -1)  # [bs, ns, ni]
+            tb_states = from_nodes_exp.gather(
+                2, tb_state_idx.unsqueeze(2).long()
+            ).squeeze(2).to(torch.int32)
+
+            cum_t = sum_metric_bytonode.min(dim=2).values
+
+            cm_list.append(cum_t)
+            tb_list.append(tb_states)
+
+            prev_cm = cum_t
+
+        cm = torch.stack(cm_list, dim=-1)  # [bs, ns, num_syms]
+        tb = torch.stack(tb_list, dim=-1)  # [bs, ns, num_syms]
+        return cm, tb
+
+    def _optimal_path(
+        self,
+        cm_: torch.Tensor,
+        tb_: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute optimal path (state at each time t) given cm_ & tb_.
+
+        :param cm_: Cumulative metrics for each state at time t [bs, ns, T]
+        :param tb_: Traceback state for each state at time t [bs, ns, T]
+
+        :output opt_path: Optimal path of shape [bs, T]
+        """
+        batch_size = cm_.shape[0]
+        num_syms = tb_.shape[-1]
+
+        optst_list = [None] * num_syms
+        if self._terminate:
+            opt_term_state = torch.zeros(batch_size, dtype=torch.int32,
+                                         device=self.device)
+        else:
+            opt_term_state = cm_[:, :, -1].argmin(dim=1).to(torch.int32)
+        optst_list[num_syms - 1] = opt_term_state
+
+        for sym in range(num_syms - 1, 0, -1):
+            opt_st = optst_list[sym]
+            # Get the traceback state for each batch element
+            opt_st_tminus1 = tb_[:, :, sym].gather(
+                1, opt_st.unsqueeze(1).long()
+            ).squeeze(1).to(torch.int32)
+            optst_list[sym - 1] = opt_st_tminus1
+
+        return torch.stack(optst_list, dim=1)  # [bs, num_syms]
+
+    def _op_bits_path(
+        self,
+        paths: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Given a path, compute the input bit stream that results in the path.
+
+        Used in call() where the input is optimal path (seq of states) such
+        as the path returned by _optimal_path.
+        """
+        paths = paths.to(torch.int32)
+        batch_size = paths.shape[0]
+        num_transitions = paths.shape[-1] - 1
+
+        ip_bits_list = []
+        dec_syms_list = []
+        ni = self._trellis.ni
+        ip_sym_mask = torch.arange(ni, device=self.device).unsqueeze(0)
+
+        for sym in range(1, paths.shape[-1]):
+            prev_st = paths[:, sym - 1]
+            curr_st = paths[:, sym]
+
+            # Get output symbol for transition
+            dec_ = self._trellis.op_mat[prev_st, curr_st]
+            dec_syms_list.append(dec_)
+
+            # Find which input bit caused the transition
+            # to_nodes[prev_st] gives the 2 possible next states
+            to_states = self._trellis.to_nodes[prev_st]  # [bs, ni]
+            match_st = (to_states == curr_st.unsqueeze(1))  # [bs, ni]
+
+            # Get the input bit (0 or 1) that matches
+            ip_bit = (match_st * ip_sym_mask).sum(dim=-1)
+            ip_bits_list.append(ip_bit)
+
+        ip_bit_vec_est = torch.stack(ip_bits_list, dim=1)
+        ip_sym_vec_est = torch.stack(dec_syms_list, dim=1)
+
+        return ip_bit_vec_est, ip_sym_vec_est
+
+    def build(self, input_shape: torch.Size):
         """Build block and check dimensions."""
-
         self._n = input_shape[-1]
 
-        divisible = tf.math.floormod(self._n, self._conv_n)
-        if divisible!=0:
-            raise ValueError('Length of codeword should be divisible by \
-            number of output bits per symbol.')
+        divisible = self._n % self._conv_n
+        if divisible != 0:
+            raise ValueError('Length of codeword should be divisible by '
+                             'number of output bits per symbol.')
 
-        self._num_syms = int(self._n*self._coderate_desired)
+        self._num_syms = int(self._n * self._coderate_desired)
 
         self._num_term_syms = self._mu if self.terminate else 0
         self._k = self._num_syms - self._num_term_syms
 
-    def call(self, inputs, /):
-        """
-        Viterbi decoding function.
+        # Build index mask
+        self._ipst_op_idx = self._mask_by_tonode()
 
-        inputs is the (noisy) codeword tensor where the last dimension should
-        equal n. All the leading dimensions are assumed as batch dimensions.
+        # Pre-compute output bit patterns for branch metric calculation
+        # Shape: [no, conv_n]
+        op_bits = np.stack(
+            [int2bin(op, self._conv_n) for op in range(self._no)]
+        )
+        # Register as buffer for CUDAGraph compatibility
+        self.register_buffer("_op_bits", torch.tensor(op_bits, dtype=self.dtype,
+                                     device=self.device))
 
+        # Move trellis to correct device if needed
+        if self._trellis.device != self.device:
+            self._trellis.to(self.device)
+
+    @torch.compiler.disable
+    def call(self, inputs: torch.Tensor, /) -> torch.Tensor:
+        """Viterbi decoding function.
+
+        :param inputs: Noisy codeword tensor of shape [..., n] where ``n`` is
+            the codeword length. All leading dimensions are treated as batch
+            dimensions.
+
+        :output output: Decoded information bits of shape [..., k] if
+            ``return_info_bits`` is `True`, otherwise [..., n].
         """
-        LARGEDIST = 2.**20 # pylint: disable=invalid-name
+        LARGEDIST = 2.**20
+
+        # Ensure build() has been called
+        if self._n is None:
+            self.build(inputs.shape)
 
         if self._method == 'hard':
             # Ensure binary values
@@ -416,190 +433,169 @@ class ViterbiDecoder(Block):
         elif self._method == 'soft_llr':
             inputs = -1. * inputs
 
-        output_shape = inputs.get_shape().as_list()
-        y_resh = tf.reshape(inputs, [-1, self._n])
+        output_shape = list(inputs.shape)
+        y_resh = inputs.reshape(-1, self._n)
         output_shape[0] = -1
         if self._return_info_bits:
-            output_shape[-1] = self._k # assign k to the last dimension
+            output_shape[-1] = self._k
         else:
             output_shape[-1] = self._n
+
+        batch_size = y_resh.shape[0]
 
         # Branch metrics matrix for a given y
         bm_mat = self._bmcalc(y_resh)
 
-        init_cm_np = np.full((self._ns,), LARGEDIST)
-        init_cm_np[0] = 0.0
-        prev_cm_ = tf.convert_to_tensor(init_cm_np, dtype=self.rdtype)
-        prev_cm = tf.tile(prev_cm_[None,:], [tf.shape(y_resh)[0], 1])
+        init_cm = torch.full((self._ns,), LARGEDIST, dtype=self.dtype,
+                             device=self.device)
+        init_cm[0] = 0.0
+        prev_cm = init_cm.unsqueeze(0).expand(batch_size, -1).clone()
 
-        cm_ta, tb_ta = self._update_fwd(prev_cm, bm_mat)
+        # Forward pass computing cumulative metrics and traceback
+        cm, tb = self._update_fwd(prev_cm, bm_mat)
 
-        cm = tf.transpose(cm_ta.stack(), perm=[1,2,0])
-        tb = tf.transpose(tb_ta.stack(),perm=[1,2,0])
-        del cm_ta, tb_ta
-
-        zero_st = tf.zeros((tf.shape(y_resh)[0], 1), tf.int32)
+        zero_st = torch.zeros((batch_size, 1), dtype=torch.int32,
+                              device=self.device)
         opt_path = self._optimal_path(cm, tb)
-        opt_path = tf.concat((zero_st, opt_path), axis=1)
-        del cm, tb
-        msghat, cwhat = self._op_bits_path(opt_path)
-        if self._return_info_bits:
-            msghat = msghat[...,:self._k]
-            output = tf.cast(msghat, self.rdtype)
-        else:
-            output = tf.cast(cwhat, self.rdtype)
-        output_reshaped = tf.reshape(output, output_shape)
+        opt_path = torch.cat((zero_st, opt_path), dim=1)
 
+        msghat, cwhat = self._op_bits_path(opt_path)
+
+        if self._return_info_bits:
+            msghat = msghat[..., :self._k]
+            output = msghat.to(self.dtype)
+        else:
+            output = cwhat.to(self.dtype)
+
+        output_reshaped = output.reshape(output_shape)
         return output_reshaped
 
 
 class BCJRDecoder(Block):
-    # pylint: disable=line-too-long
-    r"""Applies BCJR decoding to a sequence of noisy codeword bits
+    r"""Applies BCJR decoding to a sequence of noisy codeword bits.
 
-    Implements the BCJR decoding algorithm [BCJR]_ that returns an
+    Implements the BCJR decoding algorithm :cite:p:`BCJR` that returns an
     estimate of the information bits for a noisy convolutional codeword.
-    Takes as input either channel LLRs  and a priori LLRs (optional).
-    Returns an estimate of the information bits, either output LLRs (
-    ``hard_out`` = `False`) or hard decoded bits ( ``hard_out`` = `True`),
+    Takes as input channel LLRs and optional a priori LLRs.
+    Returns an estimate of the information bits, either output LLRs
+    (``hard_out`` = `False`) or hard decoded bits (``hard_out`` = `True`),
     respectively.
 
-    Parameters
-    ----------
-    encoder: :class:`~sionna.phy.fec.conv.encoding.ConvEncoder`
-        If ``encoder`` is provided as input, the following input parameters
-        are not required and will be ignored: ``gen_poly``, ``rate``,
-        ``constraint_length``, ``rsc``, ``terminate``. They will be inferred
-        from the ``encoder``  object itself. If ``encoder`` is `None`, the
-        above parameters must be provided explicitly.
-
-    gen_poly: tuple | None
-        tuple of strings with each string being a 0, 1 sequence. If `None`,
-        ``rate`` and ``constraint_length`` must be provided.
-
-    rate: float, None (default) | 1/3 | 1/2
-        Valid values are 1/3 and 1/2. Only required if ``gen_poly`` is `None`.
-
-    constraint_length: int, 3...8
-        Valid values are between 3 and 8 inclusive. Only required if
-        ``gen_poly`` is `None`.
-
-    rsc: `bool`, (default `False`)
-        Boolean flag indicating whether the encoder is recursive-systematic for
-        given generator polynomials. `True` indicates encoder is
-        recursive-systematic. `False` indicates encoder is feed-forward
-        non-systematic.
-
-    terminate: `bool`, (default `False`)
-        Boolean flag indicating whether the codeword is terminated.
+    :param encoder: If ``encoder`` is provided as input, the following input
+        parameters are not required and will be ignored: ``gen_poly``,
+        ``rate``, ``constraint_length``, ``rsc``, ``terminate``. They will be
+        inferred from the ``encoder`` object itself. If `None`, the above
+        parameters must be provided explicitly.
+    :param gen_poly: Tuple of strings with each string being a 0,1 sequence.
+        If `None`, ``rate`` and ``constraint_length`` must be provided.
+    :param rate: Valid values are 1/3 and 1/2. Only required if ``gen_poly``
+        is `None`.
+    :param constraint_length: Valid values are between 3 and 8 inclusive.
+        Only required if ``gen_poly`` is `None`.
+    :param rsc: Boolean flag indicating whether the encoder is
+        recursive-systematic for given generator polynomials.
+        `True` indicates encoder is recursive-systematic.
+        `False` indicates encoder is feed-forward non-systematic.
+        Defaults to `False`.
+    :param terminate: Boolean flag indicating whether the codeword is
+        terminated.
         `True` indicates codeword is terminated to all-zero state.
         `False` indicates codeword is not terminated.
-
-    hard_out: `bool`, (default `True`)
-        Boolean flag indicating whether to output hard or soft decisions on
-        the decoded information vector.
+        Defaults to `False`.
+    :param hard_out: Boolean flag indicating whether to output hard or soft
+        decisions on the decoded information vector.
         `True` implies a hard-decoded information vector of 0/1's as output.
-        `False` implies output is decoded LLR's of the information.
+        `False` implies output is decoded LLRs of the information.
+        Defaults to `True`.
+    :param algorithm: Indicates the implemented BCJR algorithm,
+        where ``'map'`` denotes the exact MAP algorithm, ``'log'`` indicates
+        the exact MAP implementation but in log-domain, and ``'maxlog'``
+        indicates the approximated MAP implementation in log-domain where
+        :math:`\log(e^{a}+e^{b}) \sim \max(a,b)`.
+    :param precision: Precision used for internal calculations and outputs.
+        If `None`, :attr:`~sionna.phy.config.Config.precision` is used.
+    :param device: Device for computation (e.g., 'cpu', 'cuda:0').
+        If `None`, :attr:`~sionna.phy.config.Config.device` is used.
 
-    algorithm: str, `map` (default) | `log` | `maxlog`
-        Indicates the implemented BCJR algorithm,
-        where `map` denotes the exact MAP algorithm, `log` indicates the
-        exact MAP implementation, but in log-domain, and
-        `maxlog` indicates the approximated MAP implementation in log-domain,
-        where :math:`\log(e^{a}+e^{b}) \sim \max(a,b)`.
+    :input llr_ch: [..., n], `torch.float`.
+        Tensor containing the (noisy) channel LLRs, where ``n`` denotes the
+        codeword length.
 
-    precision : `None` (default) | 'single' | 'double'
-        Precision used for internal calculations and outputs.
-        If set to `None`, :py:attr:`~sionna.phy.config.precision` is used.
-
-    Input
-    -----
-    llr_ch: [...,n], tf.float
-        Tensor containing the (noisy) channel
-        LLRs, where `n` denotes the codeword length
-
-    llr_a: [...,k], None (default) | tf.float
+    :input llr_a: [..., k], `None` (default) | `torch.float`.
         Tensor containing the a priori information of each information bit.
         Implicitly assumed to be 0 if only ``llr_ch`` is provided.
 
-    Output
-    ------
-    : tf.float
-        Tensor of shape `[...,coderate*n]` containing the estimates of the
-        information bit tensor
+    :output msghat: `torch.float`.
+        Tensor of shape ``[..., coderate*n]`` containing the estimates of the
+        information bit tensor.
 
+    .. rubric:: Examples
+
+
+    .. code-block:: python
+
+        from sionna.phy.fec.conv import BCJRDecoder
+
+        decoder = BCJRDecoder(rate=0.5, constraint_length=5)
+        llr = torch.randn(10, 200)  # Received LLRs
+        u_hat = decoder(llr)
+        print(u_hat.shape)
+        # torch.Size([10, 100])
     """
 
-    def __init__(self,
-                 encoder=None,
-                 gen_poly=None,
-                 rate=1/2,
-                 constraint_length=3,
-                 rsc=False,
-                 terminate=False,
-                 hard_out=True,
-                 algorithm='map',
-                 precision=None,
-                 **kwargs):
-
-        super().__init__(precision=precision, **kwargs)
+    def __init__(
+        self,
+        encoder: Optional["ConvEncoder"] = None,
+        gen_poly: Optional[Tuple[str, ...]] = None,
+        rate: float = 1/2,
+        constraint_length: int = 3,
+        rsc: bool = False,
+        terminate: bool = False,
+        hard_out: bool = True,
+        algorithm: str = 'map',
+        precision: Optional[str] = None,
+        device: Optional[str] = None,
+        **kwargs,
+    ):
+        super().__init__(precision=precision, device=device, **kwargs)
 
         if encoder is not None:
             self._gen_poly = encoder.gen_poly
             self._trellis = encoder.trellis
             self._terminate = encoder.terminate
+            if self._trellis.device != self.device:
+                self._trellis.to(self.device)
         else:
-            if gen_poly is not None:
-                if not all(isinstance(poly, str) for poly in gen_poly):
-                    raise TypeError("Each polynomial must be a string.")
-                if not all(len(poly)==len(gen_poly[0]) for poly in gen_poly):
-                    raise ValueError("Each polynomial must be of same length.")
-                if not all(all(
-                    char in ['0','1'] for char in poly) for poly in gen_poly):
-                    msg = "Each polynomial must be a string of 0's and 1's."
-                    raise ValueError(msg)
-                self._gen_poly = gen_poly
-            else:
-                valid_rates = (1/2, 1/3)
-                valid_constraint_length = (3, 4, 5, 6, 7, 8)
-
-                if constraint_length not in valid_constraint_length:
-                    msg = "Constraint length must be between 3 and 8."
-                    raise ValueError(msg)
-                if rate not in valid_rates:
-                    raise ValueError("Rate must be 1/3 or 1/2.")
-                self._gen_poly = polynomial_selector(rate, constraint_length)
-
-                # init Trellis parameters
-            self._trellis = Trellis(self.gen_poly, rsc=rsc)
+            self._gen_poly = resolve_gen_poly(gen_poly, rate,
+                                              constraint_length)
+            self._trellis = Trellis(self.gen_poly, rsc=rsc, device=self.device)
             self._terminate = terminate
 
         valid_algorithms = ['map', 'log', 'maxlog']
         if algorithm not in valid_algorithms:
             raise ValueError("algorithm must be one of map, log or maxlog")
 
-        self._coderate_desired = 1/len(self._gen_poly)
-        self._mu = len(self._gen_poly[0])-1
+        self._coderate_desired = 1 / len(self._gen_poly)
+        self._mu = len(self._gen_poly[0]) - 1
 
         self._num_term_bits = None
         self._num_term_syms = None
 
         # conv_k denotes number of input bit streams
-        # can only be 1 in current implementation
+        # Can only be 1 in current implementation
         self._conv_k = self._trellis.conv_k
-        if self._conv_k!=1:
+        if self._conv_k != 1:
             raise NotImplementedError("Only conv_k=1 currently supported.")
 
-        self._mu = self._trellis._mu
+        self._mu = self._trellis.mu
         # conv_n denotes number of output bits for conv_k input bits
         self._conv_n = self._trellis.conv_n
 
-        # Length of Info-bit vector. Equal to _num_syms if terminate=False,
-        # else < _num_syms
+        # Length of Info-bit vector
         self._k = None
-        # Length of Turbo codeword, including termination bits
+        # Length of codeword, including termination bits
         self._n = None
-        # num_syms denote number of encoding periods or state transitions.
+        # Number of encoding periods or state transitions
         self._num_syms = None
 
         self._ni = 2**self._conv_k
@@ -609,319 +605,363 @@ class BCJRDecoder(Block):
         self._hard_out = hard_out
         self._algorithm = algorithm
 
-        self.ipst_op_idx, self.ipst_ip_idx = self._mask_by_tonode()
+        self._ipst_op_idx = None
+        self._ipst_ip_idx = None
 
-    #########################################
-    # Public methods and properties
-    #########################################
+        # Pre-computed output bit patterns for branch metric calculation
+        # Register buffer placeholder for CUDAGraph compatibility
+        self.register_buffer("_op_bits", None)
 
     @property
-    def gen_poly(self):
-        """Generator polynomial used by the encoder"""
+    def gen_poly(self) -> Tuple[str, ...]:
+        """Generator polynomial used by the encoder."""
         return self._gen_poly
 
     @property
-    def coderate(self):
-        """Rate of the code used in the encoder"""
+    def coderate(self) -> float:
+        """Rate of the code used in the encoder."""
         if self.terminate and self._n is None:
-            print("Note that, due to termination, the true coderate is lower "\
-                  "than the returned design rate. "\
-                  "The exact true rate is dependent on the value of n and "\
-                  "hence cannot be computed before the first call().")
+            warnings.warn(
+                "Due to termination, the true coderate is lower "
+                "than the returned design rate. "
+                "The exact true rate is dependent on the value of n and "
+                "hence cannot be computed before the first call().")
             self._coderate = self._coderate_desired
         elif self.terminate and self._n is not None:
-            k = self._coderate_desired*self._n - self._mu
-            self._coderate = k/self._n
+            k = self._coderate_desired * self._n - self._mu
+            self._coderate = k / self._n
+        else:
+            self._coderate = self._coderate_desired
         return self._coderate
 
     @property
-    def trellis(self):
-        """Trellis object used during encoding"""
+    def trellis(self) -> Trellis:
+        """Trellis object used during encoding."""
         return self._trellis
 
     @property
-    def terminate(self):
-        """Indicates if the encoder is terminated during codeword generation"""
+    def terminate(self) -> bool:
+        """Indicates if the encoder is terminated during codeword generation."""
         return self._terminate
 
     @property
-    def k(self):
-        """Number of information bits per codeword"""
+    def k(self) -> Optional[int]:
+        """Number of information bits per codeword."""
         if self._k is None:
-            print("Note: The value of k cannot be computed before the first " \
-                  "call().")
+            warnings.warn("The value of k cannot be computed before the "
+                          "first call().")
         return self._k
 
     @property
-    def n(self):
-        """Number of codeword bits"""
+    def n(self) -> Optional[int]:
+        """Number of codeword bits."""
         if self._n is None:
-            print("Note: The value of n cannot be computed before the first " \
-                  "call().")
+            warnings.warn("The value of n cannot be computed before the "
+                          "first call().")
         return self._n
 
-    #########################
-    # Utility functions
-    #########################
+    def _mask_by_tonode(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Creates index matrices for gathering by to-node.
 
-    def _mask_by_tonode(self):
-        """
-        Assume i->j a valid state transition given info-bit b & emits symbol k
-        returns following two _ns x _no matrices, each element of shape (2,).
+        Assume i->j a valid state transition given info-bit b & emits symbol k.
+        Returns following two _ns x _ni x 2 matrices:
         - st_op_idx: jth row contains (i,k) tuples
         - st_ip_idx: jth row contains (i,b) tuples
 
-        When applied as tf.gather on a _ns x _no matrix, the output is
+        When applied as gather on a _ns x _no matrix, the output is
         matrix sorted by next_state.
-
-        For e.g., tf.gather when applied on "input" (shape _ns x _no), with mask
-        - st_op_idx: gathers input[i][k] in row j,
-        - st_ip_idx: gathers input[i][b] in row j.
         """
-
         cnst = self._ns * self._ni
-        from_nodes_vec = tf.reshape(self._trellis.from_nodes,(cnst,))
-        op_idx = tf.reshape(self._trellis.op_by_tonode, (cnst,))
-        st_op_idx = tf.transpose(tf.stack([from_nodes_vec, op_idx]))
-        st_op_idx = tf.reshape(st_op_idx[None,:,:],(self._ns, self._ni, 2))
+        from_nodes_vec = self._trellis.from_nodes.reshape(cnst)
+        op_idx = self._trellis.op_by_tonode.reshape(cnst)
+        st_op_idx = torch.stack([from_nodes_vec, op_idx], dim=-1)
+        st_op_idx = st_op_idx.reshape(self._ns, self._ni, 2)
 
-        ip_idx = tf.reshape(self._trellis.ip_by_tonode, (cnst,))
-        st_ip_idx = tf.transpose(tf.stack([from_nodes_vec, ip_idx]))
-        st_ip_idx = tf.reshape(st_ip_idx[None,:,:],(self._ns, self._ni, 2))
+        ip_idx = self._trellis.ip_by_tonode.reshape(cnst)
+        st_ip_idx = torch.stack([from_nodes_vec, ip_idx], dim=-1)
+        st_ip_idx = st_ip_idx.reshape(self._ns, self._ni, 2)
 
         return st_op_idx, st_ip_idx
 
-    def _bmcalc(self, llr_in):
-        """
-        Calculate branch gamma metrics for a given noisy codeword tensor.
-        For each time period t, _bmcalc computes the "distance" of symbol
-        vector y[t] from each possible output symbol i.e.,
-        (2*Eb/N0)* sum_i x_y*y_i for i=1,2,...,conv_n
+    def _bmcalc(self, llr_in: torch.Tensor) -> torch.Tensor:
+        """Calculate branch gamma metrics for a given noisy codeword tensor.
 
-        The above metric is used in calculation of gamma.
-        If the input is llr, which is nothing but 2*Eb*y/N0.
+        For each time period t, computes the 'distance' of symbol
+        vector y[t] from each possible output symbol.
         """
-        op_bits = np.stack(
-                    [int2bin(op, self._conv_n) for op in range(self._no)])
-        op_mat = tf.cast(tf.tile(op_bits, [1, self._num_syms]), self.rdtype)
-        op_mat = tf.expand_dims(op_mat, axis=0)
-        llr_in = tf.expand_dims(llr_in, axis=1)
-        op_mat_sign = 1. - 2. * op_mat
+        batch_size = llr_in.shape[0]
+        # Reshape llr_in to [bs, num_syms, conv_n]
+        llr_reshaped = llr_in.reshape(batch_size, -1, self._conv_n)
 
-        llr_sign = tf.math.multiply(llr_in, op_mat_sign)
-        half_llr_sign = tf.reshape(0.5 * llr_sign,
-            (-1, self._no, self._num_syms, self._conv_n))
+        # op_bits: [no, conv_n] - pre-computed in build()
+        # Expand for broadcasting: [1, 1, no, conv_n]
+        op_bits_exp = self._op_bits.unsqueeze(0).unsqueeze(0)
+        op_mat_sign = 1. - 2. * op_bits_exp
+
+        # llr_reshaped: [bs, num_syms, 1, conv_n]
+        llr_exp = llr_reshaped.unsqueeze(2)
+
+        llr_sign = llr_exp * op_mat_sign  # [bs, num_syms, no, conv_n]
+        half_llr_sign = 0.5 * llr_sign
 
         if self._algorithm in ['log', 'maxlog']:
-            bm = tf.math.reduce_sum(half_llr_sign, axis=-1)
+            bm = half_llr_sign.sum(dim=-1)  # [bs, num_syms, no]
         else:
-            bm = tf.math.exp(tf.math.reduce_sum(half_llr_sign, axis=-1))
+            bm = torch.exp(half_llr_sign.sum(dim=-1))
 
+        bm = bm.permute(0, 2, 1).contiguous()  # [bs, no, num_syms]
         return bm
 
-    def _initialize(self, llr_ch):
-        if self._algorithm in ['log', 'maxlog']:
-            init_vals = -np.inf, 0.0
-        else:
-            init_vals = 0.0, 1.0
-        alpha_init_np = np.full((self._ns,), init_vals[0])
-        alpha_init_np[0] = init_vals[1]
+    def _initialize(
+        self,
+        llr_ch: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Initialize alpha and beta tensors."""
+        batch_size = llr_ch.shape[0]
 
-        beta_init_np = alpha_init_np
+        if self._algorithm in ['log', 'maxlog']:
+            init_vals = (float('-inf'), 0.0)
+        else:
+            init_vals = (0.0, 1.0)
+
+        alpha_init = torch.full((self._ns,), init_vals[0], dtype=self.dtype,
+                                device=self.device)
+        alpha_init[0] = init_vals[1]
+
         if not self._terminate:
-            eq_prob = 1./self._ns
+            eq_prob = 1. / self._ns
             if self._algorithm in ['log', 'maxlog']:
                 eq_prob = np.log(eq_prob)
-            beta_init_np = np.full((self._ns,), eq_prob)
+            beta_init = torch.full((self._ns,), eq_prob, dtype=self.dtype,
+                                   device=self.device)
+        else:
+            beta_init = alpha_init.clone()
 
-        alpha_init = tf.convert_to_tensor(alpha_init_np, dtype=self.rdtype)
-        alpha_init = tf.tile(alpha_init[None,:], [tf.shape(llr_ch)[0], 1])
-        beta_init = tf.convert_to_tensor(beta_init_np, dtype=self.rdtype)
-        beta_init = tf.tile(beta_init[None,:], [tf.shape(llr_ch)[0], 1])
+        alpha_init = alpha_init.unsqueeze(0).expand(batch_size, -1).clone()
+        beta_init = beta_init.unsqueeze(0).expand(batch_size, -1).clone()
+
         return alpha_init, beta_init
 
-    def _update_fwd(self, alph_init, bm_mat, llr):
-        """
-        Run forward update from time t=0 to t=k-1.
+    def _update_fwd(
+        self,
+        alph_init: torch.Tensor,
+        bm_mat: torch.Tensor,
+        llr: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run forward update from time t=0 to t=k-1.
+
         At each time t, computes alpha_t using alpha_t-1 and gamma_t.
-
-        Returns tensor array of alpha_t, t-0,1,2...,k-1
+        Returns tensor of alpha values [bs, ns, num_syms+1].
         """
-        alph_ta = tf.TensorArray(self.rdtype, size=self._num_syms+1,
-                                  dynamic_size=False, clear_after_read=False)
-        alph_prev = tf.cast(alph_init, self.rdtype)
+        batch_size = alph_init.shape[0]
+        alph_list = [alph_init]
+        alph_prev = alph_init
 
-        # (bs, _Ns, _ni, 2) matrix
-        ipst_ip_mask = tf.tile(
-            self.ipst_ip_idx[None,:],[tf.shape(alph_init)[0],1,1,1])
-        # (bs, _Ns, _ni) matrix, by from state
-        op_mask = tf.tile(self.trellis.op_by_fromnode[None,:,:],
-                          [tf.shape(alph_init)[0],1,1])
-        ipbit_mat = tf.tile(tf.range(self._ni)[None, None, :],
-                            [tf.shape(alph_init)[0], self._ns, 1])
-        ipbitsign_mat = 1. - 2. * tf.cast(ipbit_mat, self.rdtype)
-        alph_ta = alph_ta.write(0, alph_prev)
-        for t in tf.range(self._num_syms):
-            bm_t = bm_mat[..., t]
-            llr_t = 0.5 * llr[...,t][:, None,None]
+        # op_by_fromnode[from_st, input] = output symbol
+        op_mask = self._trellis.op_by_fromnode  # [ns, ni]
 
-            bm_byfromst = tf.gather(bm_t, op_mask, batch_dims=1)
-            signed_half_llr = tf.math.multiply(
-                tf.tile(llr_t, [1, self._ns, self._ni]), ipbitsign_mat)
+        ipbit_mat = torch.arange(self._ni, device=self.device).unsqueeze(0) \
+            .unsqueeze(0).expand(batch_size, self._ns, -1).contiguous()  # [bs, ns, ni]
+        ipbitsign_mat = 1. - 2. * ipbit_mat.to(self.dtype)
+
+        # Pre-compute gather indices for vectorized gather-by-tonode
+        # _ipst_ip_idx[to_st, inp_idx, :] = (from_st, inp_bit)
+        # We need to gather alph_gam_prod[:, from_st, inp_bit] for all (to_st, inp_idx)
+        from_st_idx = self._ipst_ip_idx[:, :, 0].contiguous()  # [ns, ni]
+        inp_bit_idx = self._ipst_ip_idx[:, :, 1].contiguous()  # [ns, ni]
+
+        for t in range(self._num_syms):
+            bm_t = bm_mat[..., t].contiguous()  # [bs, no]
+            llr_t = 0.5 * llr[..., t].unsqueeze(1).unsqueeze(2)  # [bs, 1, 1]
+
+            # bm_byfromst[bs, from_st, input] = bm_t[bs, op_mask[from_st, input]]
+            bm_byfromst = bm_t[:, op_mask].contiguous()  # [bs, ns, ni]
+
+            signed_half_llr = llr_t * ipbitsign_mat  # [bs, ns, ni]
+
             if self._algorithm in ['log', 'maxlog']:
                 llr_byfromst = signed_half_llr
                 gamma_byfromst = llr_byfromst + bm_byfromst
-                alph_gam_prod = gamma_byfromst + alph_prev[:,:,None]
+                alph_gam_prod = (gamma_byfromst + alph_prev.unsqueeze(2)).contiguous()
             else:
-                llr_byfromst = tf.math.exp(signed_half_llr)
-                gamma_byfromst = tf.multiply(llr_byfromst, bm_byfromst)
-                alph_gam_prod = tf.math.multiply(gamma_byfromst,
-                                             alph_prev[:,:,None])
+                llr_byfromst = torch.exp(signed_half_llr)
+                gamma_byfromst = llr_byfromst * bm_byfromst
+                alph_gam_prod = (gamma_byfromst * alph_prev.unsqueeze(2)).contiguous()
 
-            alphgam_bytost = tf.gather_nd(alph_gam_prod,
-                                          ipst_ip_mask,
-                                          batch_dims=1)
-            if self._algorithm =='map':
-                alph_t = tf.math.reduce_sum(alphgam_bytost, axis=-1)
-                alph_t_sum = tf.reduce_sum(alph_t, axis=-1)
-                alph_t = tf.divide(alph_t,
-                                   tf.tile(alph_t_sum[:,None], [1,self._ns]))
+            # Vectorized gather by to-node using advanced indexing
+            # alph_gam_prod: [bs, ns, ni] indexed by [from_st_idx, inp_bit_idx]
+            # Result: alphgam_bytost[b, to_st, inp_idx] = alph_gam_prod[b, from_st_idx[to_st, inp_idx], inp_bit_idx[to_st, inp_idx]]
+            alphgam_bytost = alph_gam_prod[:, from_st_idx, inp_bit_idx].contiguous()
+
+            if self._algorithm == 'map':
+                alph_t = alphgam_bytost.sum(dim=-1)
+                alph_t_sum = alph_t.sum(dim=-1, keepdim=True)
+                alph_t = alph_t / alph_t_sum
             elif self._algorithm == 'log':
-                alph_t = tf.math.reduce_logsumexp(alphgam_bytost, axis=-1)
-            else:  # self._algorithm = 'maxlog'
-                alph_t = tf.math.reduce_max(alphgam_bytost, axis=-1)
+                alph_t = torch.logsumexp(alphgam_bytost, dim=-1)
+            else:  # maxlog
+                alph_t = alphgam_bytost.max(dim=-1).values
 
             alph_prev = alph_t
-            alph_ta = alph_ta.write(t+1, alph_t)
-        return alph_ta
+            alph_list.append(alph_t)
 
-    def _update_bwd(self, beta_init, bm_mat, llr, alpha_ta):
-        """
-        Run backward update from time t=k-1 to t=0.
+        return torch.stack(alph_list, dim=-1)  # [bs, ns, num_syms+1]
+
+    def _update_bwd(
+        self,
+        beta_init: torch.Tensor,
+        bm_mat: torch.Tensor,
+        llr: torch.Tensor,
+        alpha_ta: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run backward update from time t=k-1 to t=0.
+
         At each time t, computes beta_t-1 using beta_t and gamma_t.
-
-        Returns llr for information bits for t=0,1,...,k-1
+        Returns LLRs for information bits for t=0,1,...,k-1.
         """
-
+        batch_size = beta_init.shape[0]
         beta_next = beta_init
-        llr_op_ta = tf.TensorArray(self.rdtype,
-                                  size=self._num_syms,
-                                  dynamic_size=False,
-                                  clear_after_read=False)
-        beta_next = tf.cast(beta_next, self.rdtype)
 
-        # (bs, _Ns, _ni) matrix, by from state
-        op_mask = tf.tile(self.trellis.op_by_fromnode[None,:,:],
-                          [tf.shape(beta_init)[0],1,1])
-        tonode_mask = tf.tile(self.trellis.to_nodes[None,:,:],
-                              [tf.shape(beta_init)[0], 1, 1])
+        llr_op_list = [None] * self._num_syms
 
-        ipbit_mat = tf.tile(tf.range(self._ni)[None, None, :],
-                            [tf.shape(beta_init)[0], self._ns, 1])
-        ipbitsign_mat = 1.0 - 2.0 * tf.cast(ipbit_mat, self.rdtype)
+        # op_mask[from_st, input] = output symbol
+        op_mask = self._trellis.op_by_fromnode  # [ns, ni]
+        tonode_mask = self._trellis.to_nodes  # [ns, ni]
 
-        for t in tf.range(self._num_syms-1, -1, -1):
-            bm_t = bm_mat[..., t]
-            llr_t = 0.5 * llr[...,t][:, None,None]
-            signed_half_llr = tf.math.multiply(
-                tf.tile(llr_t,[1, self._ns, self._ni]), ipbitsign_mat)
-            bm_byfromst = tf.gather(bm_t, op_mask, batch_dims=1)
+        ipbit_mat = torch.arange(self._ni, device=self.device).unsqueeze(0) \
+            .unsqueeze(0).expand(batch_size, self._ns, -1).contiguous()  # [bs, ns, ni]
+        ipbitsign_mat = 1. - 2. * ipbit_mat.to(self.dtype)
+
+        for t in range(self._num_syms - 1, -1, -1):
+            bm_t = bm_mat[..., t].contiguous()  # [bs, no]
+            llr_t = 0.5 * llr[..., t].unsqueeze(1).unsqueeze(2)  # [bs, 1, 1]
+            signed_half_llr = llr_t * ipbitsign_mat
+
+            bm_byfromst = bm_t[:, op_mask].contiguous()  # [bs, ns, ni]
 
             if self._algorithm in ['log', 'maxlog']:
                 llr_byfromst = signed_half_llr
-                gamma_byfromst = tf.math.add(llr_byfromst, bm_byfromst)
+                gamma_byfromst = (llr_byfromst + bm_byfromst).contiguous()
             else:
-                llr_byfromst = tf.math.exp(signed_half_llr)
-                gamma_byfromst = tf.multiply(llr_byfromst, bm_byfromst)
+                llr_byfromst = torch.exp(signed_half_llr)
+                gamma_byfromst = (llr_byfromst * bm_byfromst).contiguous()
 
-            beta_bytonode = tf.gather(beta_next, tonode_mask, batch_dims=1)
+            # beta_bytonode[bs, from_st, input] = beta_next[bs, to_nodes[from_st, input]]
+            beta_bytonode = beta_next[:, tonode_mask].contiguous()  # [bs, ns, ni]
 
             if self._algorithm not in ['log', 'maxlog']:
-                beta_gam_prod = tf.math.multiply(gamma_byfromst, beta_bytonode)
-                beta_t = tf.math.reduce_sum(beta_gam_prod, axis=-1)
-                beta_t_sum = tf.reduce_sum(beta_t, axis=-1)
-                beta_t = tf.divide(beta_t,
-                                   tf.tile(beta_t_sum[:,None],[1,self._ns]))
+                beta_gam_prod = gamma_byfromst * beta_bytonode
+                beta_t = beta_gam_prod.sum(dim=-1)
+                beta_t_sum = beta_t.sum(dim=-1, keepdim=True)
+                beta_t = beta_t / beta_t_sum
             elif self._algorithm == 'log':
                 beta_gam_prod = gamma_byfromst + beta_bytonode
-                beta_t = tf.math.reduce_logsumexp(beta_gam_prod,
-                                                  axis=-1, keepdims=False)
-            else: #self._algorithm = 'maxlog'
+                beta_t = torch.logsumexp(beta_gam_prod, dim=-1)
+            else:  # maxlog
                 beta_gam_prod = gamma_byfromst + beta_bytonode
-                beta_t = tf.math.reduce_max(beta_gam_prod, axis=-1)
+                beta_t = beta_gam_prod.max(dim=-1).values
 
-            alph_t = alpha_ta.read(t)
+            alph_t = alpha_ta[..., t].contiguous()  # [bs, ns]
+
             if self._algorithm not in ['log', 'maxlog']:
-                llr_op_t0 = tf.math.multiply(
-                                tf.math.multiply(alph_t, gamma_byfromst[...,0]),
-                                            beta_bytonode[...,0])
-                llr_op_t1 = tf.math.multiply(
-                                tf.math.multiply(alph_t,gamma_byfromst[...,1]),
-                                            beta_bytonode[...,1])
-                llr_op_t = tf.math.log(tf.divide(
-                                tf.reduce_sum(llr_op_t0, axis=-1),
-                                tf.reduce_sum(llr_op_t1,axis=-1)))
+                llr_op_t0 = alph_t * gamma_byfromst[..., 0].contiguous() * beta_bytonode[..., 0].contiguous()
+                llr_op_t1 = alph_t * gamma_byfromst[..., 1].contiguous() * beta_bytonode[..., 1].contiguous()
+                llr_op_t = torch.log(
+                    llr_op_t0.sum(dim=-1) / llr_op_t1.sum(dim=-1)
+                )
             else:
-                llr_op_t0 = alph_t + gamma_byfromst[...,0] +beta_bytonode[...,0]
-                llr_op_t1 = alph_t + gamma_byfromst[...,1] +beta_bytonode[...,1]
+                llr_op_t0 = alph_t + gamma_byfromst[..., 0].contiguous() + beta_bytonode[..., 0].contiguous()
+                llr_op_t1 = alph_t + gamma_byfromst[..., 1].contiguous() + beta_bytonode[..., 1].contiguous()
                 if self._algorithm == 'log':
-                    llr_op_t = tf.math.subtract(
-                        tf.math.reduce_logsumexp(llr_op_t0, axis=-1),
-                        tf.math.reduce_logsumexp(llr_op_t1, axis=-1))
-                else:
-                    llr_op_t = tf.math.subtract(
-                        tf.math.reduce_max(llr_op_t0, axis=-1),
-                        tf.math.reduce_max(llr_op_t1, axis=-1))
+                    llr_op_t = torch.logsumexp(llr_op_t0, dim=-1) - \
+                               torch.logsumexp(llr_op_t1, dim=-1)
+                else:  # maxlog
+                    llr_op_t = llr_op_t0.max(dim=-1).values - \
+                               llr_op_t1.max(dim=-1).values
 
-            llr_op_ta = llr_op_ta.write(t, llr_op_t)
+            llr_op_list[t] = llr_op_t
             beta_next = beta_t
 
-        llr_op = tf.transpose(llr_op_ta.stack())
-        return llr_op
+        return torch.stack(llr_op_list, dim=-1)  # [bs, num_syms]
 
-    ########################
-    # Sionna Block functions
-    ########################
-
-    # kwargs catchs additional llr_a input which is not required here
-    # pylint: disable=unused-argument
-    def build(self, input_shape, **kwargs):
+    def build(self, llr_ch_shape: torch.Size, **kwargs):
         """Build block and check dimensions."""
-
-        self._n = input_shape[-1]
-        self._num_syms = int(self._n*self._coderate_desired)
+        self._n = llr_ch_shape[-1]
+        self._num_syms = int(self._n * self._coderate_desired)
 
         self._num_term_syms = self._mu if self._terminate else 0
-        self._num_term_bits = int(self._num_term_syms/self._coderate_desired)
+        self._num_term_bits = int(self._num_term_syms / self._coderate_desired)
 
         self._k = self._num_syms - self._num_term_syms
 
-    def call(self, llr_ch, /, *, llr_a=None):
+        # Build index masks
+        self._ipst_op_idx, self._ipst_ip_idx = self._mask_by_tonode()
+
+        # Pre-compute output bit patterns for branch metric calculation
+        # Shape: [no, conv_n]
+        op_bits = np.stack(
+            [int2bin(op, self._conv_n) for op in range(self._no)]
+        )
+        # Register as buffer for CUDAGraph compatibility
+        self.register_buffer("_op_bits", torch.tensor(op_bits, dtype=self.dtype,
+                                     device=self.device))
+
+        # Move trellis to correct device if needed
+        if self._trellis.device != self.device:
+            self._trellis.to(self.device)
+
+    @torch.compiler.disable
+    def call(
+        self,
+        llr_ch: torch.Tensor,
+        /,
+        *,
+        llr_a: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """BCJR decoding function.
+
+        :param llr_ch: Noisy channel LLR tensor of shape [..., n] where ``n``
+            is the codeword length. All leading dimensions are treated as
+            batch dimensions.
+        :param llr_a: Optional a priori LLR tensor of shape [..., k] where
+            ``k`` is the number of information bits. Implicitly assumed to be
+            0 if not provided.
+
+        :output msghat: Decoded information bits (or LLRs) of shape
+            [..., k].
         """
-        BCJR decoding function.
-        Inputs is the (noisy) codeword tensor where the last dimension should
-        equal n. All the leading dimensions are assumed as batch dimensions.
-        """
+        output_shape = list(llr_ch.shape)
+        input_device = llr_ch.device
 
-        output_shape = llr_ch.get_shape().as_list()
+        # Allow different codeword lengths in eager mode
+        # Also ensure build() is called (needed for torch.compile compatibility)
+        if self._n is None or output_shape[-1] != self._n:
+            self._built = False
+            if torch.compiler.is_compiling():
+                # During compilation trace, we need concrete values
+                torch.compiler.disable(self.build)(llr_ch.shape)
+            else:
+                self.build(llr_ch.shape)
+            self._built = True
 
-        # detect changes and triger rebuild if required (in Eager)
-
-        # allow different codeword lengths in eager mode
-        if output_shape[-1] != self._n:
-            self.build(output_shape)
+        # Move module to input device if needed (for torch.compile compatibility)
+        if self._op_bits is not None and self._op_bits.device != input_device:
+            self.to(input_device)
 
         output_shape[0] = -1
-        output_shape[-1] = self._k # assign k to the last dimension
-        llr_ch = tf.reshape(llr_ch, [-1, self._n])
+        output_shape[-1] = self._k
+        llr_ch = llr_ch.reshape(-1, self._n)
+        batch_size = llr_ch.shape[0]
 
         if llr_a is None:
-            llr_a = tf.zeros((tf.shape(llr_ch)[0], self._num_syms),
-                               dtype=self.rdtype)
+            llr_a = torch.zeros(
+                batch_size, self._num_syms,
+                dtype=self.dtype, device=input_device
+            )
         else:
-            llr_a = tf.reshape(llr_a, [-1, self._num_syms])
+            llr_a = llr_a.reshape(-1, self._num_syms)
 
-        # internally, we use more common llr definition log(x)=p(x=0)/p(x=1)
+        # Internally, we use more common LLR definition log(p(x=0)/p(x=1))
         llr_ch = -1. * llr_ch
         llr_a = -1. * llr_a
 
@@ -932,12 +972,12 @@ class BCJRDecoder(Block):
         alph_ta = self._update_fwd(alpha_init, bm_mat, llr_a)
         llr_op = self._update_bwd(beta_init, bm_mat, llr_a, alph_ta)
 
-        # revert llr definition
-        msghat = -1. * llr_op[...,:self._k]
+        # Revert LLR definition
+        msghat = -1. * llr_op[..., :self._k]
 
-        if self._hard_out: # hard decide decoder output if required
-            msghat = tf.less(0.0, msghat)
-            msghat = tf.cast(msghat, self.rdtype)
-        msghat_reshaped = tf.reshape(msghat, output_shape)
+        if self._hard_out:
+            msghat = (msghat > 0.0).to(self.dtype)
 
+        msghat_reshaped = msghat.reshape(output_shape)
         return msghat_reshaped
+

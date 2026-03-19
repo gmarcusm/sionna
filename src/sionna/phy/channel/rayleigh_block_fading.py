@@ -1,16 +1,21 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
 """Class for simulating Rayleigh block fading"""
 
-import tensorflow as tf
-from sionna.phy import config
-from . import ChannelModel
+from typing import Optional, Tuple
+
+import torch
+
+from sionna.phy.utils import normal
+from .channel_model import ChannelModel
+
+__all__ = ["RayleighBlockFading"]
+
 
 class RayleighBlockFading(ChannelModel):
-    # pylint: disable=line-too-long
-    r"""
-    Generates channel impulse responses corresponding to a Rayleigh block
+    r"""Generates channel impulse responses corresponding to a Rayleigh block
     fading channel model
 
     The channel impulse responses generated are formed of a single path with
@@ -27,85 +32,133 @@ class RayleighBlockFading(ChannelModel):
     :class:`~sionna.phy.channel.GenerateTimeChannel`,
     :class:`~sionna.phy.channel.ApplyTimeChannel`.
 
-    Parameters
-    ----------
-    num_rx : `int`
-        Number of receivers (:math:`N_R`)
+    :param num_rx: Number of receivers (:math:`N_R`)
+    :param num_rx_ant: Number of antennas per receiver (:math:`N_{RA}`)
+    :param num_tx: Number of transmitters (:math:`N_T`)
+    :param num_tx_ant: Number of antennas per transmitter (:math:`N_{TA}`)
+    :param precision: Precision used for internal calculations and outputs.
+        If set to `None`, :attr:`~sionna.phy.config.Config.precision` is
+        used.
+    :param device: Device for computation (e.g., 'cpu', 'cuda:0').
+        If `None`, :attr:`~sionna.phy.config.Config.device` is used.
 
-    num_rx_ant : `int`
-        Number of antennas per receiver (:math:`N_{RA}`)
+    :input batch_size: `int`.
+        Batch size.
 
-    num_tx : `int`
-        Number of transmitters (:math:`N_T`)
+    :input num_time_steps: `int`.
+        Number of time steps.
 
-    num_tx_ant : `int`
-        Number of antennas per transmitter (:math:`N_{TA}`)
+    :input sampling_frequency: `float`.
+        Sampling frequency [Hz]. Not used but accepted for compatibility with
+        the :class:`~sionna.phy.channel.ChannelModel` interface.
 
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
-        If set to `None`,
-        :attr:`~sionna.phy.config.Config.precision` is used.
+    :output a: [batch size, num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths=1, num_time_steps], `torch.complex`.
+        Path coefficients.
 
-    Input
-    -----
-    batch_size : `int`
-        Batch size
+    :output tau: [batch size, num_rx, num_tx, num_paths=1], `torch.float`.
+        Path delays [s].
 
-    num_time_steps : `int`
-        Number of time steps
+    .. rubric:: Examples
 
-    Output
-    -------
-    a : [batch size, num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths = 1, num_time_steps], `tf.complex`
-        Path coefficients
+    .. code-block:: python
 
-    tau : [batch size, num_rx, num_tx, num_paths = 1], `tf.float`
-        Path delays [s]
+        import torch
+        from sionna.phy.channel import RayleighBlockFading
+
+        channel_model = RayleighBlockFading(num_rx=1, num_rx_ant=2,
+                                            num_tx=1, num_tx_ant=4)
+        h, tau = channel_model(batch_size=32, num_time_steps=14)
+        print(h.shape)
+        # torch.Size([32, 1, 2, 1, 4, 1, 14])
+        print(tau.shape)
+        # torch.Size([32, 1, 1, 1])
     """
-    def __init__(self,
-                 num_rx,
-                 num_rx_ant,
-                 num_tx,
-                 num_tx_ant,
-                 precision=None,
-                 **kwargs):
-        super().__init__(precision=precision, **kwargs)
-        self.num_tx = num_tx
-        self.num_tx_ant = num_tx_ant
-        self.num_rx = num_rx
-        self.num_rx_ant = num_rx_ant
 
-    def __call__(self,  batch_size, num_time_steps, sampling_frequency=None):
+    def __init__(
+        self,
+        num_rx: int,
+        num_rx_ant: int,
+        num_tx: int,
+        num_tx_ant: int,
+        precision: Optional[str] = None,
+        device: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(precision=precision, device=device, **kwargs)
+        self._num_tx = num_tx
+        self._num_tx_ant = num_tx_ant
+        self._num_rx = num_rx
+        self._num_rx_ant = num_rx_ant
 
-        # Delays
-        # Single path with zero delay
-        delays = tf.zeros([ batch_size,
-                            self.num_rx,
-                            self.num_tx,
-                            1], # Single path
-                            dtype=self.rdtype)
+    @property
+    def num_tx(self) -> int:
+        """Number of transmitters"""
+        return self._num_tx
 
-        # Fading coefficients
-        std = tf.cast(tf.sqrt(0.5), dtype=self.rdtype)
-        h_real = config.tf_rng.normal(shape=[batch_size,
-                                             self.num_rx,
-                                             self.num_rx_ant,
-                                             self.num_tx,
-                                             self.num_tx_ant,
-                                             1, # One path
-                                             1], # Same response over the block
-                                      stddev=std,
-                                      dtype = self.rdtype)
-        h_img = config.tf_rng.normal(shape=[batch_size,
-                                            self.num_rx,
-                                            self.num_rx_ant,
-                                            self.num_tx,
-                                            self.num_tx_ant,
-                                            1, # One cluster
-                                            1], # Same response over the block
-                                     stddev=std,
-                                     dtype = self.rdtype)
-        h = tf.complex(h_real, h_img)
-        # Tile the response over the block
-        h = tf.tile(h, [1, 1, 1, 1, 1, 1, num_time_steps])
+    @property
+    def num_tx_ant(self) -> int:
+        """Number of antennas per transmitter"""
+        return self._num_tx_ant
+
+    @property
+    def num_rx(self) -> int:
+        """Number of receivers"""
+        return self._num_rx
+
+    @property
+    def num_rx_ant(self) -> int:
+        """Number of antennas per receiver"""
+        return self._num_rx_ant
+
+    def __call__(
+        self,
+        batch_size: int,
+        num_time_steps: int,
+        sampling_frequency: Optional[float] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Generate channel impulse response for Rayleigh block fading."""
+        # Delays: single path with zero delay
+        delays = torch.zeros(
+            batch_size,
+            self._num_rx,
+            self._num_tx,
+            1,  # Single path
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+        # Fading coefficients: complex Gaussian with unit variance
+        std = torch.tensor(0.5, dtype=self.dtype, device=self.device).sqrt()
+        shape = [
+            batch_size,
+            self._num_rx,
+            self._num_rx_ant,
+            self._num_tx,
+            self._num_tx_ant,
+            1,  # One path
+            1,  # Same response over the block
+        ]
+
+        # Uses smart normal that switches to global RNG in compiled mode
+        h_real = normal(
+            mean=0.0,
+            std=std,
+            size=shape,
+            dtype=self.dtype,
+            device=self.device,
+            generator=self.torch_rng,
+        )
+        h_imag = normal(
+            mean=0.0,
+            std=std,
+            size=shape,
+            dtype=self.dtype,
+            device=self.device,
+            generator=self.torch_rng,
+        )
+        h = torch.complex(h_real, h_imag)
+
+        # Tile the response over all time steps (block fading)
+        h = h.expand(-1, -1, -1, -1, -1, -1, num_time_steps)
+
         return h, delays

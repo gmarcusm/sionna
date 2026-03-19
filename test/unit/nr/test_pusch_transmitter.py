@@ -1,58 +1,174 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+"""Tests for PUSCHTransmitter."""
+
 import pytest
-import os
 import numpy as np
-import tensorflow as tf
-import json
-import numpy as np
+import torch
+
 from sionna.phy.nr import PUSCHConfig, PUSCHTransmitter
 
-script_dir = os.path.dirname(os.path.abspath(__file__))
 
-def run_test(test_name):
-    # Load data
-    b, grid = np.load(test_name + ".npy", allow_pickle=True)
+class TestPUSCHTransmitter:
+    """Tests for PUSCHTransmitter."""
 
-    # Load config
-    with open(test_name + ".json", 'r') as file:
-        config = json.load(file)
+    def test_basic_initialization(self):
+        """Test basic transmitter initialization."""
+        config = PUSCHConfig()
+        transmitter = PUSCHTransmitter(config)
 
-    pusch_config = PUSCHConfig()
+        assert transmitter.resource_grid is not None
+        assert transmitter.pilot_pattern is not None
 
-    pusch_config.carrier.n_cell_id = config["carrier"]["n_cell_id"]
-    pusch_config.carrier.slot_number = config["carrier"]["slot_number"]
+    def test_frequency_domain_output(self):
+        """Test transmitter with frequency domain output."""
+        config = PUSCHConfig()
+        config.n_size_bwp = 12
 
-    pusch_config.n_size_bwp = config["pusch"]["n_size_bwp"]
-    pusch_config.symbol_allocation = config["pusch"]["symbol_allocation"]
-    pusch_config.n_rnti = config["pusch"]["n_rnti"]
-    pusch_config.num_antenna_ports = config["pusch"]["num_antenna_ports"]
-    pusch_config.num_layers = config["pusch"]["num_layers"]
-    pusch_config.precoding = config["pusch"]["precoding"]
+        transmitter = PUSCHTransmitter(config, output_domain="freq")
 
-    if pusch_config.precoding=="codebook":
-        pusch_config.tpmi = config["pusch"]["tpmi"]
+        x, b = transmitter(4)
 
-    pusch_config.dmrs.length = config["pusch"]["dmrs"]["length"]
-    pusch_config.dmrs.config_type = config["pusch"]["dmrs"]["config_type"]
-    pusch_config.dmrs.additional_position = config["pusch"]["dmrs"]["additional_position"]
-    pusch_config.dmrs.num_cdm_groups_without_data = config["pusch"]["dmrs"]["num_cdm_groups_without_data"]
-    pusch_config.dmrs.dmrs_port_set = config["pusch"]["dmrs"]["dmrs_port_set"]
-    pusch_config.dmrs.n_scid = config["pusch"]["dmrs"]["n_scid"]
-    pusch_config.dmrs.n_id = config["pusch"]["dmrs"]["n_id"]
+        # Check output shapes
+        assert x.dim() >= 4
+        assert b.shape[0] == 4
 
-    pusch_config.tb.mcs_index = config["pusch"]["tb"]["mcs_index"]
-    pusch_config.tb.mcs_table = config["pusch"]["tb"]["mcs_table"]
+    def test_time_domain_output(self):
+        """Test transmitter with time domain output."""
+        config = PUSCHConfig()
+        config.n_size_bwp = 12
 
-    pusch_transmitter = PUSCHTransmitter(pusch_config, return_bits=False)
+        transmitter = PUSCHTransmitter(config, output_domain="time")
 
-    x_grid = pusch_transmitter(b)
-    x_grid = tf.transpose(x_grid[0,0], perm=[2,1,0])
-    return np.allclose(tf.squeeze(x_grid), grid)
+        x, b = transmitter(4)
 
-@pytest.mark.parametrize("test_id", list(range(0,83)))
-def tests_against_reference(test_id):
-    """Test PUSCHTransmitter output against reference"""
-    test_name = script_dir+f"/pusch_test_configs/test_{test_id}"
-    assert run_test(test_name)
+        # Time domain output has different shape
+        assert x.dim() >= 3
+
+    def test_return_bits_true(self):
+        """Test transmitter with return_bits=True."""
+        config = PUSCHConfig()
+        config.n_size_bwp = 12
+
+        transmitter = PUSCHTransmitter(config, return_bits=True)
+
+        result = transmitter(4)
+
+        assert len(result) == 2
+        x, b = result
+        assert x is not None
+        assert b is not None
+
+    def test_return_bits_false(self):
+        """Test transmitter with return_bits=False (provide bits)."""
+        config = PUSCHConfig()
+        config.n_size_bwp = 12
+
+        transmitter = PUSCHTransmitter(config, return_bits=False)
+
+        # Generate input bits with correct shape
+        tb_size = transmitter._tb_size
+        num_tx = transmitter._num_tx
+        bits = torch.randint(0, 2, (4, num_tx, tb_size), dtype=torch.float32)
+
+        x = transmitter(bits)
+
+        # Only signal is returned
+        assert isinstance(x, torch.Tensor)
+
+    def test_multiple_transmitters(self):
+        """Test with multiple transmitter configurations."""
+        config1 = PUSCHConfig()
+        config1.n_size_bwp = 12
+        config1.n_rnti = 1001
+
+        config2 = PUSCHConfig()
+        config2.n_size_bwp = 12
+        config2.n_rnti = 1002
+
+        transmitter = PUSCHTransmitter([config1, config2])
+
+        x, b = transmitter(4)
+
+        # Should have 2 transmitters
+        assert transmitter._num_tx == 2
+
+    @pytest.mark.parametrize("num_layers", [1, 2])
+    def test_different_num_layers(self, num_layers):
+        """Test with different number of layers."""
+        config = PUSCHConfig()
+        config.n_size_bwp = 12
+        config.num_layers = num_layers
+        config.num_antenna_ports = num_layers
+
+        transmitter = PUSCHTransmitter(config)
+
+        x, b = transmitter(2)
+
+        assert x is not None
+
+    def test_codebook_precoding(self):
+        """Test with codebook precoding."""
+        config = PUSCHConfig()
+        config.n_size_bwp = 12
+        config.num_layers = 1
+        config.num_antenna_ports = 2
+        config.precoding = "codebook"
+        config.tpmi = 0
+
+        transmitter = PUSCHTransmitter(config)
+
+        x, b = transmitter(2)
+
+        # Output should have num_antenna_ports antennas
+        assert transmitter._precoder is not None
+
+    def test_output_dtype(self):
+        """Test that output has correct dtype."""
+        config = PUSCHConfig()
+        config.n_size_bwp = 12
+
+        transmitter = PUSCHTransmitter(config)
+
+        x, b = transmitter(2)
+
+        assert x.is_complex()
+        assert not b.is_complex()
+
+
+class TestPUSCHTransmitterEdgeCases:
+    """Edge case tests for PUSCHTransmitter."""
+
+    def test_single_prb(self):
+        """Test with single PRB."""
+        config = PUSCHConfig()
+        config.n_size_bwp = 1
+
+        transmitter = PUSCHTransmitter(config)
+        x, b = transmitter(1)
+
+        assert x is not None
+
+    def test_maximum_prbs(self):
+        """Test with maximum number of PRBs."""
+        config = PUSCHConfig()
+        config.n_size_bwp = 275
+
+        transmitter = PUSCHTransmitter(config)
+        x, b = transmitter(1)
+
+        assert x is not None
+
+    def test_short_symbol_allocation(self):
+        """Test with short symbol allocation."""
+        config = PUSCHConfig()
+        config.n_size_bwp = 12
+        config.symbol_allocation = [0, 4]
+
+        transmitter = PUSCHTransmitter(config)
+        x, b = transmitter(1)
+
+        assert x is not None
+

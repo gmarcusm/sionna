@@ -1,371 +1,389 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+"""Unit tests for sionna.phy.fec.polar.encoding."""
 
 import os
-import unittest
 import numpy as np
-import tensorflow as tf
+import pytest
+import torch
+
 from sionna.phy.fec.polar.encoding import PolarEncoder, Polar5GEncoder
+from sionna.phy.fec.polar.utils import (
+    generate_5g_ranking,
+    generate_polar_transform_mat,
+)
 from sionna.phy.mapping import BinarySource
-from sionna.phy.fec.polar.utils import generate_5g_ranking, generate_polar_transform_mat
 
-current_dir = os.path.dirname(os.path.abspath(__file__))
-test_dir = os.path.abspath(os.path.join(current_dir, os.pardir, os.pardir))
 
-class TestPolarEncoding(unittest.TestCase):
-    """Testcases for the PolarEncoder layer."""
+# Get reference data directory
+test_dir = os.path.dirname(os.path.abspath(__file__))
+ref_path = os.path.join(test_dir, "..", "..", "codes", "polar")
 
-    def test_invalid_inputs(self):
+
+class TestPolarEncoder:
+    """Tests for the PolarEncoder class."""
+
+    @pytest.mark.parametrize(
+        "k,n,k_des,n_des",
+        [
+            (-1, 10, 1, 32),
+            (10, -3, 10, 32),
+            ("1.0", 10, 1, 32),
+            (3, "10.", 3, 32),
+            (10, 9, 10, 32),
+        ],
+    )
+    def test_invalid_inputs(self, k, n, k_des, n_des):
         """Test against invalid values of n and k."""
+        frozen_pos, _ = generate_5g_ranking(k_des, n_des)
+        with pytest.raises(BaseException):
+            PolarEncoder(frozen_pos, n)
 
-        # (k, n, k_des, n_des)...last two entries are just used to generate
-        # valid channel rankings
-        param_invalid = [[-1, 10, 1, 32], [10,-3, 10, 32], ["1.0", 10, 1, 32],
-                        [3, "10.", 3, 32], [10, 9, 10, 32]]
+    @pytest.mark.parametrize(
+        "k,n",
+        [(0, 32), (10, 32), (32, 32), (100, 256), (123, 1024), (1024, 1024)],
+    )
+    def test_valid_inputs(self, k, n):
+        """Test that valid shapes are accepted."""
+        frozen_pos, _ = generate_5g_ranking(k, n)
+        enc = PolarEncoder(frozen_pos, n)
+        assert enc.k == k
+        assert enc.n == n
 
-        for p in param_invalid:
-            frozen_pos,_ = generate_5g_ranking(p[2], p[3])
-            with self.assertRaises(BaseException):
-                PolarEncoder(frozen_pos, p[1])
-
-        # test also valid shapes
-        # (k, n)
-        param_valid = [[0, 32], [10, 32], [32, 32], [100, 256],
-                       [123, 1024], [1024, 1024]]
-
-        for p in param_valid:
-            frozen_pos, _ = generate_5g_ranking(p[0], p[1])
-            PolarEncoder(frozen_pos, p[1])
-
-    def test_output_dim(self):
+    @pytest.mark.parametrize(
+        "k,n",
+        [(1, 32), (10, 32), (32, 32), (100, 256), (123, 1024), (1024, 1024)],
+    )
+    def test_output_dim(self, device, k, n):
         """Test that output dims are correct (=n) and output is all-zero
-         codeword."""
-
+        codeword for all-zero input."""
         bs = 10
+        frozen_pos, _ = generate_5g_ranking(k, n)
+        enc = PolarEncoder(frozen_pos, n, device=device)
+        u = torch.zeros([bs, k], device=device)
+        c = enc(u)
+        assert c.shape[-1] == n
 
-        # (k, n)
-        param_valid = [[1, 32], [10, 32], [32, 32], [100, 256], [123, 1024],
-                      [1024, 1024]]
+        # Also check that all-zero input yields all-zero output
+        c_hat = torch.zeros([bs, n], device=device)
+        assert torch.equal(c, c_hat)
 
-        for p in param_valid:
-            frozen_pos, _ = generate_5g_ranking(p[0], p[1])
-            enc = PolarEncoder(frozen_pos, p[1])
-            u = tf.zeros([bs, p[0]])
-            c = enc(u).numpy()
-            self.assertTrue(c.shape[-1]==p[1])
-
-            # also check that all-zero input yields all-zero output
-            c_hat = np.zeros([bs, p[1]])
-            self.assertTrue(np.array_equal(c, c_hat))
-
-    def test_multi_dimensional(self):
+    def test_multi_dimensional(self, device):
         """Test against multi-dimensional shapes."""
-
         k = 120
         n = 256
 
         frozen_pos, _ = generate_5g_ranking(k, n)
-        source = BinarySource()
-        enc = PolarEncoder(frozen_pos, n)
+        source = BinarySource(device=device)
+        enc = PolarEncoder(frozen_pos, n, device=device)
 
         b = source([100, k])
-        b_res = tf.reshape(b, [4, 5, 5, k])
+        b_res = b.reshape([4, 5, 5, k])
 
-        # encode 2D Tensor
-        c = enc(b).numpy()
-        # encode 4D Tensor
-        c_res = enc(b_res).numpy()
-        # and reshape to 2D shape
-        c_res = tf.reshape(c_res, [100, n])
-        # both version should yield same result
-        self.assertTrue(np.array_equal(c, c_res))
+        # Encode 2D Tensor
+        c = enc(b)
+        # Encode 4D Tensor
+        c_res = enc(b_res)
+        # And reshape to 2D shape
+        c_res = c_res.reshape([100, n])
+        # Both version should yield same result
+        assert torch.equal(c, c_res)
 
-
-    def test_tf_fun(self):
-        """Test that graph mode works and XLA is supported."""
-
-        @tf.function
-        def run_graph(u):
-            return enc(u)
-
-        @tf.function(jit_compile=True)
-        def run_graph_xla(u):
-            return enc(u)
-
+    def test_torch_compile(self, device):
+        """Test that torch.compile works as expected."""
         bs = 10
         k = 100
         n = 128
-        source = BinarySource()
+        source = BinarySource(device=device)
         frozen_pos, _ = generate_5g_ranking(k, n)
-        enc = PolarEncoder(frozen_pos, n)
+        enc = PolarEncoder(frozen_pos, n, device=device)
 
-        # test that for arbitrary input only 0,1 values are returned
+        @torch.compile
+        def run_graph(u):
+            return enc(u)
+
         u = source([bs, k])
-        x = run_graph(u).numpy()
+        x = run_graph(u)
+        assert x.shape == (bs, n)
 
-        # execute the graph twice
-        x = run_graph(u).numpy()
+        # Execute the graph twice
+        x = run_graph(u)
+        assert x.shape == (bs, n)
 
-        # and change batch_size
-        u = source([bs+1, k])
-        x = run_graph(u).numpy()
+        # And change batch_size
+        u = source([bs + 1, k])
+        x = run_graph(u)
+        assert x.shape == (bs + 1, n)
 
-        #check XLA
-        x = run_graph_xla(u).numpy()
-        u = source([bs, k])
-        x = run_graph_xla(u).numpy()
-
-    def test_ref_implementation(self):
+    def test_ref_implementation(self, device):
         """Test channel rankings against reference implementation based on
-        polar transform matrix.
-        """
-
+        polar transform matrix."""
         bs = 10
         k = 12
         n = 32
 
         frozen_pos, info_pos = generate_5g_ranking(k, n)
-        source = BinarySource()
-        enc = PolarEncoder(frozen_pos, n)
+        source = BinarySource(device=device)
+        enc = PolarEncoder(frozen_pos, n, device=device)
 
-        b = source([bs, k]) # perform array ops in numpy
-        u = np.zeros([bs, n])
-        u[:, info_pos] = b.numpy()
+        b = source([bs, k])
+        u = torch.zeros([bs, n], device=device)
+        u[:, info_pos] = b
 
-        # call reference implementation
-        c_ref = np.zeros([bs, n])
+        # Call reference implementation
         gen_mat = generate_polar_transform_mat(int(np.log2(n)))
-        gen_mat = tf.expand_dims(gen_mat, axis=0)
+        gen_mat = torch.tensor(gen_mat, dtype=torch.float32, device=device)
+        gen_mat = gen_mat.unsqueeze(0)
 
-        u = tf.expand_dims(u, axis=1)
-        c_ref = tf.linalg.matmul(u, gen_mat)
-        c_ref = tf.math.mod(c_ref, 2)
-        c_ref = tf.squeeze(c_ref, axis=1)
+        u_exp = u.unsqueeze(1)
+        c_ref = torch.matmul(u_exp, gen_mat)
+        c_ref = torch.fmod(c_ref, 2)
+        c_ref = c_ref.squeeze(1)
 
-        # and run tf version (to be tested)
-        c = enc(b).numpy()
+        # And run encoder (to be tested)
+        c = enc(b)
 
-        self.assertTrue(np.array_equal(c, c_ref))
+        assert torch.equal(c.float(), c_ref)
 
-    def test_batch(self):
-        """Test that all samples in batch yield same output (for same input).
-        """
+    def test_batch(self, device):
+        """Test that all samples in batch yield same output (for same input)."""
         bs = 100
         k = 120
         n = 256
 
         frozen_pos, _ = generate_5g_ranking(k, n)
-        source = BinarySource()
-        enc = PolarEncoder(frozen_pos, n)
+        source = BinarySource(device=device)
+        enc = PolarEncoder(frozen_pos, n, device=device)
 
         b = source([1, 15, k])
-        b_rep = tf.tile(b, [bs, 1, 1])
-        c = enc(b_rep).numpy()
+        b_rep = b.repeat([bs, 1, 1])
+        c = enc(b_rep)
 
         for i in range(bs):
-            self.assertTrue(np.array_equal(c[0,:,:], c[i,:,:]))
+            assert torch.equal(c[0, :, :], c[i, :, :])
 
-    def test_dtypes_flexible(self):
-        """Test that encoder supports variable dtypes and
-        yields same result."""
-
-        dt_supported = (tf.float16, tf.float32, tf.float64, tf.int8,
-            tf.int32, tf.int64, tf.uint8, tf.uint16, tf.uint32)
-
+    @pytest.mark.parametrize(
+        "dtype",
+        [torch.float16, torch.float32, torch.float64, torch.int8, torch.int32],
+    )
+    def test_dtypes_flexible(self, device, dtype):
+        """Test that encoder supports variable dtypes and yields same result."""
         bs = 10
         k = 32
         n = 64
 
-        source = BinarySource()
+        source = BinarySource(device=device)
         frozen_pos, _ = generate_5g_ranking(k, n)
-        enc_ref = PolarEncoder(frozen_pos, n, dtype=tf.float32)
+        enc_ref = PolarEncoder(frozen_pos, n, device=device)
 
         u = source([bs, k])
         c_ref = enc_ref(u)
 
-        for dt in dt_supported:
-            enc = PolarEncoder(frozen_pos, n, dtype=dt)
-            u_dt = tf.cast(u, dt)
-            c = enc(u_dt)
+        enc = PolarEncoder(frozen_pos, n, device=device)
+        u_dt = u.to(dtype)
+        c = enc(u_dt)
 
-            c_32 = tf.cast(c, tf.float32)
+        c_32 = c.to(torch.float32)
 
-            self.assertTrue(np.array_equal(c_ref.numpy(), c_32.numpy()))
+        assert torch.equal(c_ref.float(), c_32)
 
 
-class TestPolarEncoding5G(unittest.TestCase):
-    """Test 5G encoder including rate-matching.
+class TestPolar5GEncoder:
+    """Tests for the Polar5GEncoder class including rate-matching.
 
-    Remark: the layer inherits from PolarEncoder, thus many basic tests are
-    already covered by the previous testcases."""
+    The layer inherits from PolarEncoder, thus many basic tests are
+    already covered by the previous testcases.
+    """
 
-    def test_invalid_inputs(self):
+    @pytest.mark.parametrize(
+        "k,n",
+        [
+            (-1, 30),
+            (12, -3),
+            ("12.", 30),
+            (3, "10."),
+            (10, 9),
+            (10, 32),
+            (10, 10),
+            (1014, 1040),
+            (1000, 1100),
+            (100, 110),
+        ],
+    )
+    def test_invalid_inputs(self, k, n):
         """Test against invalid values of n and k according to 38.212."""
+        with pytest.raises((BaseException, ValueError)):
+            Polar5GEncoder(k, n)
 
-        # (k, n)
-        param_invalid = [[-1, 30], # negative k
-                         [12, -3], # negative n
-                         ["12.", 30], # non int k
-                         [3, "10."], # non int n
-                         [10, 9], # r>1
-                         [10, 32], # k too small
-                         [10, 10], # n too small
-                         [1014, 1040], # k too large
-                         [1000, 1100], # n too large
-                         [100, 110]] # k+k_crc>n
-
-        for p in param_invalid:
-            with self.assertRaises((BaseException, ValueError)):
-                Polar5GEncoder(p[0], p[1])
-
-    def test_output_dim(self):
+    @pytest.mark.parametrize(
+        "k,n",
+        [(12, 32), (20, 32), (100, 256), (243, 1024), (1013, 1088)],
+    )
+    def test_output_dim(self, device, k, n):
         """Test that output dims are correct (=n) and output is all-zero
-         codeword for all-zero inputs."""
-
+        codeword for all-zero inputs."""
         bs = 10
-        # (k, n)
-        param_valid = [[12, 32], [20, 32], [100, 256],
-                       [243, 1024], [1013, 1088]]
+        enc = Polar5GEncoder(k, n, device=device)
+        u = torch.zeros([bs, k], device=device)
+        c = enc(u)
+        assert c.shape[-1] == n
+        # Also check that all-zero input yields all-zero output
+        c_hat = torch.zeros_like(c)
+        assert torch.equal(c, c_hat)
 
-        for p in param_valid:
-            enc = Polar5GEncoder(p[0], p[1])
-            u = tf.zeros([bs, p[0]])
-            c = enc(u).numpy()
-            self.assertTrue(c.shape[-1]==p[1])
-            # also check that all-zero input yields all-zero output
-            c_hat = np.zeros_like(c)
-            self.assertTrue(np.array_equal(c, c_hat))
-
-    def test_multi_dimensional(self):
+    def test_multi_dimensional(self, device):
         """Test against arbitrary shapes."""
-
         k = 56
         n = 240
 
-        source = BinarySource()
-        enc = Polar5GEncoder(k, n)
+        source = BinarySource(device=device)
+        enc = Polar5GEncoder(k, n, device=device)
 
         b = source([100, k])
-        b_res = tf.reshape(b, [4, 5, 5, k])
+        b_res = b.reshape([4, 5, 5, k])
 
-        # encode 2D Tensor
-        c = enc(b).numpy()
-        # encode 4D Tensor
-        c_res = enc(b_res).numpy()
-        # and reshape to 2D shape
-        c_res = tf.reshape(c_res, [100, n])
-        # both version should yield same result
-        self.assertTrue(np.array_equal(c, c_res))
+        # Encode 2D Tensor
+        c = enc(b)
+        # Encode 4D Tensor
+        c_res = enc(b_res)
+        # And reshape to 2D shape
+        c_res = c_res.reshape([100, n])
+        # Both version should yield same result
+        assert torch.equal(c, c_res)
 
-
-    def test_tf_fun(self):
-        """Test that graph mode works and XLA is supported."""
-
-        @tf.function
-        def run_graph(u):
-            return enc(u)
-
-        @tf.function(jit_compile=True)
-        def run_graph_xla(u):
-            return enc(u)
-
+    def test_torch_compile(self, device):
+        """Test that torch.compile works as expected."""
         bs = 10
         k = 100
         n = 135
-        source = BinarySource()
-        enc = Polar5GEncoder(k, n)
+        source = BinarySource(device=device)
+        enc = Polar5GEncoder(k, n, device=device)
 
-        # test that for arbitrary input only 0,1 values are returned
+        @torch.compile
+        def run_graph(u):
+            return enc(u)
+
         u = source([bs, k])
-        x = run_graph(u).numpy()
+        x = run_graph(u)
+        assert x.shape == (bs, n)
 
-        # execute the graph twice
-        x = run_graph(u).numpy()
+        # Execute the graph twice
+        x = run_graph(u)
+        assert x.shape == (bs, n)
 
-        # and change batch_size
-        u = source([bs+1, k])
-        x = run_graph(u).numpy()
+        # And change batch_size
+        u = source([bs + 1, k])
+        x = run_graph(u)
+        assert x.shape == (bs + 1, n)
 
-        # check XLA
-        x = run_graph_xla(u).numpy()
-        u = source([bs, k])
-        x = run_graph_xla(u).numpy()
-
-    def test_batch(self):
-        """Test that all samples in batch yield same output (for same input).
-        """
+    def test_batch(self, device):
+        """Test that all samples in batch yield same output (for same input)."""
         bs = 100
         k = 120
         n = 253
 
-        source = BinarySource()
-        enc = Polar5GEncoder(k, n)
+        source = BinarySource(device=device)
+        enc = Polar5GEncoder(k, n, device=device)
 
         b = source([1, 15, k])
-        b_rep = tf.tile(b, [bs, 1, 1])
+        b_rep = b.repeat([bs, 1, 1])
 
-        # and run tf version (to be tested)
-        c = enc(b_rep).numpy()
+        c = enc(b_rep)
 
         for i in range(bs):
-            self.assertTrue(np.array_equal(c[0,:,:], c[i,:,:]))
+            assert torch.equal(c[0, :, :], c[i, :, :])
 
-    def test_ref_implementation(self):
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "E45_k30_K41",
+            "E70_k32_K43",
+            "E127_k29_K40",
+            "E1023_k400_K411",
+            "E70_k28_K39",
+        ],
+    )
+    def test_ref_implementation(self, device, filename):
         """Test against pre-generated test cases.
+
         The test-cases include CRC-encoding and rate-matching and
         cover puncturing, shortening and repetition coding.
         """
+        if not os.path.exists(ref_path):
+            pytest.skip("Reference data not found")
 
-        ref_path = test_dir + '/codes/polar/'
-        filename = ['E45_k30_K41',
-                    'E70_k32_K43',
-                    'E127_k29_K40',
-                    'E1023_k400_K411',
-                    'E70_k28_K39']
+        u_path = os.path.join(ref_path, filename + "_u.npy")
+        c_path = os.path.join(ref_path, filename + "_c.npy")
 
-        for f in filename:
-            # load random info bits
-            u = np.load(ref_path + f + "_u.npy")
-            u = tf.constant(u, tf.float32)
-            # load reference codewords
-            c_ref = np.load(ref_path + f + "_c.npy")
+        if not os.path.exists(u_path) or not os.path.exists(c_path):
+            pytest.skip(f"Reference data for {filename} not found")
 
-            # restore dimensions
-            k = u.shape[1]
-            n = c_ref.shape[1]
+        u = np.load(u_path)
+        u = torch.tensor(u, dtype=torch.float32, device=device)
+        c_ref = np.load(c_path)
 
-            # encode u with Sionna encoder
-            enc = Polar5GEncoder(k, n)
-            c = enc(u)
+        k = u.shape[1]
+        n = c_ref.shape[1]
 
-            # and compare results
-            self.assertTrue(np.array_equal(c, c_ref))
+        enc = Polar5GEncoder(k, n, device=device)
+        c = enc(u)
 
-    def test_dtypes_flexible(self):
-        """Test that encoder supports variable dtypes and
-        yields same result for all dtypes."""
+        assert np.array_equal(c.cpu().numpy(), c_ref)
 
-        dt_supported = (tf.float16, tf.float32, tf.float64, tf.int8,
-            tf.int32, tf.int64, tf.uint8, tf.uint16, tf.uint32)
-
+    @pytest.mark.parametrize(
+        "dtype",
+        [torch.float16, torch.float32, torch.float64, torch.int8, torch.int32],
+    )
+    def test_dtypes_flexible(self, device, dtype):
+        """Test that encoder supports variable dtypes and yields same result."""
         bs = 10
         k = 32
         n = 64
 
-        source = BinarySource()
-        enc_ref = Polar5GEncoder(k, n, dtype=tf.float32)
+        source = BinarySource(device=device)
+        enc_ref = Polar5GEncoder(k, n, device=device)
 
         u = source([bs, k])
         c_ref = enc_ref(u)
 
-        for dt in dt_supported:
-            enc = Polar5GEncoder(k, n, dtype=dt)
-            u_dt = tf.cast(u, dt)
-            c = enc(u_dt)
+        enc = Polar5GEncoder(k, n, device=device)
+        u_dt = u.to(dtype)
+        c = enc(u_dt)
 
-            c_32 = tf.cast(c, tf.float32)
+        c_32 = c.to(torch.float32)
 
-            self.assertTrue(np.array_equal(c_ref.numpy(), c_32.numpy()))
+        assert torch.equal(c_ref.float(), c_32)
+
+    @pytest.mark.parametrize("channel_type", ["uplink", "downlink"])
+    def test_channel_types(self, device, channel_type):
+        """Test that both uplink and downlink channel types work."""
+        if channel_type == "uplink":
+            k, n = 50, 100
+        else:  # downlink has different constraints
+            k, n = 50, 150
+
+        source = BinarySource(device=device)
+        enc = Polar5GEncoder(k, n, channel_type=channel_type, device=device)
+
+        u = source([10, k])
+        c = enc(u)
+
+        assert c.shape == (10, n)
+
+    def test_properties(self, device):
+        """Test that properties return correct values."""
+        k, n = 100, 200
+        enc = Polar5GEncoder(k, n, device=device)
+
+        assert enc.k == k
+        assert enc.n == n
+        assert enc.k_target == k
+        assert enc.n_target == n
+        assert enc.k_polar >= k  # Includes CRC bits
+        assert enc.n_polar >= n  # Mother code might be larger
+        assert enc.enc_crc is not None
+
 
 

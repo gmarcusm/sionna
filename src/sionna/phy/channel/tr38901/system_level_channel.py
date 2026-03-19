@@ -1,107 +1,135 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
 """Base class for implementing system level channel models from 3GPP TR38.901
 specification"""
 
-import tensorflow as tf
-import numpy as np
-import matplotlib.pyplot as plt
+from typing import Optional, Tuple, Union
 
-from . import LSPGenerator
-from . import RaysGenerator
-from . import Topology, ChannelCoefficientsGenerator
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+
 from sionna.phy.channel import ChannelModel
 from sionna.phy.channel.utils import deg_2_rad
 
+from .channel_coefficients import ChannelCoefficientsGenerator, Topology
+from .lsp import LSP, LSPGenerator
+from .rays import Rays, RaysGenerator
+from .system_level_scenario import SystemLevelScenario
+
+__all__ = ["SystemLevelChannel"]
+
+
 class SystemLevelChannel(ChannelModel):
-    # pylint: disable=line-too-long
     r"""
-    Baseclass for implementing 3GPP system level channel models, such as UMi,
-    UMa, and RMa
+    Base class for implementing 3GPP system level channel models, such as UMi,
+    UMa, and RMa.
 
-    Parameters
-    -----------
-    scenario : :class:`~sionna.phy.channel.tr38901.SystemLevelScenario`
-        Scenario for the channel simulation
+    :param scenario: Scenario for the channel simulation
+    :param always_generate_lsp: If `True`, new large scale parameters (LSPs)
+        are generated for every new generation of channel impulse responses.
+        Otherwise, always reuse the same LSPs, except if the topology is
+        changed. Defaults to `False`.
+    :param precision: Precision used for internal calculations and outputs.
+        If set to `None`, :attr:`~sionna.phy.config.Config.precision` is used.
+    :param device: Device for computation (e.g., 'cpu', 'cuda:0').
+        If `None`, :attr:`~sionna.phy.config.Config.device` is used.
 
-    always_generate_lsp : `bool`, (default `False`)
-        If `True`, new large scale parameters (LSPs) are generated for every
-        new generation of channel impulse responses. Otherwise, always reuse
-        the same LSPs, except if the topology is changed.
+    :input num_time_samples: `int`.
+        Number of time samples.
 
-    Input
-    -----
-    num_time_samples : `int`
-        Number of time samples
+    :input sampling_frequency: `float`.
+        Sampling frequency [Hz].
 
-    sampling_frequency : `float`
-        Sampling frequency [Hz]
+    :output a: [batch size, num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths, num_time_samples], `torch.complex`.
+        Path coefficients.
 
-    Output
-    -------
-    a : [batch size, num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths, num_time_samples], `tf.complex`
-        Path coefficients
+    :output tau: [batch size, num_rx, num_tx, num_paths], `torch.float`.
+        Path delays [s].
 
-    tau : [batch size, num_rx, num_tx, num_paths], `tf.float`
-        Path delays [s]
+    :output rays: :class:`~sionna.phy.channel.tr38901.Rays`.
+        Sampled rays. Only returned if ``self.return_rays`` is `True`.
 
-    rays : :class:`~sionna.phy.channel.tr38901.RaysGenerator`
-        Sampled rays. Only returned if ``self.return_rays`` is `True` 
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        import torch
+        from sionna.phy.channel.tr38901 import SystemLevelScenario, SystemLevelChannel
+
+        # Assuming a concrete scenario implementation exists
+        scenario = MyScenario(carrier_frequency=3.5e9, ...)
+        channel = SystemLevelChannel(scenario)
+
+        # Set topology
+        channel.set_topology(ut_loc, bs_loc, ut_orientations, bs_orientations,
+                             ut_velocities, in_state)
+
+        # Generate channel
+        h, delays = channel(num_time_samples=100, sampling_frequency=1e6)
     """
-    def __init__(self,
-                 scenario,
-                 always_generate_lsp=False,
-                 precision=None):
 
-        super().__init__(precision=scenario.precision)
+    def __init__(
+        self,
+        scenario: SystemLevelScenario,
+        always_generate_lsp: bool = False,
+        precision: Optional[str] = None,
+        device: Optional[str] = None,
+    ) -> None:
+        super().__init__(precision=scenario.precision, device=scenario.device)
 
         self._scenario = scenario
         self._lsp_sampler = LSPGenerator(scenario)
         self._ray_sampler = RaysGenerator(scenario)
         self._set_topology_called = False
         self._return_rays = False
+        self._lsp: Optional[LSP] = None
 
         if scenario.direction == "uplink":
             tx_array = scenario.ut_array
             rx_array = scenario.bs_array
-        else: # "downlink"
+        else:  # "downlink"
             tx_array = scenario.bs_array
             rx_array = scenario.ut_array
+
         self._cir_sampler = ChannelCoefficientsGenerator(
             scenario.carrier_frequency,
-            tx_array, rx_array,
+            tx_array,
+            rx_array,
             subclustering=True,
-            precision=self.precision)
+            precision=self.precision,
+            device=self.device,
+        )
 
         # Are new LSPs needed
         self._always_generate_lsp = always_generate_lsp
 
     @property
-    def return_rays(self):
-        r"""
-        `bool` : Indicates whether the call method returns the generated rays
-        """
+    def return_rays(self) -> bool:
+        """Indicates whether the call method returns the generated rays."""
         return self._return_rays
 
     @return_rays.setter
-    def return_rays(self, value):
-        tf.debugging.assert_type(value,
-                                 bool,
-                                 message="return_rays must be bool")
+    def return_rays(self, value: bool) -> None:
+        if not isinstance(value, bool):
+            raise TypeError("return_rays must be bool")
         self._return_rays = value
 
-    def set_topology(self,
-                     ut_loc=None,
-                     bs_loc=None,
-                     ut_orientations=None,
-                     bs_orientations=None,
-                     ut_velocities=None,
-                     in_state=None,
-                     los=None,
-                     bs_virtual_loc=None):
+    def set_topology(
+        self,
+        ut_loc: Optional[torch.Tensor] = None,
+        bs_loc: Optional[torch.Tensor] = None,
+        ut_orientations: Optional[torch.Tensor] = None,
+        bs_orientations: Optional[torch.Tensor] = None,
+        ut_velocities: Optional[torch.Tensor] = None,
+        in_state: Optional[torch.Tensor] = None,
+        los: Optional[bool] = None,
+        bs_virtual_loc: Optional[torch.Tensor] = None,
+    ) -> None:
         r"""
-        Set the network topology
+        Set the network topology.
 
         It is possible to set up a different network topology for each batch
         example. The batch size used when setting up the network topology
@@ -109,51 +137,42 @@ class SystemLevelChannel(ChannelModel):
 
         When calling this function, not specifying a parameter leads to the
         reuse of the previously given value. Not specifying a value that was not
-        set at a former call rises an error.
+        set at a former call raises an error.
 
-        Input
-        ------
-        ut_loc : `None` (default) | [batch size,num_ut, 3], `tf.float`
-            Locations of the UTs
-
-        bs_loc : `None` (default) | [batch size,num_bs, 3], `tf.float`
-            Locations of BSs
-
-        ut_orientations : `None` (default) | [batch size,num_ut, 3], `tf.float`
-            Orientations of the UTs arrays [radian]
-
-        bs_orientations : `None` (default) | [batch size,num_bs, 3], `tf.float`
-            Orientations of the BSs arrays [radian]
-
-        ut_velocities : `None` (default) | [batch size,num_ut, 3], `tf.float`
-            Velocity vectors of UTs
-
-        in_state : `None` (default) | [batch size,num_ut], `tf.bool`
-            Indoor/outdoor state of UTs. `True` means indoor and `False`
-            means outdoor.
-
-        los : `None` (default) | `tf.bool`
-            If not `None`, all UTs located outdoor are
-            forced to be in LoS if ``los`` is set to `True`, or in NLoS
-            if it is set to `False`. If set to `None`, the LoS/NLoS states
-            of UTs is set following 3GPP specification [TR38901]_.
-
-        bs_virtual_loc : `None` (default) | [batch size, number of BSs, number of UTs, 3], `tf.float`
-            Virtual locations of BSs for each UT [m]. 
+        :param ut_loc: Locations of the UTs [m].
+            Shape [batch size, num_ut, 3]
+        :param bs_loc: Locations of BSs [m].
+            Shape [batch size, num_bs, 3]
+        :param ut_orientations: Orientations of the UTs arrays [radian].
+            Shape [batch size, num_ut, 3]
+        :param bs_orientations: Orientations of the BSs arrays [radian].
+            Shape [batch size, num_bs, 3]
+        :param ut_velocities: Velocity vectors of UTs [m/s].
+            Shape [batch size, num_ut, 3]
+        :param in_state: Indoor/outdoor state of UTs. `True` means indoor and
+            `False` means outdoor. Shape [batch size, num_ut]
+        :param los: If not `None`, all UTs located outdoor are forced to be
+            in LoS if ``los`` is set to `True`, or in NLoS if it is set to
+            `False`. If set to `None`, the LoS/NLoS states of UTs is set
+            following 3GPP specification :cite:p:`TR38901`.
+        :param bs_virtual_loc: Virtual locations of BSs for each UT [m].
             Used to compute BS-UT relative distance and angles.
             If `None` while ``bs_loc`` is specified, then it is set to
             ``bs_loc`` upon reshaping.
+            Shape [batch size, number of BSs, number of UTs, 3]
         """
 
         # Update the scenario topology
-        need_for_update = self._scenario.set_topology(ut_loc,
-                                                      bs_loc,
-                                                      ut_orientations,
-                                                      bs_orientations,
-                                                      ut_velocities,
-                                                      in_state,
-                                                      los,
-                                                      bs_virtual_loc)
+        need_for_update = self._scenario.set_topology(
+            ut_loc,
+            bs_loc,
+            ut_orientations,
+            bs_orientations,
+            ut_velocities,
+            in_state,
+            los,
+            bs_virtual_loc,
+        )
 
         if need_for_update:
             # Update the LSP sampler
@@ -162,18 +181,71 @@ class SystemLevelChannel(ChannelModel):
             # Update the ray sampler
             self._ray_sampler.topology_updated_callback()
 
-            # Sample LSPs if no need to generate them everytime
+            # Sample LSPs if no need to generate them every time
             if not self._always_generate_lsp:
                 self._lsp = self._lsp_sampler()
 
         if not self._set_topology_called:
             self._set_topology_called = True
 
-    def __call__(self,
-                 num_time_samples,
-                 sampling_frequency,
-                 foo=None):
+    def allocate_topology_tensors(
+        self,
+        batch_size: int,
+        num_bs: int,
+        num_ut: int,
+    ) -> None:
+        r"""
+        Pre-allocate all tensors used for topology updates.
 
+        This method should be called before using `set_topology` within a
+        `torch.compile`-decorated function with CUDAGraphs enabled. It ensures
+        that all internal tensors are pre-allocated with fixed shapes, allowing
+        subsequent `set_topology` calls to use in-place operations that are
+        compatible with CUDAGraph capture.
+
+        Calling this method again reinitializes all topology buffers to the
+        new shapes (equivalent to :meth:`reset_topology` + allocate).
+
+        After calling this method, the shapes of the topology cannot change.
+
+        :param batch_size: Batch size
+        :param num_bs: Number of base stations
+        :param num_ut: Number of user terminals
+        """
+        self._scenario.allocate_topology_tensors(batch_size, num_bs, num_ut)
+        self._lsp_sampler.allocate_topology_tensors(batch_size, num_bs, num_ut)
+
+    def reset_topology(self) -> None:
+        """Reset the topology to allow different batch_size/num_ut/num_bs.
+
+        This method clears all topology buffers and returns the channel
+        to its initial state. The next `set_topology` call will re-initialize
+        the buffers with the new shapes.
+
+        Use this when you need to change the batch_size, num_ut, or num_bs,
+        for example when switching between training and evaluation with
+        different batch sizes.
+
+        Note: If using torch.compile, this will trigger recompilation.
+        """
+        self._scenario.reset_topology()
+        self._lsp_sampler.reset_topology()
+
+    def __call__(
+        self,
+        num_time_samples: int,
+        sampling_frequency: float,
+        foo: Optional[float] = None,
+    ) -> Union[
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, Rays],
+    ]:
+        """Generate channel impulse responses.
+
+        :param num_time_samples: Number of time samples
+        :param sampling_frequency: Sampling frequency [Hz]
+        :param foo: Unused parameter for compatibility with some channel layers
+        """
         # Some channel layers (GenerateOFDMChannel and GenerateTimeChannel)
         # give as input (batch_size, num_time_samples, sampling_frequency)
         # instead of (num_time_samples, sampling_frequency), as specified
@@ -182,13 +254,8 @@ class SystemLevelChannel(ChannelModel):
         # parameters are kept.
         if foo is not None:
             # batch_size = num_time_samples
-            num_time_samples = sampling_frequency
+            num_time_samples = int(sampling_frequency)
             sampling_frequency = foo
-#             if ( (batch_size is not None)
-#                     and tf.not_equal(batch_size,self._scenario.batch_size) ):
-#                 tf.print("Warning: The value of `batch_size` specified when \
-# calling the channel model is different from the one previously configured for \
-# the topology. The value specified when calling is ignored.")
 
         # Sample LSPs if required
         if self._always_generate_lsp:
@@ -202,31 +269,34 @@ class SystemLevelChannel(ChannelModel):
         # Sample channel responses
         # First we need to create a topology
         # Indicates which end of the channel is moving: TX or RX
-        if self._scenario.direction == 'downlink':
-            moving_end = 'rx'
+        if self._scenario.direction == "downlink":
+            moving_end = "rx"
             tx_orientations = self._scenario.bs_orientations
             rx_orientations = self._scenario.ut_orientations
-        else : # 'uplink'
-            moving_end = 'tx'
+        else:  # 'uplink'
+            moving_end = "tx"
             tx_orientations = self._scenario.ut_orientations
             rx_orientations = self._scenario.bs_orientations
-        topology = Topology(velocities=self._scenario.ut_velocities,
-                            moving_end=moving_end,
-                            los_aoa=deg_2_rad(self._scenario.los_aoa),
-                            los_aod=deg_2_rad(self._scenario.los_aod),
-                            los_zoa=deg_2_rad(self._scenario.los_zoa),
-                            los_zod=deg_2_rad(self._scenario.los_zod),
-                            los=self._scenario.los,
-                            distance_3d=self._scenario.distance_3d,
-                            tx_orientations=tx_orientations,
-                            rx_orientations=rx_orientations)
+
+        topology = Topology(
+            velocities=self._scenario.ut_velocities,
+            moving_end=moving_end,
+            los_aoa=deg_2_rad(self._scenario.los_aoa),
+            los_aod=deg_2_rad(self._scenario.los_aod),
+            los_zoa=deg_2_rad(self._scenario.los_zoa),
+            los_zod=deg_2_rad(self._scenario.los_zod),
+            los=self._scenario.los,
+            distance_3d=self._scenario.distance_3d,
+            tx_orientations=tx_orientations,
+            rx_orientations=rx_orientations,
+        )
 
         # The channel coefficient needs the cluster delay spread parameter in ns
-        c_ds = self._scenario.get_param("cDS")*1e-9
+        c_ds = self._scenario.get_param("cDS") * 1e-9
 
         # According to the link direction, we need to specify which from BS
         # and UT is uplink, and which is downlink.
-        # Default is downlink, so we need to do some tranpose to switch tx and
+        # Default is downlink, so we need to do some transpose to switch tx and
         # rx and to switch angle of arrivals and departure if direction is set
         # to uplink. Nothing needs to be done if direction is downlink
         if self._scenario.direction == "uplink":
@@ -234,77 +304,70 @@ class SystemLevelChannel(ChannelModel):
             zoa = rays.zoa
             aod = rays.aod
             zod = rays.zod
-            rays.aod = tf.transpose(aoa, [0, 2, 1, 3, 4])
-            rays.zod = tf.transpose(zoa, [0, 2, 1, 3, 4])
-            rays.aoa = tf.transpose(aod, [0, 2, 1, 3, 4])
-            rays.zoa = tf.transpose(zod, [0, 2, 1, 3, 4])
-            rays.powers = tf.transpose(rays.powers, [0, 2, 1, 3])
-            rays.delays = tf.transpose(rays.delays, [0, 2, 1, 3])
-            rays.xpr = tf.transpose(rays.xpr, [0, 2, 1, 3, 4])
+            rays.aod = aoa.permute(0, 2, 1, 3, 4)
+            rays.zod = zoa.permute(0, 2, 1, 3, 4)
+            rays.aoa = aod.permute(0, 2, 1, 3, 4)
+            rays.zoa = zod.permute(0, 2, 1, 3, 4)
+            rays.powers = rays.powers.permute(0, 2, 1, 3)
+            rays.delays = rays.delays.permute(0, 2, 1, 3)
+            rays.xpr = rays.xpr.permute(0, 2, 1, 3, 4)
+
             los_aod = topology.los_aod
             los_aoa = topology.los_aoa
             los_zod = topology.los_zod
             los_zoa = topology.los_zoa
-            topology.los_aoa = tf.transpose(los_aod, [0, 2, 1])
-            topology.los_aod = tf.transpose(los_aoa, [0, 2, 1])
-            topology.los_zoa = tf.transpose(los_zod, [0, 2, 1])
-            topology.los_zod = tf.transpose(los_zoa, [0, 2, 1])
-            topology.los = tf.transpose(topology.los, [0, 2, 1])
-            c_ds = tf.transpose(c_ds, [0, 2, 1])
-            topology.distance_3d = tf.transpose(topology.distance_3d, [0, 2, 1])
+            topology.los_aoa = los_aod.permute(0, 2, 1)
+            topology.los_aod = los_aoa.permute(0, 2, 1)
+            topology.los_zoa = los_zod.permute(0, 2, 1)
+            topology.los_zod = los_zoa.permute(0, 2, 1)
+            topology.los = topology.los.permute(0, 2, 1)
+            c_ds = c_ds.permute(0, 2, 1)
+            topology.distance_3d = topology.distance_3d.permute(0, 2, 1)
+
             # Concerning LSPs, only these two are used.
             # We do not transpose the others to reduce complexity
-            k_factor = tf.transpose(lsp.k_factor, [0, 2, 1])
-            sf = tf.transpose(lsp.sf, [0, 2, 1])
+            k_factor = lsp.k_factor.permute(0, 2, 1)
+            sf = lsp.sf.permute(0, 2, 1)
         else:
             k_factor = lsp.k_factor
             sf = lsp.sf
 
-        # pylint: disable=unbalanced-tuple-unpacking
-        h, delays = self._cir_sampler(num_time_samples, sampling_frequency,
-                                      k_factor, rays, topology, c_ds)
+        h, delays = self._cir_sampler(
+            num_time_samples, sampling_frequency, k_factor, rays, topology, c_ds
+        )
 
         # Step 12
         h = self._step_12(h, sf)
 
         # Reshaping to match the expected output
-        h = tf.transpose(h, [0, 2, 4, 1, 5, 3, 6])
-        delays = tf.transpose(delays, [0, 2, 1, 3])
+        h = h.permute(0, 2, 4, 1, 5, 3, 6)
+        delays = delays.permute(0, 2, 1, 3)
 
         # Stop gradients to avoid useless backpropagation
-        h = tf.stop_gradient(h)
-        delays = tf.stop_gradient(delays)
+        h = h.detach()
+        delays = delays.detach()
 
         if self.return_rays:
             return h, delays, rays
         else:
             return h, delays
 
-    def show_topology(self,
-                      bs_index=0,
-                      batch_index=0):
+    def show_topology(self, bs_index: int = 0, batch_index: int = 0) -> None:
         r"""
-        Shows the network topology of the batch example with index
+        Show the network topology of the batch example with index
         ``batch_index``.
 
         The ``bs_index`` parameter specifies with respect to which BS the
         LoS/NLoS state of UTs is indicated.
 
-        Input
-        -------
-        bs_index : `int`, (default 0)
-            BS index with respect to which the LoS/NLoS state of UTs is
-            indicated
-
-        batch_index : `int`, (default 0)
-            Batch example for which the topology is shown
+        :param bs_index: BS index with respect to which the LoS/NLoS state of
+            UTs is indicated. Defaults to 0.
+        :param batch_index: Batch example for which the topology is shown.
+            Defaults to 0.
         """
 
-        def draw_coordinate_system(ax,
-                                   loc,
-                                   ort,
-                                   delta):
-            # This function draw the coordinate system x-y-z, represented by
+        def draw_coordinate_system(ax, loc, ort, delta):
+            # This function draws the coordinate system x-y-z, represented by
             # three lines with colors red-green-blue (rgb), to show the
             # orientation of the array (LCS) in the GCS.
             # To always draw a visible and not too big axes, we scale them
@@ -316,54 +379,72 @@ class SystemLevelChannel(ChannelModel):
 
             arrow_ratio_size = 0.1
 
-            x_ = np.array([ np.cos(a)*np.cos(b),
-                            np.sin(a)*np.cos(b),
-                            -np.sin(b) ])
-            scale_x = arrow_ratio_size/np.sqrt(np.sum(np.square(x_/delta)))
-            x_ = x_*scale_x
+            x_ = np.array([np.cos(a) * np.cos(b), np.sin(a) * np.cos(b), -np.sin(b)])
+            scale_x = arrow_ratio_size / np.sqrt(np.sum(np.square(x_ / delta)))
+            x_ = x_ * scale_x
 
-            y_ = np.array([ np.cos(a)*np.sin(b)*np.sin(c)-np.sin(a)*np.cos(c),
-                            np.sin(a)*np.sin(b)*np.sin(c)+np.cos(a)*np.cos(c),
-                            np.cos(b)*np.sin(c) ])
-            scale_y = arrow_ratio_size/np.sqrt(np.sum(np.square(y_/delta)))
-            y_ = y_*scale_y
+            y_ = np.array(
+                [
+                    np.cos(a) * np.sin(b) * np.sin(c) - np.sin(a) * np.cos(c),
+                    np.sin(a) * np.sin(b) * np.sin(c) + np.cos(a) * np.cos(c),
+                    np.cos(b) * np.sin(c),
+                ]
+            )
+            scale_y = arrow_ratio_size / np.sqrt(np.sum(np.square(y_ / delta)))
+            y_ = y_ * scale_y
 
-            z_ = np.array([ np.cos(a)*np.sin(b)*np.cos(c)+np.sin(a)*np.sin(c),
-                            np.sin(a)*np.sin(b)*np.cos(c)-np.cos(a)*np.sin(c),
-                            np.cos(b)*np.cos(c)])
-            scale_z = arrow_ratio_size/np.sqrt(np.sum(np.square(z_/delta)))
-            z_ = z_*scale_z
+            z_ = np.array(
+                [
+                    np.cos(a) * np.sin(b) * np.cos(c) + np.sin(a) * np.sin(c),
+                    np.sin(a) * np.sin(b) * np.cos(c) - np.cos(a) * np.sin(c),
+                    np.cos(b) * np.cos(c),
+                ]
+            )
+            scale_z = arrow_ratio_size / np.sqrt(np.sum(np.square(z_ / delta)))
+            z_ = z_ * scale_z
 
-            ax.plot([loc[0], loc[0] + x_[0]],
-                    [loc[1], loc[1] + x_[1]],
-                    [loc[2], loc[2] + x_[2]], c='r')
-            ax.plot([loc[0], loc[0] + y_[0]],
-                    [loc[1], loc[1] + y_[1]],
-                    [loc[2], loc[2] + y_[2]], c='g')
-            ax.plot([loc[0], loc[0] + z_[0]],
-                    [loc[1], loc[1] + z_[1]],
-                    [loc[2], loc[2] + z_[2]], c='b')
+            ax.plot(
+                [loc[0], loc[0] + x_[0]],
+                [loc[1], loc[1] + x_[1]],
+                [loc[2], loc[2] + x_[2]],
+                c="r",
+            )
+            ax.plot(
+                [loc[0], loc[0] + y_[0]],
+                [loc[1], loc[1] + y_[1]],
+                [loc[2], loc[2] + y_[2]],
+                c="g",
+            )
+            ax.plot(
+                [loc[0], loc[0] + z_[0]],
+                [loc[1], loc[1] + z_[1]],
+                [loc[2], loc[2] + z_[2]],
+                c="b",
+            )
 
-        indoor = self._scenario.indoor.numpy()[batch_index]
-        los = self._scenario.los.numpy()[batch_index,bs_index]
+        indoor = self._scenario.indoor.cpu().numpy()[batch_index]
+        los = self._scenario.los.cpu().numpy()[batch_index, bs_index]
 
         indoor_indices = np.where(indoor)
         los_indices = np.where(los)
-        nlos_indices = np.where(np.logical_and(np.logical_not(indoor),
-                                np.logical_not(los)))
+        nlos_indices = np.where(
+            np.logical_and(np.logical_not(indoor), np.logical_not(los))
+        )
 
+        ut_loc = self._scenario.ut_loc.cpu().numpy()[batch_index]
+        bs_loc = self._scenario.bs_loc.cpu().numpy()[batch_index]
+        ut_orientations = self._scenario.ut_orientations.cpu().numpy()[batch_index]
+        bs_orientations = self._scenario.bs_orientations.cpu().numpy()[batch_index]
 
-        ut_loc = self._scenario.ut_loc.numpy()[batch_index]
-        bs_loc = self._scenario.bs_loc.numpy()[batch_index]
-        ut_orientations = self._scenario.ut_orientations.numpy()[batch_index]
-        bs_orientations = self._scenario.bs_orientations.numpy()[batch_index]
-
-        delta_x = np.max(np.concatenate([ut_loc[:,0], bs_loc[:,0]]))\
-            - np.min(np.concatenate([ut_loc[:,0], bs_loc[:,0]]))
-        delta_y = np.max(np.concatenate([ut_loc[:,1], bs_loc[:,1]]))\
-            - np.min(np.concatenate([ut_loc[:,1], bs_loc[:,1]]))
-        delta_z = np.max(np.concatenate([ut_loc[:,2], bs_loc[:,2]]))\
-            - np.min(np.concatenate([ut_loc[:,2], bs_loc[:,2]]))
+        delta_x = np.max(np.concatenate([ut_loc[:, 0], bs_loc[:, 0]])) - np.min(
+            np.concatenate([ut_loc[:, 0], bs_loc[:, 0]])
+        )
+        delta_y = np.max(np.concatenate([ut_loc[:, 1], bs_loc[:, 1]])) - np.min(
+            np.concatenate([ut_loc[:, 1], bs_loc[:, 1]])
+        )
+        delta_z = np.max(np.concatenate([ut_loc[:, 2], bs_loc[:, 2]])) - np.min(
+            np.concatenate([ut_loc[:, 2], bs_loc[:, 2]])
+        )
         delta = np.array([delta_x, delta_y, delta_z])
 
         indoor_ut_loc = ut_loc[indoor_indices]
@@ -371,28 +452,52 @@ class SystemLevelChannel(ChannelModel):
         nlos_ut_loc = ut_loc[nlos_indices]
 
         fig = plt.figure()
-        ax = fig.add_subplot(projection='3d')
+        ax = fig.add_subplot(projection="3d")
         # Showing BS
-        ax.scatter( bs_loc[:,0], bs_loc[:,1], bs_loc[:,2], c='k', label='BS',
-                    depthshade=False)
+        ax.scatter(
+            bs_loc[:, 0],
+            bs_loc[:, 1],
+            bs_loc[:, 2],
+            c="k",
+            label="BS",
+            depthshade=False,
+        )
         # Showing BS indices and orientations
         for u, loc in enumerate(bs_loc):
-            ax.text(loc[0], loc[1], loc[2], f'{u}')
+            ax.text(loc[0], loc[1], loc[2], f"{u}")
             draw_coordinate_system(ax, loc, bs_orientations[u], delta)
         # Showing UTs
-        ax.scatter(indoor_ut_loc[:,0], indoor_ut_loc[:,1], indoor_ut_loc[:,2],
-                    c='b', label='UT Indoor', depthshade=False)
-        ax.scatter(los_ut_loc[:,0], los_ut_loc[:,1], los_ut_loc[:,2],
-                    c='r', label='UT LoS', depthshade=False)
-        ax.scatter(nlos_ut_loc[:,0], nlos_ut_loc[:,1], nlos_ut_loc[:,2],
-                    c='y', label='UT NLoS', depthshade=False)
+        ax.scatter(
+            indoor_ut_loc[:, 0],
+            indoor_ut_loc[:, 1],
+            indoor_ut_loc[:, 2],
+            c="b",
+            label="UT Indoor",
+            depthshade=False,
+        )
+        ax.scatter(
+            los_ut_loc[:, 0],
+            los_ut_loc[:, 1],
+            los_ut_loc[:, 2],
+            c="r",
+            label="UT LoS",
+            depthshade=False,
+        )
+        ax.scatter(
+            nlos_ut_loc[:, 0],
+            nlos_ut_loc[:, 1],
+            nlos_ut_loc[:, 2],
+            c="y",
+            label="UT NLoS",
+            depthshade=False,
+        )
         # Showing UT indices and orientations
         for u, loc in enumerate(ut_loc):
-            ax.text(loc[0], loc[1], loc[2], f'{u}')
+            ax.text(loc[0], loc[1], loc[2], f"{u}")
             draw_coordinate_system(ax, loc, ut_orientations[u], delta)
-        ax.set_xlabel('x [m]')
-        ax.set_ylabel('y [m]')
-        ax.set_zlabel('z [m]')
+        ax.set_xlabel("x [m]")
+        ax.set_ylabel("y [m]")
+        ax.set_zlabel("z [m]")
         plt.legend()
         plt.tight_layout()
 
@@ -400,34 +505,33 @@ class SystemLevelChannel(ChannelModel):
     # Internal utility methods
     #####################################################
 
-    def _step_12(self,
-                 h,
-                 sf):
-        # pylint: disable=line-too-long
+    def _step_12(self, h: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
         """Apply path loss and shadow fading ``sf`` to paths coefficients ``h``.
 
-        Input
-        ------
-        h : [batch size, num_tx, num_rx, num_paths, num_rx_ant, num_tx_ant, num_time_samples], tf.complex
-            Paths coefficients
-
-        sf : [batch size, num_tx, num_rx]
-            Shadow fading
+        :param h: Paths coefficients.
+            Shape [batch size, num_tx, num_rx, num_paths, num_rx_ant, num_tx_ant, num_time_samples].
+        :param sf: Shadow fading.
+            Shape [batch size, num_tx, num_rx].
         """
         if self._scenario.pathloss_enabled:
             pl_db = self._lsp_sampler.sample_pathloss()
-            if self._scenario.direction == 'uplink':
-                pl_db = tf.transpose(pl_db, [0,2,1])
+            if self._scenario.direction == "uplink":
+                pl_db = pl_db.permute(0, 2, 1)
         else:
-            pl_db = tf.constant(0.0, self.rdtype)
+            pl_db = torch.tensor(0.0, dtype=self.dtype, device=self.device)
 
         if not self._scenario.shadow_fading_enabled:
-            sf = tf.ones_like(sf)
+            sf = torch.ones_like(sf)
 
-        gain = tf.math.pow(tf.constant(10., self.rdtype),
-            -(pl_db)/20.)*tf.sqrt(sf)
-        gain = tf.reshape(gain, tf.concat([tf.shape(gain),
-            tf.ones([tf.rank(h)-tf.rank(gain)], tf.int32)],0))
-        h *= tf.complex(gain, tf.constant(0., self.rdtype))
+        gain = torch.pow(
+            torch.tensor(10.0, dtype=self.dtype, device=self.device), -pl_db / 20.0
+        ) * torch.sqrt(sf)
+
+        # Expand gain to match h dimensions
+        num_extra_dims = h.dim() - gain.dim()
+        for _ in range(num_extra_dims):
+            gain = gain.unsqueeze(-1)
+
+        h = h * gain.to(dtype=h.dtype)
 
         return h

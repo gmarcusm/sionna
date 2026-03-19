@@ -1,8 +1,9 @@
 <!--
-SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0
+
 -->
-# Sionna: An Open-Source Library for Research on Communication Systems
+# Sionna 2.0: An Open-Source Library for Research on Communication Systems
 
 Sionna&trade; is an open-source Python-based library for research on
 communication systems.
@@ -22,7 +23,7 @@ It is composed of the following packages:
     A system-level simulator based on physical-layer abstraction
 
 # Installation
-Sionna PHY and Sionna SYS require [Python 3.10-3.12](https://www.python.org/) and [TensorFlow 2.14-2.19](https://www.tensorflow.org/install). We recommend Ubuntu 24.04. Earlier versions of TensorFlow may still work but are not recommended. We refer to the [TensorFlow GPU support tutorial](https://www.tensorflow.org/install/gpu) for GPU support and the required driver setup.
+Sionna PHY and Sionna SYS require [Python 3.11+](https://www.python.org/) and [PyTorch 2.9+](https://pytorch.org/get-started/locally/). We recommend Ubuntu 24.04. Earlier versions of PyTorch may still work but are not recommended. We refer to the [PyTorch get-started guide](https://pytorch.org/get-started/locally/) for GPU (CUDA) support and the required driver setup.
 
 Sionna RT has the same requirements as [Mitsuba
 3](https://github.com/mitsuba-renderer/mitsuba3) and we refer to its
@@ -95,21 +96,21 @@ You might need to install [pandoc](https://pandoc.org) manually.
 
 You can then build the documentation by executing ``make html`` from within the ``doc`` folder.
 
-The documentation can then be served by any web server, e.g.,
+To serve the documentation locally:
 
 ```
-python -m http.server --dir build/html
+make serve
 ```
 
-## For Developers
+This serves the documentation at `http://localhost:8000/sionna/` with the same URL structure as the production website. You can specify a different port with `make serve PORT=9000`.
 
-Development requirements can be installed by executing from the repository's root directory:
+For local development without the `/sionna/` prefix, build and serve with:
 
 ```
-pip install '.[dev]'
+BASE_PATH= make html
+BASE_PATH= make serve
 ```
 
-Linting of the code can be achieved by running ```pylint src/``` from the repository's root directory.
 
 ## License and Citation
 
@@ -122,6 +123,6 @@ If you use this software, please cite it as:
  author = {Hoydis, Jakob and Cammerer, Sebastian and {Ait Aoudia}, Fayçal and Nimier-David, Merlin and Maggi, Lorenzo and Marcus, Guillermo and Vem, Avinash and Keller, Alexander},
  note = {https://nvlabs.github.io/sionna/},
  year = {2022},
- version = {1.2.2}
+ version = {2.0.0}
 }
 ```

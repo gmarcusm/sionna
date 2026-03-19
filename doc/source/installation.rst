@@ -4,12 +4,12 @@ Installation
 Sionna is composed of three Python modules, namely `Sionna RT <rt/index.html>`_, `Sionna
 PHY <phy/index.html>`_, and `Sionna SYS <sys/index.html>`_.
 
-Sionna PHY and Sionna SYS require `Python 3.10-3.13 <https://www.python.org/>`_
-and `TensorFlow 2.14-2.19 <https://www.tensorflow.org/install>`_. We recommend
-Ubuntu 24.04. Earlier versions of TensorFlow may still work but are not
-recommended. We refer to the `TensorFlow GPU support
-tutorial <https://www.tensorflow.org/install/gpu>`_ for GPU support and the
-required driver setup.
+Sionna PHY and Sionna SYS require `Python 3.11+ <https://www.python.org/>`_
+and `PyTorch 2.9+ <https://pytorch.org/get-started/locally/>`_. We recommend
+Ubuntu 24.04. Earlier versions of PyTorch may still work but are not
+recommended. We refer to the `PyTorch get-started
+guide <https://pytorch.org/get-started/locally/>`_ for GPU (CUDA) support and
+the required driver setup.
 
 `Sionna RT <rt/index.html>`_ has the same requirements as `Mitsuba 3 <https://github.com/mitsuba-renderer/mitsuba3>`_ and we refer to its
 `installation guide <https://mitsuba.readthedocs.io/en/stable/>`_ for further
@@ -24,7 +24,8 @@ Colab <https://colab.research.google.com/>`_. Although not necessary, we recomme
 running Sionna in a `Docker container <https://www.docker.com>`_ and/or `Python virtual
 enviroment <https://docs.python.org/3/library/venv.html>`_.
 
-The `Sionna Research Kit <rk/index.html>`_ runs on the `NVIDIA Jetson AGX Orin platform <https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-orin/>`_. We refer to the `quickstart guide <rk/quickstart.html>`_ for a detailed introduction.
+The `Sionna Research Kit <rk/index.html>`_ runs on the `NVIDIA DGX
+Spark <https://www.nvidia.com/en-us/products/workstations/dgx-spark/>`_. We refer to the `quickstart guide <rk/quickstart.html>`_ for a detailed introduction.
 
 Using pip
 ---------
@@ -98,20 +99,17 @@ You might need to install `pandoc <https://pandoc.org>`_ manually.
 
 You can then build the documentation by executing ``make html`` from within the ``doc`` folder.
 
-The documentation can finally be served by any web server, e.g.,
+To serve the documentation locally:
 
 .. code-block:: bash
 
-    python -m http.server --dir build/html
+    make serve
 
+This serves the documentation at ``http://localhost:8000/sionna/`` with the same URL structure as the production website. You can specify a different port with ``make serve PORT=9000``.
 
-Developing
-----------
-
-Development requirements can be installed by executing from the repository's root directory:
+For local development without the ``/sionna/`` prefix, build and serve with:
 
 .. code-block:: bash
 
-    pip install '.[dev]'
-
-Linting of the code can be achieved by running ``pylint src/`` from the repository's root directory.
+    BASE_PATH= make html
+    BASE_PATH= make serve

@@ -1,87 +1,101 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
 """Class used to define a system level 3GPP channel simulation scenario"""
 
 import json
-from importlib_resources import files
-import tensorflow as tf
 from abc import abstractmethod
-from sionna.phy import config
-from sionna.phy.block import Object
-from sionna.phy import SPEED_OF_LIGHT, PI
-from sionna.phy.utils import log10, insert_dims, sample_bernoulli
-from sionna.phy.channel.utils import rad_2_deg, \
-    wrap_angle_0_360
+from typing import Optional, Union
+
+import torch
+from importlib_resources import files
+
+from sionna.phy import PI, SPEED_OF_LIGHT
+from sionna.phy.object import Object
+from sionna.phy.utils import insert_dims, sample_bernoulli, rand
+from sionna.phy.channel.utils import rad_2_deg, wrap_angle_0_360
+
+from . import models
 from .antenna import PanelArray
 
-from . import models # pylint: disable=relative-beyond-top-level
+__all__ = ["SystemLevelScenario"]
 
 
 class SystemLevelScenario(Object):
     r"""
-    This class is used to set up the scenario for system level 3GPP channel
-    simulation
+    Base class for setting up the scenario for system level 3GPP channel
+    simulation.
 
     Scenarios for system level channel simulation, such as UMi, UMa, or RMa,
     are defined by implementing this base class.
 
-    Input
-    ------
-    carrier_frequency : `float`
-        Carrier frequency [Hz]
-
-    o2i_model : "low" | "high"
-        Outdoor to indoor (O2I) pathloss model, used for indoor UTs,
-        see section 7.4.3 from 38.901 specification.
-
-    ut_array : :class:`~sionna.phy.channel.tr38901.PanelArray`
-        Panel array configuration used by UTs
-
-    bs_array ::class:`~sionna.phy.channel.tr38901.PanelArray`
-        Panel array configuration used by BSs
-
-    direction : "uplink" |"downlink"
-        Link direction
-
-    enable_pathloss : `bool`, (default `True`)
-        If `True`, apply pathloss. Otherwise doesn't.
-
-    enable_shadow_fading : `bool`, (default `True`)
-        If `True`, apply shadow fading. Otherwise doesn't.
-
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
+    :param carrier_frequency: Carrier frequency [Hz]
+    :param o2i_model: Outdoor to indoor (O2I) pathloss model, used for
+        indoor UTs. Must be ``"low"`` or ``"high"``.
+        See section 7.4.3 from 38.901 specification.
+    :param ut_array: Panel array configuration used by UTs
+    :param bs_array: Panel array configuration used by BSs
+    :param direction: Link direction. Must be ``"uplink"`` or ``"downlink"``.
+    :param enable_pathloss: If `True`, apply pathloss. Otherwise doesn't.
+        Defaults to `True`.
+    :param enable_shadow_fading: If `True`, apply shadow fading.
+        Otherwise doesn't. Defaults to `True`.
+    :param precision: Precision used for internal calculations and outputs.
         If set to `None`,
         :attr:`~sionna.phy.config.Config.precision` is used.
+    :param device: Device for computation (e.g., ``"cpu"``, ``"cuda:0"``).
+        If `None`, :attr:`~sionna.phy.config.Config.device` is used.
     """
-    def __init__(self, carrier_frequency, o2i_model, ut_array, bs_array,
-        direction, enable_pathloss=True, enable_shadow_fading=True,
-        precision=None):
-        super().__init__(precision=precision)
+
+    def __init__(
+        self,
+        carrier_frequency: float,
+        o2i_model: str,
+        ut_array: PanelArray,
+        bs_array: PanelArray,
+        direction: str,
+        enable_pathloss: bool = True,
+        enable_shadow_fading: bool = True,
+        precision: Optional[str] = None,
+        device: Optional[str] = None,
+    ) -> None:
+        super().__init__(precision=precision, device=device)
 
         # Carrier frequency (Hz)
-        self._carrier_frequency = tf.constant(carrier_frequency, self.rdtype)
+        # Register as buffers for CUDAGraph compatibility
+        self.register_buffer(
+            "_carrier_frequency",
+            torch.tensor(carrier_frequency, dtype=self.dtype, device=self.device),
+        )
 
         # Wavelength (m)
-        self._lambda_0 = tf.constant(SPEED_OF_LIGHT/carrier_frequency,
-            self.rdtype)
+        self.register_buffer(
+            "_lambda_0",
+            torch.tensor(
+                SPEED_OF_LIGHT / carrier_frequency, dtype=self.dtype, device=self.device
+            ),
+        )
 
         # O2I model
-        assert o2i_model in ('low', 'high'), "o2i_model must be 'low' or 'high'"
+        assert o2i_model in ("low", "high"), "o2i_model must be 'low' or 'high'"
         self._o2i_model = o2i_model
 
         # UTs and BSs arrays
-        assert isinstance(ut_array, PanelArray), \
-            "'ut_array' must be an instance of PanelArray"
-        assert isinstance(bs_array, PanelArray), \
-            "'bs_array' must be an instance of PanelArray"
+        assert isinstance(
+            ut_array, PanelArray
+        ), "'ut_array' must be an instance of PanelArray"
+        assert isinstance(
+            bs_array, PanelArray
+        ), "'bs_array' must be an instance of PanelArray"
         self._ut_array = ut_array
         self._bs_array = bs_array
 
         # Direction
-        assert direction in ("uplink", "downlink"), \
-            "'direction' must be 'uplink' or 'downlink'"
+        assert direction in (
+            "uplink",
+            "downlink",
+        ), "'direction' must be 'uplink' or 'downlink'"
         self._direction = direction
 
         # Pathloss and shadow fading
@@ -89,295 +103,342 @@ class SystemLevelScenario(Object):
         self._enable_shadow_fading = enable_shadow_fading
 
         # Scenario
-        self._ut_loc = None
-        self._bs_loc = None
-        self._bs_virtual_loc = None
-        self._ut_orientations = None
-        self._bs_orientations = None
-        self._ut_velocities = None
-        self._in_state = None
-        self._requested_los = None
+        self._ut_loc: Optional[torch.Tensor] = None
+        self._bs_loc: Optional[torch.Tensor] = None
+        self._bs_virtual_loc: Optional[torch.Tensor] = None
+        self._ut_orientations: Optional[torch.Tensor] = None
+        self._bs_orientations: Optional[torch.Tensor] = None
+        self._ut_velocities: Optional[torch.Tensor] = None
+        self._in_state: Optional[torch.Tensor] = None
+        self._requested_los: Optional[bool] = None
+
+        # Internal state
+        self._distance_2d: Optional[torch.Tensor] = None
+        self._distance_3d: Optional[torch.Tensor] = None
+        self._distance_2d_in: Optional[torch.Tensor] = None
+        self._distance_2d_out: Optional[torch.Tensor] = None
+        self._distance_3d_in: Optional[torch.Tensor] = None
+        self._distance_3d_out: Optional[torch.Tensor] = None
+        self._matrix_ut_distance_2d: Optional[torch.Tensor] = None
+        self._los_aod: Optional[torch.Tensor] = None
+        self._los_aoa: Optional[torch.Tensor] = None
+        self._los_zod: Optional[torch.Tensor] = None
+        self._los_zoa: Optional[torch.Tensor] = None
+        self._los: Optional[torch.Tensor] = None
+        self._lsp_log_mean: Optional[torch.Tensor] = None
+        self._lsp_log_std: Optional[torch.Tensor] = None
+        self._zod_offset: Optional[torch.Tensor] = None
+        self._pl_b: Optional[torch.Tensor] = None
+
+        # Flag to track if topology has been initialized (frozen after first set_topology)
+        self._topology_frozen = False
 
         # Load parameters for this scenario
         self._load_params()
 
     @property
-    def carrier_frequency(self):
-        r"""Carrier frequency [Hz]"""
+    def carrier_frequency(self) -> torch.Tensor:
+        """Carrier frequency [Hz]"""
         return self._carrier_frequency
 
     @property
-    def direction(self):
-        r"""Direction of communication. Either "uplink" or "downlink"."""
+    def direction(self) -> str:
+        """Direction of communication. Either ``"uplink"`` or ``"downlink"``."""
         return self._direction
 
     @property
-    def pathloss_enabled(self):
-        r"""`True` is pathloss is enabled. `False` otherwise."""
+    def pathloss_enabled(self) -> bool:
+        """`True` if pathloss is enabled. `False` otherwise."""
         return self._enable_pathloss
 
     @property
-    def shadow_fading_enabled(self):
-        r"""`True` is shadow fading is enabled. `False` otherwise."""
+    def shadow_fading_enabled(self) -> bool:
+        """`True` if shadow fading is enabled. `False` otherwise."""
         return self._enable_shadow_fading
 
     @property
-    def lambda_0(self):
-        r"""Wavelength [m]"""
+    def lambda_0(self) -> torch.Tensor:
+        """Wavelength [m]"""
         return self._lambda_0
 
     @property
-    def batch_size(self):
+    def batch_size(self) -> int:
         """Batch size"""
-        return tf.shape(self._ut_loc)[0]
+        return self._ut_loc.shape[0]
 
     @property
-    def num_ut(self):
-        """Number of UTs."""
-        return tf.shape(self._ut_loc)[1]
+    def num_ut(self) -> int:
+        """Number of UTs"""
+        return self._ut_loc.shape[1]
 
     @property
-    def num_bs(self):
-        """
-        Number of BSs.
-        """
-        return tf.shape(self._bs_loc)[1]
+    def num_bs(self) -> int:
+        """Number of BSs"""
+        return self._bs_loc.shape[1]
 
     @property
-    def h_ut(self):
-        r"""Height of UTs [m]. [batch size, number of UTs]"""
-        return self._ut_loc[:,:,2]
+    def h_ut(self) -> torch.Tensor:
+        """Height of UTs [m]. Shape [batch size, number of UTs]"""
+        return self._ut_loc[:, :, 2]
 
     @property
-    def h_bs(self):
-        r"""Height of BSs [m]. [batch size, number of BSs]"""
-        return self._bs_loc[:,:,2]
+    def h_bs(self) -> torch.Tensor:
+        """Height of BSs [m]. Shape [batch size, number of BSs]"""
+        return self._bs_loc[:, :, 2]
 
     @property
-    def ut_loc(self):
-        r"""Locations of UTs [m]. [batch size, number of UTs, 3]"""
+    def ut_loc(self) -> torch.Tensor:
+        """Locations of UTs [m]. Shape [batch size, number of UTs, 3]"""
         return self._ut_loc
 
     @property
-    def bs_loc(self):
-        r"""Locations of BSs [m]. [batch size, number of BSs, 3]"""
+    def bs_loc(self) -> torch.Tensor:
+        """Locations of BSs [m]. Shape [batch size, number of BSs, 3]"""
         return self._bs_loc
 
     @property
-    def bs_virtual_loc(self):
-        r"""Virtual location of BSs, relative to each UT position [m]. Useful in
-         case of wraparound. Broadcastable to [batch size, number of
-         UTs, number of BSs, 3]
-        """
+    def bs_virtual_loc(self) -> torch.Tensor:
+        """Virtual location of BSs, relative to each UT position [m].
+        Useful in case of wraparound.
+        Broadcastable to [batch size, number of UTs, number of BSs, 3]"""
         return self._bs_virtual_loc
 
     @property
-    def ut_orientations(self):
-        r"""Orientations of UTs [radian]. [batch size, number of UTs, 3]"""
+    def ut_orientations(self) -> torch.Tensor:
+        """Orientations of UTs [radian]. Shape [batch size, number of UTs, 3]"""
         return self._ut_orientations
 
     @property
-    def bs_orientations(self):
-        r"""Orientations of BSs [radian]. [batch size, number of BSs, 3]"""
+    def bs_orientations(self) -> torch.Tensor:
+        """Orientations of BSs [radian]. Shape [batch size, number of BSs, 3]"""
         return self._bs_orientations
 
     @property
-    def ut_velocities(self):
-        r"""UTs velocities [m/s]. [batch size, number of UTs, 3]"""
+    def ut_velocities(self) -> torch.Tensor:
+        """UTs velocities [m/s]. Shape [batch size, number of UTs, 3]"""
         return self._ut_velocities
 
     @property
-    def ut_array(self):
-        r"""PanelArray used by UTs."""
+    def ut_array(self) -> PanelArray:
+        """PanelArray used by UTs"""
         return self._ut_array
 
     @property
-    def bs_array(self):
-        r"""PanelArray used by BSs."""
+    def bs_array(self) -> PanelArray:
+        """PanelArray used by BSs"""
         return self._bs_array
 
     @property
-    def indoor(self):
-        r"""
-        Indoor state of UTs. `True` is indoor, `False` otherwise.
-        [batch size, number of UTs]"""
+    def indoor(self) -> torch.Tensor:
+        """Indoor state of UTs. `True` is indoor, `False` otherwise.
+        Shape [batch size, number of UTs]"""
         return self._in_state
 
     @property
-    def los(self):
-        r"""LoS state of BS-UT links. `True` if LoS, `False` otherwise.
-        [batch size, number of BSs, number of UTs]"""
+    def los(self) -> torch.Tensor:
+        """LoS state of BS-UT links. `True` if LoS, `False` otherwise.
+        Shape [batch size, number of BSs, number of UTs]"""
         return self._los
 
     @property
-    def distance_2d(self):
-        r"""
-        Distance between each UT and each BS in the X-Y plan [m].
-        [batch size, number of BSs, number of UTs]"""
+    def distance_2d(self) -> torch.Tensor:
+        """Distance between each UT and each BS in the X-Y plane [m].
+        Shape [batch size, number of BSs, number of UTs]"""
         return self._distance_2d
 
     @property
-    def distance_2d_in(self):
-        r"""Indoor distance between each UT and BS in the X-Y plan [m], i.e.,
-        part of the total distance that corresponds to indoor propagation in the
-        X-Y plan.
-        Set to 0 for UTs located ourdoor.
-        [batch size, number of BSs, number of UTs]"""
+    def distance_2d_in(self) -> torch.Tensor:
+        """Indoor distance between each UT and BS in the X-Y plane [m],
+        i.e., part of the total distance that corresponds to indoor
+        propagation in the X-Y plane.
+        Set to 0 for UTs located outdoor.
+        Shape [batch size, number of BSs, number of UTs]"""
         return self._distance_2d_in
 
     @property
-    def distance_2d_out(self):
-        r"""Outdoor distance between each UT and BS in the X-Y plan [m], i.e.,
-        part of the total distance that corresponds to outdoor propagation in
-        the X-Y plan.
-        Equals to ``distance_2d`` for UTs located outdoor.
-        [batch size, number of BSs, number of UTs]"""
+    def distance_2d_out(self) -> torch.Tensor:
+        """Outdoor distance between each UT and BS in the X-Y plane [m],
+        i.e., part of the total distance that corresponds to outdoor
+        propagation in the X-Y plane.
+        Equals ``distance_2d`` for UTs located outdoor.
+        Shape [batch size, number of BSs, number of UTs]"""
         return self._distance_2d_out
 
     @property
-    def distance_3d(self):
-        r"""
-        Distance between each UT and each BS [m].
-        [batch size, number of BSs, number of UTs]"""
-        return self._distance_2d
+    def distance_3d(self) -> torch.Tensor:
+        """Distance between each UT and each BS [m].
+        Shape [batch size, number of BSs, number of UTs]"""
+        return self._distance_3d
 
     @property
-    def distance_3d_in(self):
-        r"""Indoor distance between each UT and BS [m], i.e.,
-        part of the total distance that corresponds to indoor propagation.
-        Set to 0 for UTs located ourdoor.
-        [batch size, number of BSs, number of UTs]"""
+    def distance_3d_in(self) -> torch.Tensor:
+        """Indoor distance between each UT and BS [m],
+        i.e., part of the total distance that corresponds to indoor
+        propagation. Set to 0 for UTs located outdoor.
+        Shape [batch size, number of BSs, number of UTs]"""
         return self._distance_3d_in
 
     @property
-    def distance_3d_out(self):
-        r"""Outdoor distance between each UT and BS [m], i.e.,
-        part of the total distance that corresponds to outdoor propagation.
-        Equals to ``distance_3d`` for UTs located outdoor.
-        [batch size, number of BSs, number of UTs]"""
+    def distance_3d_out(self) -> torch.Tensor:
+        """Outdoor distance between each UT and BS [m],
+        i.e., part of the total distance that corresponds to outdoor
+        propagation. Equals ``distance_3d`` for UTs located outdoor.
+        Shape [batch size, number of BSs, number of UTs]"""
         return self._distance_3d_out
 
     @property
-    def matrix_ut_distance_2d(self):
-        r"""Distance between all pairs of UTs in the X-Y plan [m].
-        [batch size, number of UTs, number of UTs]"""
+    def matrix_ut_distance_2d(self) -> torch.Tensor:
+        """Distance between all pairs of UTs in the X-Y plane [m].
+        Shape [batch size, number of UTs, number of UTs]"""
         return self._matrix_ut_distance_2d
 
     @property
-    def los_aod(self):
-        r"""LoS azimuth angle of departure of each BS-UT link [deg].
-        [batch size, number of BSs, number of UTs]"""
+    def los_aod(self) -> torch.Tensor:
+        """LoS azimuth angle of departure of each BS-UT link [deg].
+        Shape [batch size, number of BSs, number of UTs]"""
         return self._los_aod
 
     @property
-    def los_aoa(self):
-        r"""LoS azimuth angle of arrival of each BS-UT link [deg].
-        [batch size, number of BSs, number of UTs]"""
+    def los_aoa(self) -> torch.Tensor:
+        """LoS azimuth angle of arrival of each BS-UT link [deg].
+        Shape [batch size, number of BSs, number of UTs]"""
         return self._los_aoa
 
     @property
-    def los_zod(self):
-        r"""LoS zenith angle of departure of each BS-UT link [deg].
-        [batch size, number of BSs, number of UTs]"""
+    def los_zod(self) -> torch.Tensor:
+        """LoS zenith angle of departure of each BS-UT link [deg].
+        Shape [batch size, number of BSs, number of UTs]"""
         return self._los_zod
 
     @property
-    def los_zoa(self):
-        r"""LoS zenith angle of arrival of each BS-UT link [deg].
-        [batch size, number of BSs, number of UTs]"""
+    def los_zoa(self) -> torch.Tensor:
+        """LoS zenith angle of arrival of each BS-UT link [deg].
+        Shape [batch size, number of BSs, number of UTs]"""
         return self._los_zoa
 
     @property
     @abstractmethod
-    def los_probability(self):
-        r"""Probability of each UT to be LoS. Used to randomly generate LoS
-        status of outdoor UTs. [batch size, number of UTs]"""
+    def los_probability(self) -> torch.Tensor:
+        """Probability of each UT to be LoS. Used to randomly generate LoS
+        status of outdoor UTs. Shape [batch size, number of UTs]"""
         pass
 
     @property
     @abstractmethod
-    def min_2d_in(self):
-        r"""Minimum indoor 2D distance for indoor UTs [m]"""
+    def min_2d_in(self) -> torch.Tensor:
+        """Minimum indoor 2D distance for indoor UTs [m]"""
         pass
 
     @property
     @abstractmethod
-    def max_2d_in(self):
-        r"""Maximum indoor 2D distance for indoor UTs [m]"""
+    def max_2d_in(self) -> torch.Tensor:
+        """Maximum indoor 2D distance for indoor UTs [m]"""
         pass
 
     @property
-    def lsp_log_mean(self):
-        r"""
-        Mean of LSPs in the log domain.
-        [batch size, number of BSs, number of UTs, 7].
+    def lsp_log_mean(self) -> torch.Tensor:
+        """Mean of LSPs in the log domain.
+        Shape [batch size, number of BSs, number of UTs, 7].
         The last dimension corresponds to the LSPs, in the following order:
-        DS - ASD - ASA - SF - K - ZSA - ZSD - XPR"""
+        DS - ASD - ASA - SF - K - ZSA - ZSD"""
         return self._lsp_log_mean
 
     @property
-    def lsp_log_std(self):
-        r"""
-        STD of LSPs in the log domain.
-        [batch size, number of BSs, number of UTs, 7].
+    def lsp_log_std(self) -> torch.Tensor:
+        """STD of LSPs in the log domain.
+        Shape [batch size, number of BSs, number of UTs, 7].
         The last dimension corresponds to the LSPs, in the following order:
-        DS - ASD - ASA - SF - K - ZSA - ZSD - XPR"""
+        DS - ASD - ASA - SF - K - ZSA - ZSD"""
         return self._lsp_log_std
 
     @property
     @abstractmethod
-    def rays_per_cluster(self):
-        r"""Number of rays per cluster"""
+    def rays_per_cluster(self) -> int:
+        """Number of rays per cluster"""
         pass
 
     @property
-    def zod_offset(self):
-        r"""Zenith angle of departure offset"""
+    def zod_offset(self) -> torch.Tensor:
+        """Zenith angle of departure offset"""
         return self._zod_offset
 
     @property
-    def num_clusters_los(self):
-        r"""Number of clusters for LoS scenario"""
+    def num_clusters_los(self) -> int:
+        """Number of clusters for LoS scenario"""
         return self._params_los["numClusters"]
 
     @property
-    def num_clusters_nlos(self):
-        r"""Number of clusters for NLoS scenario"""
+    def num_clusters_nlos(self) -> int:
+        """Number of clusters for NLoS scenario"""
         return self._params_nlos["numClusters"]
 
     @property
-    def num_clusters_indoor(self):
-        r"""Number of clusters indoor scenario"""
+    def num_clusters_indoor(self) -> int:
+        """Number of clusters for indoor scenario"""
         return self._params_o2i["numClusters"]
 
     @property
-    def num_clusters_max(self):
-        r"""Maximum number of clusters over indoor, LoS, and NLoS scenarios"""
-        # Different models have different number of clusters
+    def num_clusters_max(self) -> int:
+        """Maximum number of clusters over indoor, LoS, and NLoS scenarios"""
         num_clusters_los = self._params_los["numClusters"]
         num_clusters_nlos = self._params_nlos["numClusters"]
         num_clusters_o2i = self._params_o2i["numClusters"]
-        num_clusters_max = tf.reduce_max([num_clusters_los, num_clusters_nlos,
-            num_clusters_o2i])
-        return num_clusters_max
+        return max(num_clusters_los, num_clusters_nlos, num_clusters_o2i)
 
     @property
-    def basic_pathloss(self):
-        r"""Basic pathloss component [dB].
+    def basic_pathloss(self) -> torch.Tensor:
+        """Basic pathloss component [dB].
         See section 7.4.1 of 38.901 specification.
-        [batch size, num BS, num UT]"""
+        Shape [batch size, num BS, num UT]"""
         return self._pl_b
 
-    def set_topology(self,
-                     ut_loc=None,
-                     bs_loc=None,
-                     ut_orientations=None,
-                     bs_orientations=None,
-                     ut_velocities=None,
-                     in_state=None,
-                     los=None,
-                     bs_virtual_loc=None):
-        # pylint: disable=line-too-long
+    def _update_attr(self, name: str, value: torch.Tensor) -> None:
+        """Update attribute, using in-place copy if tensor already exists.
+
+        On first call for each attribute, registers the tensor as a buffer
+        for torch.compile/CUDAGraph compatibility. On subsequent calls,
+        updates the buffer in-place using copy_().
+
+        After the first `set_topology` call, shapes are frozen. To change
+        shapes, call :meth:`reset_topology` first.
+
+        :param name: Attribute name (e.g., "_ut_loc")
+        :param value: New tensor value
+        :raises RuntimeError: If shapes don't match after topology is frozen,
+            or if trying to register new buffers during torch.compile tracing
+        """
+        existing = getattr(self, name, None)
+        if existing is not None and name in self._buffers:
+            # Buffer already registered - update in-place
+            if existing.shape != value.shape:
+                raise RuntimeError(
+                    f"Cannot change shape of '{name}'. "
+                    f"Expected {existing.shape}, got {value.shape}. "
+                    f"Call reset_topology() before changing batch_size/num_ut/num_bs."
+                )
+            existing.copy_(value)
+        else:
+            # First time setting this attribute - need to register as buffer
+            # But buffer registration doesn't work inside torch.compile tracing
+            if torch.compiler.is_compiling():
+                raise RuntimeError(
+                    f"Cannot initialize topology buffer '{name}' inside torch.compile. "
+                    f"Call the model once (eager) before compiling to initialize buffers, "
+                    f"or use allocate_topology_tensors() to pre-allocate."
+                )
+            self._register_buffer_safe(name, value)
+
+    def set_topology(
+        self,
+        ut_loc: Optional[torch.Tensor] = None,
+        bs_loc: Optional[torch.Tensor] = None,
+        ut_orientations: Optional[torch.Tensor] = None,
+        bs_orientations: Optional[torch.Tensor] = None,
+        ut_velocities: Optional[torch.Tensor] = None,
+        in_state: Optional[torch.Tensor] = None,
+        los: Optional[bool] = None,
+        bs_virtual_loc: Optional[torch.Tensor] = None,
+    ) -> bool:
         r"""
         Set the network topology.
 
@@ -386,68 +447,64 @@ class SystemLevelScenario(Object):
 
         When calling this function, not specifying a parameter leads to the
         reuse of the previously given value. Not specifying a value that was not
-        set at a former call rises an error.
+        set at a former call raises an error.
 
-        Input
-        ------
-        ut_loc : `None` (default) | [batch size, number of UTs, 3], `tf.float`
-            Locations of the UTs [m]
-
-        bs_loc : `None` (default) | [batch size, number of BSs, 3], `tf.float`
-            Locations of BSs [m]
-
-        ut_orientations : `None` (default) | [batch size, number of UTs, 3], `tf.float`
-            Orientations of the UTs arrays [radian]
-
-        bs_orientations : `None` (default) | [batch size, number of BSs, 3], `tf.float`
-            Orientations of the BSs arrays [radian]
-
-        ut_velocities : `None` (default) | [batch size, number of UTs, 3], `tf.float`
-            Velocity vectors of UTs [m/s]
-
-        in_state : `None` (default) | [batch size, number of UTs], `tf.bool`
-            Indoor/outdoor state of UTs. `True` means indoor and `False`
-            means outdoor.
-
-        los : `None` (default) | `tf.bool`
-            If not `None`, all UTs located outdoor are
-            forced to be in LoS if ``los`` is set to `True`, or in NLoS
-            if it is set to `False`. If set to `None`, the LoS/NLoS states
-            of UTs is set following 3GPP specification
-            (Section 7.4.2 of TR 38.901).
-        
-        bs_virtual_loc : `None` (default) | [batch size, number of BSs, number of UTs, 3], `tf.float`
-            Virtual locations of BSs for each UT [m]. 
+        :param ut_loc: Locations of the UTs [m].
+            Shape [batch size, number of UTs, 3]
+        :param bs_loc: Locations of BSs [m].
+            Shape [batch size, number of BSs, 3]
+        :param ut_orientations: Orientations of the UTs arrays [radian].
+            Shape [batch size, number of UTs, 3]
+        :param bs_orientations: Orientations of the BSs arrays [radian].
+            Shape [batch size, number of BSs, 3]
+        :param ut_velocities: Velocity vectors of UTs [m/s].
+            Shape [batch size, number of UTs, 3]
+        :param in_state: Indoor/outdoor state of UTs. `True` means indoor and
+            `False` means outdoor.
+            Shape [batch size, number of UTs]
+        :param los: If not `None`, all UTs located outdoor are forced to be in
+            LoS if ``los`` is set to `True`, or in NLoS if it is set to
+            `False`. If set to `None`, the LoS/NLoS states of UTs is set
+            following 3GPP specification (Section 7.4.2 of TR 38.901).
+        :param bs_virtual_loc: Virtual locations of BSs for each UT [m].
             Used to compute BS-UT relative distance and angles.
             If `None` while ``bs_loc`` is specified, then it is set to
             ``bs_loc`` upon reshaping. If neither ``bs_virtual_loc`` nor
-            ``bs_loc`` are specified, then the previous value is used. 
+            ``bs_loc`` are specified, then the previous value is used.
+            Shape [batch size, number of BSs, number of UTs, 3]
+
+        :output updated: `True` if the topology was updated, `False` otherwise
         """
 
-        assert (ut_loc is not None) or (self._ut_loc is not None),\
-            "`ut_loc` is None and was not previously set"
+        assert (ut_loc is not None) or (
+            self._ut_loc is not None
+        ), "`ut_loc` is None and was not previously set"
 
-        assert (bs_loc is not None) or (self._bs_loc is not None),\
-            "`bs_loc` is None and was not previously set"
+        assert (bs_loc is not None) or (
+            self._bs_loc is not None
+        ), "`bs_loc` is None and was not previously set"
 
-        assert (bs_virtual_loc is not None) or (bs_loc is not None) or \
-            (self._bs_virtual_loc is not None),\
-            "`bs_virtual_loc` is None and was not previously set"
+        assert (
+            (bs_virtual_loc is not None)
+            or (bs_loc is not None)
+            or (self._bs_virtual_loc is not None)
+        ), "`bs_virtual_loc` is None and was not previously set"
 
-        assert (in_state is not None) or (self._in_state is not None),\
-            "`in_state` is None and was not previously set"
+        assert (in_state is not None) or (
+            self._in_state is not None
+        ), "`in_state` is None and was not previously set"
 
-        assert (ut_orientations is not None)\
-            or (self._ut_orientations is not None),\
-            "`ut_orientations` is None and was not previously set"
+        assert (ut_orientations is not None) or (
+            self._ut_orientations is not None
+        ), "`ut_orientations` is None and was not previously set"
 
-        assert (bs_orientations is not None)\
-            or (self._bs_orientations is not None),\
-            "`bs_orientations` is None and was not previously set"
+        assert (bs_orientations is not None) or (
+            self._bs_orientations is not None
+        ), "`bs_orientations` is None and was not previously set"
 
-        assert (ut_velocities is not None)\
-            or (self._ut_velocities is not None),\
-            "`ut_velocities` is None and was not previously set"
+        assert (ut_velocities is not None) or (
+            self._ut_velocities is not None
+        ), "`ut_velocities` is None and was not previously set"
 
         # Boolean used to keep track of whether or not we need to (re-)compute
         # the distances between users, correlation matrices...
@@ -455,33 +512,42 @@ class SystemLevelScenario(Object):
         # state of UTs, or LoS/NLoS states of outdoor UTs are updated.
         need_for_update = False
 
+        # Update topology tensors using _update_attr which automatically uses
+        # in-place operations when tensors are pre-allocated (for CUDAGraph
+        # compatibility) or standard assignment otherwise.
         if ut_loc is not None:
-            self._ut_loc = ut_loc
+            self._update_attr("_ut_loc", self._convert(ut_loc))
             need_for_update = True
 
         if bs_loc is not None:
-            self._bs_loc = bs_loc
+            self._update_attr("_bs_loc", self._convert(bs_loc))
             need_for_update = True
 
         if bs_virtual_loc is not None:
-            self._bs_virtual_loc = bs_virtual_loc
+            self._update_attr("_bs_virtual_loc", self._convert(bs_virtual_loc))
             need_for_update = True
         elif bs_loc is not None:
             # Set virtual BS locations to the effective ones
             # [batch size, number of BSs, 1, 3]
-            self._bs_virtual_loc = insert_dims(bs_loc, num_dims=1, axis=2)
+            self._update_attr(
+                "_bs_virtual_loc", insert_dims(self._bs_loc, num_dims=1, axis=2)
+            )
 
         if bs_orientations is not None:
-            self._bs_orientations = bs_orientations
+            self._update_attr("_bs_orientations", self._convert(bs_orientations))
 
         if ut_orientations is not None:
-            self._ut_orientations = ut_orientations
+            self._update_attr("_ut_orientations", self._convert(ut_orientations))
 
         if ut_velocities is not None:
-            self._ut_velocities = ut_velocities
+            self._update_attr("_ut_velocities", self._convert(ut_velocities))
 
         if in_state is not None:
-            self._in_state = in_state
+            if isinstance(in_state, torch.Tensor):
+                in_state_tensor = in_state.to(device=self.device)
+            else:
+                in_state_tensor = torch.as_tensor(in_state, device=self.device)
+            self._update_attr("_in_state", in_state_tensor)
             need_for_update = True
 
         if los is not None:
@@ -500,163 +566,449 @@ class SystemLevelScenario(Object):
             # Compute the basic path-loss
             self._compute_pathloss_basic()
 
+            # Freeze topology after first complete set_topology call
+            # This enables optimal performance with torch.compile
+            # Call reset_topology() to allow shape changes
+            if not self._topology_frozen:
+                self._topology_frozen = True
+
         return need_for_update
 
-    def spatial_correlation_matrix(self, correlation_distance):
+    def _register_buffer_safe(self, name: str, tensor: torch.Tensor) -> None:
+        """Register a buffer, replacing any existing attribute with the same name.
+
+        This is needed because attributes are initialized to None in __init__,
+        and register_buffer will fail if the attribute already exists as a
+        non-buffer.
+
+        :param name: Buffer name
+        :param tensor: Tensor to register
+        """
+        if hasattr(self, name) and name not in self._buffers:
+            delattr(self, name)
+        self.register_buffer(name, tensor)
+
+    def reset_topology(self) -> None:
+        """Reset the topology to allow different batch_size/num_ut/num_bs.
+
+        This method clears all topology buffers and returns the scenario
+        to its initial state. The next `set_topology` call will re-initialize
+        the buffers with the new shapes and freeze again.
+
+        Use this when you need to change the batch_size, num_ut, or num_bs,
+        for example when switching between training and evaluation with
+        different batch sizes.
+
+        Note: After reset, the next `set_topology` call will re-freeze.
+        If using torch.compile, this will trigger recompilation.
+        """
+        # List of all topology buffer names
+        topology_buffers = [
+            "_ut_loc",
+            "_bs_loc",
+            "_bs_virtual_loc",
+            "_ut_orientations",
+            "_bs_orientations",
+            "_ut_velocities",
+            "_in_state",
+            "_distance_2d",
+            "_distance_3d",
+            "_distance_2d_in",
+            "_distance_2d_out",
+            "_distance_3d_in",
+            "_distance_3d_out",
+            "_matrix_ut_distance_2d",
+            "_los_aod",
+            "_los_aoa",
+            "_los_zod",
+            "_los_zoa",
+            "_los",
+            "_lsp_log_mean",
+            "_lsp_log_std",
+            "_zod_offset",
+            "_pl_b",
+        ]
+
+        # Remove all topology buffers - delattr removes from _buffers dict
+        for name in topology_buffers:
+            if hasattr(self, name):
+                delattr(self, name)
+
+        # Unfreeze to allow new shapes
+        self._topology_frozen = False
+
+        # Clear any cached compiled graphs that might reference old buffers
+        import torch._dynamo
+
+        torch._dynamo.reset()
+
+    def allocate_topology_tensors(
+        self,
+        batch_size: int,
+        num_bs: int,
+        num_ut: int,
+    ) -> None:
+        r"""
+        Pre-allocate all tensors used for topology updates.
+
+        This method is optional. When using `set_topology` inside a
+        `torch.compile`-decorated function, tensors are automatically allocated
+        as buffers on the first call and updated in-place on subsequent calls.
+
+        Calling this method explicitly can be useful if you want to ensure
+        all tensors are allocated before the first forward pass, or if you
+        want to pre-allocate with specific shapes before calling `set_topology`.
+
+        Calling this method again reinitializes all topology buffers to the
+        new shapes (equivalent to :meth:`reset_topology` + allocate).
+
+        After the first `set_topology` call (or after calling this method),
+        the shapes of topology tensors are frozen and cannot be changed.
+        This is required for `torch.compile` with `mode="reduce-overhead"`.
+
+        :param batch_size: Batch size
+        :param num_bs: Number of base stations
+        :param num_ut: Number of user terminals
+        """
+        # Reset any existing buffers to allow reinitialization
+        self.reset_topology()
+
+        # Pre-allocate scenario tensors - register as buffers for CUDAGraph compatibility
+        self._register_buffer_safe(
+            "_ut_loc",
+            torch.zeros(batch_size, num_ut, 3, dtype=self.dtype, device=self.device),
+        )
+        self._register_buffer_safe(
+            "_bs_loc",
+            torch.zeros(batch_size, num_bs, 3, dtype=self.dtype, device=self.device),
+        )
+        self._register_buffer_safe(
+            "_bs_virtual_loc",
+            torch.zeros(
+                batch_size, num_bs, 1, 3, dtype=self.dtype, device=self.device
+            ),
+        )
+        self._register_buffer_safe(
+            "_ut_orientations",
+            torch.zeros(batch_size, num_ut, 3, dtype=self.dtype, device=self.device),
+        )
+        self._register_buffer_safe(
+            "_bs_orientations",
+            torch.zeros(batch_size, num_bs, 3, dtype=self.dtype, device=self.device),
+        )
+        self._register_buffer_safe(
+            "_ut_velocities",
+            torch.zeros(batch_size, num_ut, 3, dtype=self.dtype, device=self.device),
+        )
+        self._register_buffer_safe(
+            "_in_state",
+            torch.zeros(batch_size, num_ut, dtype=torch.bool, device=self.device),
+        )
+
+        # Pre-allocate internal state tensors
+        self._register_buffer_safe(
+            "_distance_2d",
+            torch.zeros(
+                batch_size, num_bs, num_ut, dtype=self.dtype, device=self.device
+            ),
+        )
+        self._register_buffer_safe(
+            "_distance_3d",
+            torch.zeros(
+                batch_size, num_bs, num_ut, dtype=self.dtype, device=self.device
+            ),
+        )
+        self._register_buffer_safe(
+            "_distance_2d_in",
+            torch.zeros(
+                batch_size, num_bs, num_ut, dtype=self.dtype, device=self.device
+            ),
+        )
+        self._register_buffer_safe(
+            "_distance_2d_out",
+            torch.zeros(
+                batch_size, num_bs, num_ut, dtype=self.dtype, device=self.device
+            ),
+        )
+        self._register_buffer_safe(
+            "_distance_3d_in",
+            torch.zeros(
+                batch_size, num_bs, num_ut, dtype=self.dtype, device=self.device
+            ),
+        )
+        self._register_buffer_safe(
+            "_distance_3d_out",
+            torch.zeros(
+                batch_size, num_bs, num_ut, dtype=self.dtype, device=self.device
+            ),
+        )
+        self._register_buffer_safe(
+            "_matrix_ut_distance_2d",
+            torch.zeros(
+                batch_size, num_ut, num_ut, dtype=self.dtype, device=self.device
+            ),
+        )
+
+        # Angle tensors
+        self._register_buffer_safe(
+            "_los_aod",
+            torch.zeros(
+                batch_size, num_bs, num_ut, dtype=self.dtype, device=self.device
+            ),
+        )
+        self._register_buffer_safe(
+            "_los_aoa",
+            torch.zeros(
+                batch_size, num_bs, num_ut, dtype=self.dtype, device=self.device
+            ),
+        )
+        self._register_buffer_safe(
+            "_los_zod",
+            torch.zeros(
+                batch_size, num_bs, num_ut, dtype=self.dtype, device=self.device
+            ),
+        )
+        self._register_buffer_safe(
+            "_los_zoa",
+            torch.zeros(
+                batch_size, num_bs, num_ut, dtype=self.dtype, device=self.device
+            ),
+        )
+
+        # LoS state tensor
+        self._register_buffer_safe(
+            "_los",
+            torch.zeros(
+                batch_size, num_bs, num_ut, dtype=torch.bool, device=self.device
+            ),
+        )
+
+        # LSP tensors (7 LSPs: DS, ASD, ASA, SF, K, ZSA, ZSD)
+        self._register_buffer_safe(
+            "_lsp_log_mean",
+            torch.zeros(
+                batch_size, num_bs, num_ut, 7, dtype=self.dtype, device=self.device
+            ),
+        )
+        self._register_buffer_safe(
+            "_lsp_log_std",
+            torch.zeros(
+                batch_size, num_bs, num_ut, 7, dtype=self.dtype, device=self.device
+            ),
+        )
+        self._register_buffer_safe(
+            "_zod_offset",
+            torch.zeros(
+                batch_size, num_bs, num_ut, dtype=self.dtype, device=self.device
+            ),
+        )
+
+        # Pathloss tensor
+        self._register_buffer_safe(
+            "_pl_b",
+            torch.zeros(
+                batch_size, num_bs, num_ut, dtype=self.dtype, device=self.device
+            ),
+        )
+
+        # Freeze topology shapes for torch.compile compatibility
+        self._topology_frozen = True
+
+    def spatial_correlation_matrix(self, correlation_distance: float) -> torch.Tensor:
         r"""Computes and returns a 2D spatial exponential correlation matrix
-        :math:`C` over the UTs, such that :math:`C`has shape
-        (number of UTs)x(number of UTs), and
+        :math:`C` over the UTs, such that :math:`C` has shape
+        (number of UTs) x (number of UTs), and
 
         .. math::
-            C_{n,m} = \exp{-\frac{d_{n,m}}{D}}
+            C_{n,m} = \exp\left(-\frac{d_{n,m}}{D}\right)
 
         where :math:`d_{n,m}` is the distance between UT :math:`n` and UT
-        :math:`m` in the X-Y plan, and :math:`D` the correlation distance.
+        :math:`m` in the X-Y plane, and :math:`D` the correlation distance.
 
-        Input
-        ------
-        correlation_distance : float
-            Correlation distance, i.e., distance such that the correlation
-            is :math:`e^{-1} \approx 0.37`
+        :param correlation_distance: Correlation distance, i.e., distance
+            such that the correlation is :math:`e^{-1} \approx 0.37`
 
-        Output
-        --------
-        : [batch size, number of UTs, number of UTs], float
-            Spatial correlation :math:`C`
+        :output C: Spatial correlation :math:`C`,
+            shape [batch size, number of UTs, number of UTs]
         """
-        spatial_correlation_matrix = tf.math.exp(-self.matrix_ut_distance_2d/
-                                                 correlation_distance)
-        return spatial_correlation_matrix
-
+        return torch.exp(-self.matrix_ut_distance_2d / correlation_distance)
 
     @property
     @abstractmethod
-    def los_parameter_filepath(self):
-        r""" Path of the configuration file for LoS scenario"""
+    def los_parameter_filepath(self) -> str:
+        """Path of the configuration file for LoS scenario"""
         pass
 
     @property
     @abstractmethod
-    def nlos_parameter_filepath(self):
-        r""" Path of the configuration file for NLoS scenario"""
+    def nlos_parameter_filepath(self) -> str:
+        """Path of the configuration file for NLoS scenario"""
         pass
 
     @property
     @abstractmethod
-    def o2i_parameter_filepath(self):
-        r""" Path of the configuration file for indoor scenario"""
+    def o2i_parameter_filepath(self) -> str:
+        """Path of the configuration file for indoor scenario"""
         pass
 
     @property
-    def o2i_model(self):
-        r"""O2I model used for pathloss computation of indoor UTs. Either "low"
-        or "high". See section 7.4.3 or TR 38.901."""
+    def o2i_model(self) -> str:
+        """O2I model used for pathloss computation of indoor UTs.
+        Either ``"low"`` or ``"high"``. See section 7.4.3 of TR 38.901."""
         return self._o2i_model
 
     @abstractmethod
-    def clip_carrier_frequency_lsp(self, fc):
-        r"""Clip the carrier frequency ``fc`` in GHz for LSP calculation
+    def clip_carrier_frequency_lsp(self, fc: torch.Tensor) -> torch.Tensor:
+        r"""Clip the carrier frequency ``fc`` in GHz for LSP calculation.
 
-        Input
-        -----
-        fc : `float`
-            Carrier frequency [GHz]
+        :param fc: Carrier frequency [GHz]
 
-        Output
-        -------
-        : `float`
-            Clipped carrier frequency, that should be used for LSp computation
+        :output fc_clipped: Clipped carrier frequency, that should be used for LSP
+            computation
         """
         pass
 
-    def get_param(self, parameter_name):
-        r"""
-        Given a ``parameter_name`` used in the configuration file, returns a
-        tensor with shape [batch size, number of BSs, number of UTs] of the
-        parameter value according to each BS-UT link state (LoS, NLoS, indoor).
+    _LOG_LINEAR_PARAMS = {
+        "muDS",
+        "sigmaDS",
+        "muASD",
+        "sigmaASD",
+        "muASA",
+        "sigmaASA",
+        "muZSA",
+        "sigmaZSA",
+    }
 
-        Input
-        ------
-        parameter_name : str
-            Name of the parameter used in the configuration file
+    def _get_log_linear_param(
+        self, parameter_name: str, fc: torch.Tensor
+    ) -> torch.Tensor:
+        pa_los = self._params_los[parameter_name + "a"]
+        pb_los = self._params_los[parameter_name + "b"]
+        pc_los = self._params_los[parameter_name + "c"]
 
-        Output
-        -------
-        : [batch size, number of BSs, number of UTs], tf.float
-            Parameter value for each BS-UT link
+        pa_nlos = self._params_nlos[parameter_name + "a"]
+        pb_nlos = self._params_nlos[parameter_name + "b"]
+        pc_nlos = self._params_nlos[parameter_name + "c"]
+
+        pa_o2i = self._params_o2i[parameter_name + "a"]
+        pb_o2i = self._params_o2i[parameter_name + "b"]
+        pc_o2i = self._params_o2i[parameter_name + "c"]
+
+        parameter_value_los = pa_los * torch.log10(pb_los + fc) + pc_los
+        parameter_value_nlos = pa_nlos * torch.log10(pb_nlos + fc) + pc_nlos
+        parameter_value_o2i = pa_o2i * torch.log10(pb_o2i + fc) + pc_o2i
+
+        return self.broadcast_params(
+            parameter_value_los, parameter_value_nlos, parameter_value_o2i
+        )
+
+    def _get_cds_param(self, parameter_name: str, fc: torch.Tensor) -> torch.Tensor:
+        pa_los = self._params_los[parameter_name + "a"]
+        pb_los = self._params_los[parameter_name + "b"]
+        pc_los = self._params_los[parameter_name + "c"]
+
+        pa_nlos = self._params_nlos[parameter_name + "a"]
+        pb_nlos = self._params_nlos[parameter_name + "b"]
+        pc_nlos = self._params_nlos[parameter_name + "c"]
+
+        pa_o2i = self._params_o2i[parameter_name + "a"]
+        pb_o2i = self._params_o2i[parameter_name + "b"]
+        pc_o2i = self._params_o2i[parameter_name + "c"]
+
+        parameter_value_los = torch.maximum(pa_los, pb_los - pc_los * torch.log10(fc))
+        parameter_value_nlos = torch.maximum(
+            pa_nlos, pb_nlos - pc_nlos * torch.log10(fc)
+        )
+        parameter_value_o2i = torch.maximum(pa_o2i, pb_o2i - pc_o2i * torch.log10(fc))
+
+        return self.broadcast_params(
+            parameter_value_los, parameter_value_nlos, parameter_value_o2i
+        )
+
+    def _get_generic_param(self, parameter_name: str) -> torch.Tensor:
+        parameter_value_los = self._params_los[parameter_name]
+        parameter_value_nlos = self._params_nlos[parameter_name]
+        parameter_value_o2i = self._params_o2i[parameter_name]
+
+        return self.broadcast_params(
+            parameter_value_los, parameter_value_nlos, parameter_value_o2i
+        )
+
+    def get_param(self, parameter_name: str) -> torch.Tensor:
+        r"""Given a ``parameter_name`` used in the configuration file, returns
+        a tensor with shape [batch size, number of BSs, number of UTs] of the
+        parameter value according to each BS-UT link state (LoS, NLoS,
+        indoor).
+
+        :param parameter_name: Name of the parameter used in the
+            configuration file
+
+        :output value: Parameter value for each BS-UT link,
+            shape [batch size, number of BSs, number of UTs]
         """
-
-        fc = self._carrier_frequency/1e9
-        fc = self.clip_carrier_frequency_lsp(fc)
-
-        parameter_tensor = tf.zeros(shape=[self.batch_size,
-                                            self.num_bs,
-                                            self.num_ut],
-                                            dtype=self.rdtype)
-
-        # Parameter value
-        if parameter_name in ('muDS', 'sigmaDS', 'muASD', 'sigmaASD', 'muASA',
-                             'sigmaASA', 'muZSA', 'sigmaZSA'):
-
-            pa_los = self._params_los[parameter_name + 'a']
-            pb_los = self._params_los[parameter_name + 'b']
-            pc_los = self._params_los[parameter_name + 'c']
-
-            pa_nlos = self._params_nlos[parameter_name + 'a']
-            pb_nlos = self._params_nlos[parameter_name + 'b']
-            pc_nlos = self._params_nlos[parameter_name + 'c']
-
-            pa_o2i = self._params_o2i[parameter_name + 'a']
-            pb_o2i = self._params_o2i[parameter_name + 'b']
-            pc_o2i = self._params_o2i[parameter_name + 'c']
-
-            parameter_value_los = pa_los*log10(pb_los+fc) + pc_los
-            parameter_value_nlos = pa_nlos*log10(pb_nlos+fc) + pc_nlos
-            parameter_value_o2i = pa_o2i*log10(pb_o2i+fc) + pc_o2i
+        if parameter_name in self._LOG_LINEAR_PARAMS:
+            fc = self._carrier_frequency / 1e9
+            fc = self.clip_carrier_frequency_lsp(fc)
+            return self._get_log_linear_param(parameter_name, fc)
         elif parameter_name == "cDS":
-
-            pa_los = self._params_los[parameter_name + 'a']
-            pb_los = self._params_los[parameter_name + 'b']
-            pc_los = self._params_los[parameter_name + 'c']
-
-            pa_nlos = self._params_nlos[parameter_name + 'a']
-            pb_nlos = self._params_nlos[parameter_name + 'b']
-            pc_nlos = self._params_nlos[parameter_name + 'c']
-
-            pa_o2i = self._params_o2i[parameter_name + 'a']
-            pb_o2i = self._params_o2i[parameter_name + 'b']
-            pc_o2i = self._params_o2i[parameter_name + 'c']
-
-            parameter_value_los = tf.math.maximum(pa_los,
-                pb_los - pc_los*log10(fc))
-            parameter_value_nlos = tf.math.maximum(pa_nlos,
-                pb_nlos - pc_nlos*log10(fc))
-            parameter_value_o2i = tf.math.maximum(pa_o2i,
-                pb_o2i - pc_o2i*log10(fc))
+            fc = self._carrier_frequency / 1e9
+            fc = self.clip_carrier_frequency_lsp(fc)
+            return self._get_cds_param(parameter_name, fc)
         else:
-            parameter_value_los = self._params_los[parameter_name]
-            parameter_value_nlos = self._params_nlos[parameter_name]
-            parameter_value_o2i = self._params_o2i[parameter_name]
+            return self._get_generic_param(parameter_name)
+
+    def broadcast_params(
+        self, parameter_value_los, parameter_value_nlos, parameter_value_o2i
+    ) -> torch.Tensor:
+        r"""Broadcast parameters to the shape
+        [batch size, number of BSs, number of UTs] based on the link state
+        (LoS, NLoS, indoor).
+        """
+        parameter_tensor = torch.zeros(
+            self.batch_size,
+            self.num_bs,
+            self.num_ut,
+            dtype=self.dtype,
+            device=self.device,
+        )
 
         # Expand to allow broadcasting with the BS dimension
-        indoor = tf.expand_dims(self.indoor, axis=1)
+        indoor = self.indoor.unsqueeze(1)
+
         # LoS
-        parameter_value_los = tf.cast(parameter_value_los,
-                                        self.rdtype)
-        parameter_tensor = tf.where(self.los, parameter_value_los,
-            parameter_tensor)
+        if isinstance(parameter_value_los, torch.Tensor):
+            parameter_value_los = parameter_value_los.to(
+                dtype=self.dtype, device=self.device
+            )
+        else:
+            parameter_value_los = torch.tensor(
+                parameter_value_los, dtype=self.dtype, device=self.device
+            )
+        parameter_tensor = torch.where(self.los, parameter_value_los, parameter_tensor)
+
         # NLoS
-        parameter_value_nlos = tf.cast(parameter_value_nlos,
-                                        self.rdtype)
-        parameter_tensor = tf.where(
-            tf.logical_and(tf.logical_not(self.los),
-            tf.logical_not(indoor)), parameter_value_nlos,
-            parameter_tensor)
+        if isinstance(parameter_value_nlos, torch.Tensor):
+            parameter_value_nlos = parameter_value_nlos.to(
+                dtype=self.dtype, device=self.device
+            )
+        else:
+            parameter_value_nlos = torch.tensor(
+                parameter_value_nlos, dtype=self.dtype, device=self.device
+            )
+        parameter_tensor = torch.where(
+            (~self.los) & (~indoor), parameter_value_nlos, parameter_tensor
+        )
+
         # O2I
-        parameter_value_o2i = tf.cast(parameter_value_o2i,
-                                        self.rdtype)
-        parameter_tensor = tf.where(indoor, parameter_value_o2i,
-            parameter_tensor)
+        if isinstance(parameter_value_o2i, torch.Tensor):
+            parameter_value_o2i = parameter_value_o2i.to(
+                dtype=self.dtype, device=self.device
+            )
+        else:
+            parameter_value_o2i = torch.tensor(
+                parameter_value_o2i, dtype=self.dtype, device=self.device
+            )
+        parameter_tensor = torch.where(indoor, parameter_value_o2i, parameter_tensor)
 
         return parameter_tensor
 
@@ -664,7 +1016,7 @@ class SystemLevelScenario(Object):
     # Internal utility methods
     #####################################################
 
-    def _compute_distance_2d_3d_and_angles(self):
+    def _compute_distance_2d_3d_and_angles(self) -> None:
         r"""
         Computes the following internal values:
         * 2D distances for all BS-UT pairs in the X-Y plane
@@ -674,48 +1026,44 @@ class SystemLevelScenario(Object):
 
         This function is called at every update of the topology.
         """
-
         ut_loc = self._ut_loc
         # [batch_size, 1, num_ut, 3]
-        ut_loc = tf.expand_dims(ut_loc, axis=1)
+        ut_loc_exp = ut_loc.unsqueeze(1)
         # [batch_size, num_bs, num_ut, 3]
         bs_virtual_loc = self._bs_virtual_loc
 
-        delta_loc_xy = ut_loc[:,:,:,:2] - bs_virtual_loc[:,:,:,:2]
-        delta_loc = ut_loc - bs_virtual_loc
+        delta_loc_xy = ut_loc_exp[:, :, :, :2] - bs_virtual_loc[:, :, :, :2]
+        delta_loc = ut_loc_exp - bs_virtual_loc
 
         # 2D distances for all BS-UT pairs in the (x-y) plane
-        distance_2d = tf.sqrt(tf.reduce_sum(tf.square(delta_loc_xy), axis=3))
-        self._distance_2d = distance_2d
+        distance_2d = torch.sqrt((delta_loc_xy**2).sum(dim=3))
+        self._update_attr("_distance_2d", distance_2d)
 
         # 3D distances for all BS-UT pairs
-        distance_3d = tf.sqrt(tf.reduce_sum(tf.square(delta_loc), axis=3))
-        self._distance_3d = distance_3d
+        distance_3d = torch.sqrt((delta_loc**2).sum(dim=3))
+        self._update_attr("_distance_3d", distance_3d)
 
         # LoS AoA, AoD, ZoA, ZoD
-        los_aod = tf.atan2(delta_loc[:,:,:,1], delta_loc[:,:,:,0])
+        los_aod = torch.atan2(delta_loc[:, :, :, 1], delta_loc[:, :, :, 0])
         los_aoa = los_aod + PI
-        los_zod = tf.atan2(distance_2d, delta_loc[:,:,:,2])
+        los_zod = torch.atan2(distance_2d, delta_loc[:, :, :, 2])
         los_zoa = los_zod - PI
+
         # Angles are converted to degrees and wrapped to (0,360)
-        self._los_aod = wrap_angle_0_360(rad_2_deg(los_aod))
-        self._los_aoa = wrap_angle_0_360(rad_2_deg(los_aoa))
-        self._los_zod = wrap_angle_0_360(rad_2_deg(los_zod))
-        self._los_zoa = wrap_angle_0_360(rad_2_deg(los_zoa))
+        self._update_attr("_los_aod", wrap_angle_0_360(rad_2_deg(los_aod)))
+        self._update_attr("_los_aoa", wrap_angle_0_360(rad_2_deg(los_aoa)))
+        self._update_attr("_los_zod", wrap_angle_0_360(rad_2_deg(los_zod)))
+        self._update_attr("_los_zoa", wrap_angle_0_360(rad_2_deg(los_zoa)))
 
         # 2D distances for all pairs of UTs in the (x-y) plane
-        ut_loc_xy = self._ut_loc[:,:,:2]
+        ut_loc_xy = self._ut_loc[:, :, :2]
+        ut_loc_xy_expanded_1 = ut_loc_xy.unsqueeze(1)
+        ut_loc_xy_expanded_2 = ut_loc_xy.unsqueeze(2)
+        delta_loc_xy_ut = ut_loc_xy_expanded_1 - ut_loc_xy_expanded_2
+        matrix_ut_distance_2d = torch.sqrt((delta_loc_xy_ut**2).sum(dim=3))
+        self._update_attr("_matrix_ut_distance_2d", matrix_ut_distance_2d)
 
-        ut_loc_xy_expanded_1 = tf.expand_dims(ut_loc_xy, axis=1)
-        ut_loc_xy_expanded_2 = tf.expand_dims(ut_loc_xy, axis=2)
-
-        delta_loc_xy = ut_loc_xy_expanded_1 - ut_loc_xy_expanded_2
-
-        matrix_ut_distance_2d = tf.sqrt(tf.reduce_sum(tf.square(delta_loc_xy),
-                                                       axis=3))
-        self._matrix_ut_distance_2d = matrix_ut_distance_2d
-
-    def _sample_los(self):
+    def _sample_los(self) -> None:
         r"""Set the LoS state of each UT randomly, following the procedure
         described in section 7.4.2 of TR 38.901.
         LoS state of each UT is randomly assigned according to a Bernoulli
@@ -723,86 +1071,114 @@ class SystemLevelScenario(Object):
         """
         if self._requested_los is None:
             los_probability = self.los_probability
-            los = sample_bernoulli([self.batch_size, self.num_bs,
-                                        self.num_ut], los_probability,
-                                        precision=self.precision)
+            los = sample_bernoulli(
+                [self.batch_size, self.num_bs, self.num_ut],
+                los_probability,
+                precision=self.precision,
+                device=self.device,
+            )
         else:
-            los = tf.fill([self.batch_size, self.num_bs, self.num_ut],
-                            self._requested_los)
+            los = torch.full(
+                (self.batch_size, self.num_bs, self.num_ut),
+                self._requested_los,
+                dtype=torch.bool,
+                device=self.device,
+            )
 
-        self._los = tf.logical_and(los,
-            tf.logical_not(tf.expand_dims(self._in_state, axis=1)))
+        self._update_attr("_los", los & (~self._in_state.unsqueeze(1)))
 
-    def _sample_indoor_distance(self):
+    def _sample_indoor_distance(self) -> None:
         r"""Sample 2D indoor distances for indoor devices, according to section
         7.4.3.1 of TR 38.901.
         """
-
         indoor = self.indoor
-        indoor = tf.expand_dims(indoor, axis=1) # For broadcasting with BS dim
-        indoor_mask = tf.where(indoor, tf.constant(1.0, self.rdtype),
-            tf.constant(0.0, self.rdtype))
+        indoor = indoor.unsqueeze(1)  # For broadcasting with BS dim
+        indoor_mask = torch.where(
+            indoor,
+            torch.tensor(1.0, dtype=self.dtype, device=self.device),
+            torch.tensor(0.0, dtype=self.dtype, device=self.device),
+        )
 
         # Sample the indoor 2D distances for each BS-UT link
-        self._distance_2d_in = config.tf_rng.uniform(
-            shape=[self.batch_size, self.num_bs, self.num_ut],
-            minval=self.min_2d_in,
-            maxval=self.max_2d_in,
-            dtype=self.rdtype) * indoor_mask
-        # Compute the outdoor 2D distances
-        self._distance_2d_out = self.distance_2d - self._distance_2d_in
-        # Compute the indoor 3D distances
-        self._distance_3d_in = ((self._distance_2d_in/self.distance_2d)
-            *self.distance_3d)
-        # Compute the outdoor 3D distances
-        self._distance_3d_out = self.distance_3d - self._distance_3d_in
+        distance_2d_in = (
+            rand(
+                (self.batch_size, self.num_bs, self.num_ut),
+                dtype=self.dtype,
+                device=self.device,
+                generator=self.torch_rng,
+            )
+            * (self.max_2d_in - self.min_2d_in)
+            + self.min_2d_in
+        ) * indoor_mask
+        self._update_attr("_distance_2d_in", distance_2d_in)
 
-    def _load_params(self):
+        # Compute the outdoor 2D distances
+        self._update_attr("_distance_2d_out", self.distance_2d - self._distance_2d_in)
+
+        # Compute the indoor 3D distances
+        self._update_attr(
+            "_distance_3d_in",
+            (self._distance_2d_in / self.distance_2d) * self.distance_3d,
+        )
+
+        # Compute the outdoor 3D distances
+        self._update_attr("_distance_3d_out", self.distance_3d - self._distance_3d_in)
+
+    def _load_params(self) -> None:
         r"""Load the configuration files corresponding to the 3 possible states
         of UTs: LoS, NLoS, and O2I"""
 
         source = files(models).joinpath(self.o2i_parameter_filepath)
-        # pylint: disable=unspecified-encoding
         with open(source) as f:
             self._params_o2i = json.load(f)
 
-        for param_name in self._params_o2i :
+        for param_name in self._params_o2i:
             v = self._params_o2i[param_name]
             if isinstance(v, float):
-                self._params_o2i[param_name] = tf.constant(v, self.rdtype)
+                # Register as buffer for CUDAGraph compatibility
+                tensor = torch.tensor(v, dtype=self.dtype, device=self.device)
+                self.register_buffer(f"_params_o2i_{param_name}", tensor)
+                self._params_o2i[param_name] = tensor
             elif isinstance(v, int):
-                self._params_o2i[param_name] = tf.constant(v, tf.int32)
+                # Keep integers as Python int for num_clusters, etc.
+                pass
 
         source = files(models).joinpath(self.los_parameter_filepath)
-        # pylint: disable=unspecified-encoding
         with open(source) as f:
             self._params_los = json.load(f)
 
-        for param_name in self._params_los :
+        for param_name in self._params_los:
             v = self._params_los[param_name]
             if isinstance(v, float):
-                self._params_los[param_name] = tf.constant(v, self.rdtype)
+                # Register as buffer for CUDAGraph compatibility
+                tensor = torch.tensor(v, dtype=self.dtype, device=self.device)
+                self.register_buffer(f"_params_los_{param_name}", tensor)
+                self._params_los[param_name] = tensor
             elif isinstance(v, int):
-                self._params_los[param_name] = tf.constant(v, tf.int32)
+                # Keep integers as Python int for num_clusters, etc.
+                pass
 
         source = files(models).joinpath(self.nlos_parameter_filepath)
-        # pylint: disable=unspecified-encoding
         with open(source) as f:
             self._params_nlos = json.load(f)
 
-        for param_name in self._params_nlos :
+        for param_name in self._params_nlos:
             v = self._params_nlos[param_name]
             if isinstance(v, float):
-                self._params_nlos[param_name] = tf.constant(v, self.rdtype)
+                # Register as buffer for CUDAGraph compatibility
+                tensor = torch.tensor(v, dtype=self.dtype, device=self.device)
+                self.register_buffer(f"_params_nlos_{param_name}", tensor)
+                self._params_nlos[param_name] = tensor
             elif isinstance(v, int):
-                self._params_nlos[param_name] = tf.constant(v, tf.int32)
+                # Keep integers as Python int for num_clusters, etc.
+                pass
 
     @abstractmethod
-    def _compute_lsp_log_mean_std(self):
+    def _compute_lsp_log_mean_std(self) -> None:
         r"""Computes the mean and standard deviations of LSPs in log-domain"""
         pass
 
     @abstractmethod
-    def _compute_pathloss_basic(self):
+    def _compute_pathloss_basic(self) -> None:
         r"""Computes the basic component of the pathloss [dB]"""
         pass

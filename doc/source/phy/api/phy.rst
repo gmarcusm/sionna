@@ -4,15 +4,14 @@ API Documentation
 .. toctree::
     :maxdepth: 5
 
+    block
     config
-    fec
-    mapping
-    channel.wireless
-    channel.optical
-    channel.discrete
-    ofdm
-    mimo
-    nr
-    signal
-    utils
-    developers
+    channel/channel
+    fec/fec
+    mapping/index
+    mimo/index
+    nr/index
+    object
+    ofdm/index
+    signal/index
+    utils/index

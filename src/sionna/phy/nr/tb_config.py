@@ -1,34 +1,44 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
-"""TB configuration for the NR (5G) module of Sionna PHY"""
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+"""TB configuration for the NR (5G) module of Sionna PHY."""
+
+from typing import Optional
 
 from .config import Config
 from .utils import decode_mcs_index
 
+
+__all__ = ["TBConfig"]
+
+
 class TBConfig(Config):
     # pylint: disable=line-too-long
-    r"""
-    The TBConfig objects sets parameters related to the transport block
-    encoding, as described in TS 38.214 [3GPP38214]_.
+    r"""Sets parameters related to the transport block encoding, as
+    described in TS 38.214 :cite:p:`3GPPTS38214`.
 
-    All configurable properties can be provided as keyword arguments during the
+    All configurable properties can be provided as keyword arguments during
     initialization or changed later.
 
     The TBConfig is configured by selecting the modulation and coding scheme
     (MCS) tables and index.
 
-    Example
-    -------
-    >>> tb_config = TBConfig(mcs_index=13)
-    >>> tb_config.mcs_table = 3
-    >>> tb_config.channel_type = "PUSCH"
-    >>> tb_config.show()
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        from sionna.phy.nr import TBConfig
+
+        tb_config = TBConfig(mcs_index=13)
+        tb_config.mcs_table = 3
+        tb_config.channel_type = "PUSCH"
+        tb_config.show()
 
     The following tables provide an overview of the corresponding coderates and
     modulation orders.
 
-    .. table:: MCS Index Table 1 (Table 5.1.3.1-1 in [3GPP38214]_)
+    .. table:: MCS Index Table 1 (Table 5.1.3.1-1 in :cite:p:`3GPPTS38214`)
         :align: center
 
         +-------------------+--------------------+-------------------------+-----------------------+
@@ -94,7 +104,7 @@ class TBConfig(Config):
         | 28                | 6                  | 948                     | 5.5547                |
         +-------------------+--------------------+-------------------------+-----------------------+
 
-    .. table:: MCS Index Table 2 (Table 5.1.3.1-2 in [3GPP38214]_)
+    .. table:: MCS Index Table 2 (Table 5.1.3.1-2 in :cite:p:`3GPPTS38214`)
         :align: center
 
         +-------------------+--------------------+-------------------------+-----------------------+
@@ -158,7 +168,7 @@ class TBConfig(Config):
         | 27                | 8                  | 948                     | 7.4063                |
         +-------------------+--------------------+-------------------------+-----------------------+
 
-    .. table:: MCS Index Table 3 (Table 5.1.3.1-3 in [3GPP38214]_)
+    .. table:: MCS Index Table 3 (Table 5.1.3.1-3 in :cite:p:`3GPPTS38214`)
         :align: center
 
         +-------------------+--------------------+-------------------------+-----------------------+
@@ -225,7 +235,7 @@ class TBConfig(Config):
         +-------------------+--------------------+-------------------------+-----------------------+
 
 
-    .. table:: MCS Index Table 4 (Table 5.1.3.1-4 in [3GPP38214]_)
+    .. table:: MCS Index Table 4 (Table 5.1.3.1-4 in :cite:p:`3GPPTS38214`)
         :align: center
 
         +-------------------+--------------------+-------------------------+-----------------------+
@@ -294,116 +304,109 @@ class TBConfig(Config):
         super().__init__(**kwargs)
         self.check_config()
 
-    #-----------------------------#
-    #---Configurable parameters---#
-    #-----------------------------#
+    # -----------------------------
+    # Configurable parameters
+    # -----------------------------
 
     @property
-    def mcs_index(self):
+    def mcs_index(self) -> int:
         r"""Modulation and coding scheme (MCS) index (denoted as :math:`I_{MCS}`
-        in [3GPP38214]_)"""
-        self._ifndef("mcs_index", 14) # 16-QAM, r=0.54
+        in :cite:p:`3GPPTS38214`)."""
+        self._ifndef("mcs_index", 14)  # 16-QAM, r=0.54
         return self._mcs_index
 
     @mcs_index.setter
-    def mcs_index(self, value):
-        assert value in range(29), \
-            "mcs_index must be in range from 0 to 28."
+    def mcs_index(self, value: int) -> None:
+        if value not in range(29):
+            raise ValueError("mcs_index must be in range from 0 to 28.")
         self._mcs_index = value
 
     @property
-    def mcs_table(self):
-        r"""Indicates which MCS table from [3GPP38214]_ to use. Starts with "1".
-        """
+    def mcs_table(self) -> int:
+        r"""Indicates which MCS table from :cite:p:`3GPPTS38214` to use. Starts with "1"."""
         self._ifndef("mcs_table", 1)
         return self._mcs_table
 
     @mcs_table.setter
-    def mcs_table(self, value):
-        assert value in range(1,5), \
-            "mcs_table must be in range from 1 to 4"
+    def mcs_table(self, value: int) -> None:
+        if value not in range(1, 5):
+            raise ValueError("mcs_table must be in range from 1 to 4")
         self._mcs_table = value
 
     @property
-    def channel_type(self):
-        r"""5G NR physical channel type. Valid choices are "PDSCH" and "PUSCH".
-        """
+    def channel_type(self) -> str:
+        r"""5G NR physical channel type. Valid choices are "PDSCH" and "PUSCH"."""
         self._ifndef("channel_type", "PUSCH")
         return self._channel_type
 
     @channel_type.setter
-    def channel_type(self, value):
-        assert value in ("PUSCH", "PDSCH"), \
-            'Only "PUSCH" and "PDSCH are supported'
+    def channel_type(self, value: str) -> None:
+        if value not in ("PUSCH", "PDSCH"):
+            raise ValueError('Only "PUSCH" and "PDSCH" are supported')
         self._channel_type = value
 
     @property
-    def n_id(self):
-        r"""
-        `int`, None (default), [0, 1023] : Data scrambling initialization
-            :math:`n_\text{ID}`. Data Scrambling ID related to cell id and
-            provided by higher layer. If `None`, the
-            :class:`~sionna.phy.nr.PUSCHConfig` will automatically set
-            :math:`n_\text{ID}=N_\text{ID}^{cell}`.
+    def n_id(self) -> Optional[int]:
+        r"""Data scrambling initialization :math:`n_\text{ID}`.
+
+        Data scrambling ID related to cell id and provided by higher layer.
+        If `None`, the :class:`~sionna.phy.nr.PUSCHConfig` will automatically
+        set :math:`n_\text{ID}=N_\text{ID}^{cell}`.
         """
         self._ifndef("n_id", None)
         return self._n_id
 
     @n_id.setter
-    def n_id(self, value):
+    def n_id(self, value: Optional[int]) -> None:
         if value is None:
             self._n_id = None
         else:
-            assert value in range(1024), \
-                "n_id must be in range from 0 to 1023"
+            if value not in range(1024):
+                raise ValueError("n_id must be in range from 0 to 1023")
             self._n_id = value
 
-    ###
-    ### Derived (read-only) parameters
-    ###
+    # --------------------------
+    # Derived (read-only) parameters
+    # --------------------------
 
     @property
-    def name(self):
+    def name(self) -> str:
+        """Configuration name."""
         return "Transport Block Configuration"
 
     @property
-    def target_coderate(self):
-        r"""
-        `float`, read-only: Target coderate of the TB as defined by the selected
-        MCS"""
-        _, r = decode_mcs_index(self._mcs_index,
-                                self._mcs_table,
-                                is_pusch=self._channel_type=='PUSCH')
-        return r.numpy()
+    def target_coderate(self) -> float:
+        r"""Target coderate of the TB as defined by the selected MCS."""
+        _, r = decode_mcs_index(
+            self._mcs_index,
+            self._mcs_table,
+            is_pusch=self._channel_type == "PUSCH",
+        )
+        return r
 
     @property
-    def num_bits_per_symbol(self):
-        r"""
-        `int`, read-only: Modulation order as defined by the selected MCS"""
-        m, _ = decode_mcs_index(self._mcs_index,
-                                self._mcs_table,
-                                is_pusch=self._channel_type=='PUSCH')
-        return m.numpy()
+    def num_bits_per_symbol(self) -> int:
+        r"""Modulation order as defined by the selected MCS."""
+        m, _ = decode_mcs_index(
+            self._mcs_index,
+            self._mcs_table,
+            is_pusch=self._channel_type == "PUSCH",
+        )
+        return m
 
     @property
-    def tb_scaling(self):
-        r"""
-        `float`, 1. (default), read-only: TB scaling factor for PDSCH as
-            defined in [3GPP38214]_ Tab. 5.1.3.2-2
-        """
-        return 1. # only 1. supported at the moment
+    def tb_scaling(self) -> float:
+        r"""TB scaling factor for PDSCH as defined in :cite:p:`3GPPTS38214` Tab. 5.1.3.2-2."""
+        return 1.0  # Only 1.0 supported at the moment
 
-    #-------------------#
-    #---Class methods---#
-    #-------------------#
+    # -------------------
+    # Class methods
+    # -------------------
 
-    def check_config(self):
-        """Test if configuration is valid"""
-        attr_list = ["mcs_index",
-                     "mcs_table",
-                     "channel_type",
-                     "n_id"
-                    ]
+    def check_config(self) -> None:
+        """Test if configuration is valid."""
+        attr_list = ["mcs_index", "mcs_table", "channel_type", "n_id"]
         for attr in attr_list:
             value = getattr(self, attr)
             setattr(self, attr, value)
+

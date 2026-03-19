@@ -3,56 +3,58 @@
 Sionna Block and Object
 =======================
 
-All of Sionna PHY's components inherit from the Sionna `Object
-<https://nvlabs.github.io/sionna/phy/api/developers.html#sionna.phy.Object>`_
+All of Sionna PHY's components inherit from the Sionna :class:`~sionna.phy.object.Object`
 class.
 
-A Sionna ``Object`` is instantiated with an optional ``precision`` argument from which it
+A Sionna :class:`~sionna.phy.object.Object` is instantiated with an optional
+:attr:`~sionna.phy.object.Object.precision` argument from which it
 derives complex- and real-valued data types which can be accessed via the
-properties ``cdtype`` and ``rdtype``, respectively:
+properties :attr:`~sionna.phy.object.Object.cdtype` and :attr:`~sionna.phy.object.Object.dtype`, respectively:
 
 .. code-block:: python
 
     from sionna.phy import Object
     obj = Object(precision="single")
     print(obj.cdtype)
-    print(obj.rdtype)
+    print(obj.dtype)
 
-.. code-block:: python
+.. code-block:: console
 
-    <dtype: 'complex64'>
-    <dtype: 'float32'>
+    torch.complex64
+    torch.float32
 
-If the ``precision`` argument is not provided, ``Objects`` use the
-global ``config.precision`` parameter, as shown next:
+If the :attr:`~sionna.phy.object.Object.precision` argument is not provided,
+:class:`~sionna.phy.object.Object` instances use the
+global :attr:`~sionna.phy.config.Config.precision` parameter of the
+:data:`~sionna.phy.config.config` singleton, as shown next:
 
 .. code-block:: python
 
     from sionna.phy import config
     from sionna.phy import Object
-    config.precision = "double" # Set global precision
+    config.precision = "double"  # Set global precision
     obj = Object()
     print(obj.cdtype)
-    print(obj.rdtype)
+    print(obj.dtype)
 
-.. code-block:: python
+.. code-block:: console
 
-    <dtype: 'complex128'>
-    <dtype: 'float64'>
+    torch.complex128
+    torch.float64
 
 Understanding Sionna Blocks
 ---------------------------
 
-Sionna ``Blocks`` inherit from ``Objects`` and are used to implement most of Sionna's components.
+Sionna :class:`~sionna.phy.block.Block`\ s inherit from :class:`~sionna.phy.object.Object` and are used to implement most of Sionna's components.
 To get an understanding of their features, let us implement a simple custom
-``Block``. Every ``Block`` must implement the method ``call`` which can take arbitray
+:class:`~sionna.phy.block.Block`. Every :class:`~sionna.phy.block.Block` must implement the method :meth:`~sionna.phy.block.Block.call` which can take arbitrary
 arguments and keyword arguments. It is important to understand that all tensor arguments
-are cast to the ``Block``'s internal ``precision``. The
+are cast to the :class:`~sionna.phy.block.Block`'s internal :attr:`~sionna.phy.object.Object.precision`. The
 following code snippet demonstrates this behavior:
 
 .. code-block:: python
 
-    import tensorflow as tf
+    import torch
     from sionna.phy import config
     from sionna.phy import Block
     config.precision = "double"
@@ -64,22 +66,25 @@ following code snippet demonstrates this behavior:
                 print(y.dtype)
 
     my_block = MyBlock()
-    x = tf.constant([3], dtype=tf.float32)
-    y = tf.complex(2., 3.)
+    x = torch.tensor([3.], dtype=torch.float32)
+    y = torch.complex(torch.tensor(2.), torch.tensor(3.))
     my_block(x, y)
 
 .. code-block:: console
 
-    <dtype: 'float64'>
-    <dtype: 'complex128'>
+    torch.float64
+    torch.complex128
 
-As the internal precision of all ``Blocks`` was set via the global ``precision``
-flag to double preceision,
+As the internal :attr:`~sionna.phy.object.Object.precision` of all
+:class:`~sionna.phy.block.Block`\ s was set via the global
+:attr:`~sionna.phy.config.Config.precision` flag to double precision,
 the inputs ``x`` and ``y`` were cast to the corresponding dtypes prior to executing
-the Block's ``call`` method. Note that only floating data types are cast, as can be
+the :class:`~sionna.phy.block.Block`'s :meth:`~sionna.phy.block.Block.call` method. Note that only floating data types are cast, as can be
 seen from the following example:
 
 .. code-block:: python
+
+    from sionna.phy import Block
 
     class MyBlock(Block):
         def call(self, x):
@@ -93,19 +98,21 @@ seen from the following example:
     <class 'int'>
 
 The reason for this behavior is that we sometimes need to pass non-tensor
-arguments to a function so that algorithms can be unrolled during the creation
-of the computation graph.
+arguments (e.g. shapes or indices) so that control flow can be traced correctly
+when using :torch:`torch.compile`.
 
-In many cases, a ``Block`` require some initialization that requires the shapes of
-its inputs. The first time a ``Block`` is called, it executes the ``build`` method
-which provides the shapes of all arguments and keyword arguments. The next
+In many cases, a :class:`~sionna.phy.block.Block` requires some initialization that depends on the shapes of
+its inputs. The first time a :class:`~sionna.phy.block.Block` is called, it executes the :meth:`~sionna.phy.block.Block.build` method
+which receives the shapes of all arguments and keyword arguments. The next
 example demonstrates this feature:
 
 .. code-block:: python
 
     import numpy as np
-    import tensorflow as tf
+    import torch
+    from sionna.phy import config
     from sionna.phy import Block
+    config.precision = "double"
 
     class MyBlock(Block):
         def build(self, *args, **kwargs):
@@ -118,16 +125,16 @@ example demonstrates this feature:
             print(self.y_shape)
 
     my_block = MyBlock()
-    my_block(np.array([3, 3]), y=tf.zeros([10, 12]))
+    my_block(np.array([3., 3.]), y=torch.zeros([10, 12]))
 
 .. code-block:: console
 
     (2,)
-    <dtype: 'float64'>
+    torch.float64
     (10, 12)
 
-Note that the argument ``x`` was provided as NumPy array which is
-converted to a TensorFlow tensor within the ``Block``. This is in contrast to the
-example above, where this did not happen for an integer input. For a detailed
-understanding of type conversions within ``Blocks``, we refer to the source code of
-the class method ``Block._convert_to_tensor``.
+Note that the argument ``x`` was provided as a NumPy array which is
+converted to a PyTorch tensor within the :class:`~sionna.phy.block.Block`. This is in contrast to the
+example above, where an integer input was left unchanged. For a detailed
+understanding of type conversions within :class:`~sionna.phy.block.Block`\ s, see the method
+:meth:`~sionna.phy.object.Object._convert` in the :class:`~sionna.phy.object.Object` class.

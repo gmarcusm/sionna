@@ -1,5 +1,5 @@
 ##
-## SPDX-FileCopyrightText: Copyright (c) 2021-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+## SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 ## SPDX-License-Identifier: Apache-2.0
 ##
 
@@ -18,7 +18,7 @@ name: "CodeQL"
 
 on:
   push:
-    branches: [ main, website ]
+    branches: [ main ]
   pull_request:
     # The branches below must be a subset of the branches above
     branches: [ main ]

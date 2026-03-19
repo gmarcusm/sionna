@@ -1,45 +1,52 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+"""Unit tests for sionna.sys.effective_sinr"""
 
-import unittest
 import numpy as np
-import tensorflow as tf
-import os
+import pytest
+import torch
 
-from sionna.phy.mimo import StreamManagement
-from sionna.sys import PHYAbstraction, EESM
 from sionna.phy import config
-from sionna.phy.nr.utils import CodedAWGNChannelNR, MCSDecoderNR, \
-    TransportBlockNR
-from sionna.phy.utils import SplineGriddataInterpolation, sample_bernoulli
+from sionna.sys import EESM
 
 
-class TestEffectiveSINR(unittest.TestCase):
+def get_sinr_eff_numpy(
+    sinr_sel: np.ndarray,
+    beta_sel: float,
+    sinr_eff_min_db: float,
+    sinr_eff_max_db: float,
+) -> float:
+    """Numpy version of effective SINR computation.
 
-    def test_sinr_eff_vs_numpy(self):
-        """ 
-        Check that the effective SINR computation matches its Numpy
-        counterpart 
-        """
+    :param sinr_sel: SINR values
+    :param beta_sel: Beta parameter for EESM
+    :param sinr_eff_min_db: Minimum effective SINR [dB]
+    :param sinr_eff_max_db: Maximum effective SINR [dB]
+    :return: Effective SINR
+    """
+    n_used_res = (sinr_sel > 0).sum()
+    if n_used_res == 0:
+        return 0
+    sinr_exp = np.exp(-sinr_sel / beta_sel)
+    sinr_exp = sinr_exp * (sinr_sel > 0)
+    sinr_eff_numpy = -beta_sel * np.log(np.sum(sinr_exp) / n_used_res)
 
-        def get_sinr_eff_numpy(sinr_sel, beta_sel, sinr_eff_min_db, sinr_eff_max_db):
-            """ Numpy version of effective SINR computation """
-            n_used_res = (sinr_sel > 0).sum()
-            if n_used_res == 0:
-                return 0
-            sinr_exp = np.exp(-sinr_sel / beta_sel)
-            sinr_exp = sinr_exp * (sinr_sel > 0)
-            sinr_eff_numpy = -beta_sel * np.log(np.sum(sinr_exp) / n_used_res)
-            
-            sinr_eff_min = np.power(10, sinr_eff_min_db/10)
-            sinr_eff_max = np.power(10, sinr_eff_max_db/10)
-            if sinr_eff_numpy > sinr_eff_max:
-                sinr_eff_numpy = sinr_eff_max
-            if sinr_eff_numpy<sinr_eff_min:
-                sinr_eff_numpy = sinr_eff_min
-            return sinr_eff_numpy
+    sinr_eff_min = np.power(10, sinr_eff_min_db / 10)
+    sinr_eff_max = np.power(10, sinr_eff_max_db / 10)
+    if sinr_eff_numpy > sinr_eff_max:
+        sinr_eff_numpy = sinr_eff_max
+    if sinr_eff_numpy < sinr_eff_min:
+        sinr_eff_numpy = sinr_eff_min
+    return sinr_eff_numpy
 
+
+class TestEffectiveSINR:
+    """Tests for the EESM effective SINR computation."""
+
+    def test_sinr_eff_vs_numpy(self, device):
+        """Check that the effective SINR computation matches its Numpy counterpart."""
         batch_size = 30
         num_ofdm_symbols = 2
         num_subcarriers = 10
@@ -47,81 +54,120 @@ class TestEffectiveSINR(unittest.TestCase):
         num_streams_per_ut = 3
         sinr_eff_min_db = -40
         sinr_eff_max_db = 40
-        dtype = tf.float64
-        precision = 'double'
+        precision = "double"
+        dtype = torch.float64
 
-        eff_sinr_obj = EESM(sinr_eff_min_db=sinr_eff_min_db,
-                            sinr_eff_max_db=sinr_eff_max_db,
-                            precision=precision)
+        eff_sinr_obj = EESM(
+            sinr_eff_min_db=sinr_eff_min_db,
+            sinr_eff_max_db=sinr_eff_max_db,
+            precision=precision,
+            device=device,
+        )
 
-        @tf.function(jit_compile=False)
-        def effective_sinr_eesm_graph(sinr, mcs_index, mcs_table_index=1, per_stream=False):
-            return eff_sinr_obj(sinr, mcs_index, mcs_table_index=mcs_table_index, per_stream=per_stream)
+        # Generate SINR randomly
+        generator = config.torch_rng(device)
+        sinr = torch.rand(
+            batch_size,
+            num_ofdm_symbols,
+            num_subcarriers,
+            num_ut,
+            num_streams_per_ut,
+            dtype=dtype,
+            device=device,
+            generator=generator,
+        ) * 10
 
-        @tf.function(jit_compile=True, reduce_retracing=True)
-        def effective_sinr_eesm_xla(sinr, mcs_index, mcs_table_index=1, per_stream=False):
-            return eff_sinr_obj(sinr, mcs_index, mcs_table_index=mcs_table_index, per_stream=per_stream)
+        # Mask SINR on some streams
+        mask = torch.randint(
+            0,
+            2,
+            (batch_size, num_ofdm_symbols, num_subcarriers, num_ut, num_streams_per_ut),
+            dtype=torch.int32,
+            device=device,
+            generator=generator,
+        )
+        sinr = sinr * mask.to(dtype)
 
-        effective_sinr_eesm_dict = {'eager': eff_sinr_obj,
-                                    'graph': effective_sinr_eesm_graph,
-                                    'xla': effective_sinr_eesm_xla}
+        # Generate MCS per user
+        mcs = torch.randint(
+            0, 27, (batch_size, num_ut), dtype=torch.int32, device=device, generator=generator
+        )
 
-        for mode, eff_sinr_fun in effective_sinr_eesm_dict.items():
-            print(f'\n{mode}')
+        # Table index
+        table_index = torch.randint(
+            1, 3, (batch_size, num_ut), dtype=torch.int32, device=device, generator=generator
+        )
 
-            # generate SINR randomly
-            sinr = config.tf_rng.uniform([batch_size,
-                                          num_ofdm_symbols,
-                                          num_subcarriers,
-                                          num_ut,
-                                          num_streams_per_ut],
-                                         minval=0,
-                                         maxval=10,
-                                         dtype=dtype)
-            # Mask SINR on some streams
-            sinr = sinr * tf.cast(config.tf_rng.uniform([batch_size,
-                                                         num_ofdm_symbols,
-                                                         num_subcarriers,
-                                                         num_ut,
-                                                         num_streams_per_ut],
-                                                        minval=0,
-                                                        maxval=2,
-                                                        dtype=tf.int32), dtype)
+        for per_stream in [True, False]:
+            # PyTorch version
+            sinr_eff = eff_sinr_obj(
+                sinr, mcs, mcs_table_index=table_index, per_stream=per_stream
+            ).cpu().numpy()
 
-            # Generate MCS per user
-            mcs = config.tf_rng.uniform(
-                [batch_size, num_ut], minval=0, maxval=27, dtype=tf.int32)
+            for batch in range(batch_size):
+                for ut in range(num_ut):
+                    mcs_sel = mcs[batch, ut].item()
+                    table_idx_sel = table_index[batch, ut].item()
+                    beta_sel = eff_sinr_obj.beta_tensor.cpu().numpy()[
+                        table_idx_sel - 1, mcs_sel
+                    ]
 
-            # Table index
-            table_index = config.tf_rng.uniform(
-                [batch_size, num_ut], minval=1, maxval=3, dtype=tf.int32)
-
-            for per_stream in [True, False]:
-                # TF version
-                sinr_eff = eff_sinr_fun(
-                    sinr, mcs, mcs_table_index=table_index, per_stream=per_stream).numpy()
-
-                for batch in range(batch_size):
-                    for ut in range(num_ut):
-                        mcs_sel = mcs[batch, ut]
-                        table_idx_sel = table_index[batch, ut]
-                        beta_sel = eff_sinr_obj.beta_tensor.numpy()[
-                            table_idx_sel-1, mcs_sel]
-
-                        if per_stream:
-                            for stream in range(num_streams_per_ut):
-                                sinr_sel = sinr[batch, :, :, ut, stream].numpy()
-                                # Numpy version
-                                sinr_eff_numpy = get_sinr_eff_numpy(
-                                    sinr_sel, beta_sel, sinr_eff_min_db, sinr_eff_max_db)
-
-                                self.assertAlmostEqual(
-                                    sinr_eff[batch, ut, stream], sinr_eff_numpy, delta=1e-5)
-                        else:
-                            sinr_sel = sinr[batch, :, :, ut, :].numpy()
+                    if per_stream:
+                        for stream in range(num_streams_per_ut):
+                            sinr_sel = sinr[batch, :, :, ut, stream].cpu().numpy()
                             # Numpy version
                             sinr_eff_numpy = get_sinr_eff_numpy(
-                                sinr_sel, beta_sel, sinr_eff_min_db, sinr_eff_max_db)
+                                sinr_sel, beta_sel, sinr_eff_min_db, sinr_eff_max_db
+                            )
+                            assert abs(sinr_eff[batch, ut, stream] - sinr_eff_numpy) < 1e-5, (
+                                f"Mismatch at batch={batch}, ut={ut}, stream={stream}"
+                            )
+                    else:
+                        sinr_sel = sinr[batch, :, :, ut, :].cpu().numpy()
+                        # Numpy version
+                        sinr_eff_numpy = get_sinr_eff_numpy(
+                            sinr_sel, beta_sel, sinr_eff_min_db, sinr_eff_max_db
+                        )
+                        assert abs(sinr_eff[batch, ut] - sinr_eff_numpy) < 1e-5, (
+                            f"Mismatch at batch={batch}, ut={ut}"
+                        )
 
-                            self.assertAlmostEqual(
-                                sinr_eff[batch, ut], sinr_eff_numpy, delta=1e-5)
+    @pytest.mark.parametrize("mode", ["default", "reduce-overhead"])
+    def test_compiled(self, device, mode):
+        """Test that EESM works with torch.compile."""
+        if device == "cpu" and mode == "reduce-overhead":
+            pytest.skip("reduce-overhead mode not well supported on CPU")
+
+        batch_size = 4
+        num_ofdm_symbols = 2
+        num_subcarriers = 10
+        num_ut = 8
+        num_streams_per_ut = 2
+        precision = "single"
+        dtype = torch.float32
+
+        eff_sinr_obj = EESM(precision=precision, device=device)
+
+        # Compile the call method
+        if mode != "default":
+            compiled_call = torch.compile(eff_sinr_obj.call, mode=mode)
+        else:
+            compiled_call = eff_sinr_obj.call
+
+        # Generate inputs
+        sinr = torch.rand(
+            batch_size,
+            num_ofdm_symbols,
+            num_subcarriers,
+            num_ut,
+            num_streams_per_ut,
+            dtype=dtype,
+            device=device,
+        ) * 10
+        mcs = torch.randint(0, 27, (batch_size, num_ut), dtype=torch.int32, device=device)
+
+        # Run compiled version
+        sinr_eff = compiled_call(sinr, mcs, mcs_table_index=1, per_stream=False)
+
+        # Basic shape check
+        assert sinr_eff.shape == (batch_size, num_ut)

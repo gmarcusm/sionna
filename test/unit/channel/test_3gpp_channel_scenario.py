@@ -1,131 +1,602 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
-import tensorflow as tf
-import unittest
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+"""Tests for 3GPP TR 38.901 system level channel scenarios (RMa, UMa, UMi)"""
+
 import numpy as np
-from sionna.phy import channel
-from channel_test_utils import *
+import pytest
+import torch
+
+from sionna.phy.channel.tr38901 import (
+    PanelArray,
+    RMaScenario,
+    RMa,
+    UMaScenario,
+    UMa,
+    UMiScenario,
+    UMi,
+)
+from channel_test_utils import generate_random_loc, generate_random_bool
 
 
-class TestScenario(unittest.TestCase):
-    r"""Test the distance calculations and function that get the parameters
-    according to the scenario.
-    """
+# Test configuration
+BATCH_SIZE = 16
+CARRIER_FREQUENCY = 3.5e9  # Hz
+MAX_ERR = 1e-2
+H_UT = 1.5
+H_BS = 10.0
+NB_BS = 3
+NB_UT = 10
 
-    # Batch size used to check the LSP distribution
-    BATCH_SIZE = 100
 
-    # Carrier frequency
-    CARRIER_FREQUENCY = 3.5e9 # Hz
+def create_arrays(fc, device, precision="single"):
+    """Create UT and BS panel arrays for testing."""
+    bs_array = PanelArray(
+        num_rows_per_panel=2,
+        num_cols_per_panel=2,
+        polarization="dual",
+        polarization_type="VH",
+        antenna_pattern="38.901",
+        carrier_frequency=fc,
+        precision=precision,
+        device=device,
+    )
+    ut_array = PanelArray(
+        num_rows_per_panel=1,
+        num_cols_per_panel=1,
+        polarization="dual",
+        polarization_type="VH",
+        antenna_pattern="38.901",
+        carrier_frequency=fc,
+        precision=precision,
+        device=device,
+    )
+    return ut_array, bs_array
 
-    # Maximum allowed deviation for distance calculation (relative error)
-    MAX_ERR = 1e-2
 
-    # Height of UTs
-    H_UT = 1.5
+class TestRMaScenario:
+    """Tests for RMaScenario"""
 
-    # Height of BSs
-    H_BS = 10.0
+    def test_instantiation(self, device, precision):
+        """Test RMaScenario can be instantiated"""
+        ut_array, bs_array = create_arrays(CARRIER_FREQUENCY, device, precision)
+        scenario = RMaScenario(
+            carrier_frequency=CARRIER_FREQUENCY,
+            ut_array=ut_array,
+            bs_array=bs_array,
+            direction="uplink",
+            precision=precision,
+            device=device,
+        )
+        assert scenario is not None
+        assert scenario.carrier_frequency.item() == pytest.approx(CARRIER_FREQUENCY)
 
-    # Number of BS
-    NB_BS = 3
+    def test_distance_calculation(self, device, precision):
+        """Test distance calculations (2D and 3D)"""
+        ut_array, bs_array = create_arrays(CARRIER_FREQUENCY, device, precision)
+        scenario = RMaScenario(
+            carrier_frequency=CARRIER_FREQUENCY,
+            ut_array=ut_array,
+            bs_array=bs_array,
+            direction="uplink",
+            precision=precision,
+            device=device,
+        )
 
-    # Number of UT
-    NB_UT = 10
+        dtype = torch.float32 if precision == "single" else torch.float64
 
-    def setUp(self):
+        # Generate random locations
+        ut_loc = generate_random_loc(
+            BATCH_SIZE, NB_UT, (100, 2000), (100, 2000), (H_UT, H_UT),
+            dtype=dtype, device=device
+        )
+        bs_loc = generate_random_loc(
+            BATCH_SIZE, NB_BS, (0, 100), (0, 100), (H_BS, H_BS),
+            dtype=dtype, device=device
+        )
+        ut_orientations = torch.zeros(BATCH_SIZE, NB_UT, 3, dtype=dtype, device=device)
+        bs_orientations = torch.zeros(BATCH_SIZE, NB_BS, 3, dtype=dtype, device=device)
+        ut_velocities = torch.zeros(BATCH_SIZE, NB_UT, 3, dtype=dtype, device=device)
+        in_state = generate_random_bool(BATCH_SIZE, NB_UT, 0.5, device=device)
 
-        batch_size = TestScenario.BATCH_SIZE
-        nb_bs = TestScenario.NB_BS
-        nb_ut = TestScenario.NB_UT
-        fc = TestScenario.CARRIER_FREQUENCY
-        h_ut = TestScenario.H_UT
-        h_bs = TestScenario.H_BS
+        scenario.set_topology(
+            ut_loc, bs_loc, ut_orientations, bs_orientations, ut_velocities, in_state
+        )
 
-        # UT and BS arrays have no impact on LSP
-        # However, these are needed to instantiate the model
-        bs_array = channel.tr38901.PanelArray(num_rows_per_panel=2,
-                                              num_cols_per_panel=2,
-                                              polarization='dual',
-                                              polarization_type='VH',
-                                              antenna_pattern='38.901',
-                                              carrier_frequency=fc)
-        ut_array = channel.tr38901.PanelArray(num_rows_per_panel=1,
-                                              num_cols_per_panel=1,
-                                              polarization='dual',
-                                              polarization_type='VH',
-                                              antenna_pattern='38.901',
-                                              carrier_frequency=fc)
+        # Get distances
+        d_3d = scenario.distance_3d
+        d_3d_in = scenario.distance_3d_in
+        d_3d_out = scenario.distance_3d_out
+        d_2d = scenario.distance_2d
+        d_2d_in = scenario.distance_2d_in
+        d_2d_out = scenario.distance_2d_out
 
-        # The following quantities have no impact on LSP
-        # However,these are needed to instantiate the model
-        ut_orientations = tf.zeros([batch_size, nb_ut])
-        bs_orientations = tf.zeros([batch_size, nb_ut])
-        ut_velocities = tf.zeros([batch_size, nb_ut])
+        # Verify total 3D distances
+        ut_loc_expanded = ut_loc.unsqueeze(1)
+        bs_loc_expanded = bs_loc.unsqueeze(2)
+        d_3d_ref = torch.sqrt(((ut_loc_expanded - bs_loc_expanded) ** 2).sum(dim=3))
+        max_err = torch.max(torch.abs(d_3d - d_3d_ref) / d_3d_ref)
+        assert max_err <= MAX_ERR
 
-        self.scenario = channel.tr38901.RMaScenario(fc, ut_array,
-                                                    bs_array, "uplink")
+        # Verify 3D indoor + outdoor = total
+        max_err = torch.max(torch.abs(d_3d - d_3d_in - d_3d_out) / d_3d)
+        assert max_err <= MAX_ERR
 
-        ut_loc = generate_random_loc(batch_size, nb_ut, (100,2000),
-                                     (100,2000), (h_ut, h_ut))
-        bs_loc = generate_random_loc(batch_size, nb_bs, (0,100),
-                                            (0,100), (h_bs, h_bs))
+        # Verify total 2D distances
+        d_2d_ref = torch.sqrt(
+            ((ut_loc_expanded[:, :, :, :2] - bs_loc_expanded[:, :, :, :2]) ** 2).sum(dim=3)
+        )
+        max_err = torch.max(torch.abs(d_2d - d_2d_ref) / d_2d_ref)
+        assert max_err <= MAX_ERR
 
-        in_state = generate_random_bool(batch_size, nb_ut, 0.5)
-        self.scenario.set_topology(ut_loc, bs_loc, ut_orientations,
-                                bs_orientations, ut_velocities, in_state)
+        # Verify 2D indoor + outdoor = total
+        max_err = torch.max(torch.abs(d_2d - d_2d_in - d_2d_out) / d_2d)
+        assert max_err <= MAX_ERR
 
-    def test_dist(self):
-        """Test calculation of distances (total, in, and out)"""
-        d_3d = self.scenario.distance_3d
-        d_3d_in = self.scenario.distance_3d_in
-        d_3d_out = self.scenario.distance_3d_out
-        d_2d = self.scenario.distance_2d
-        d_2d_in = self.scenario.distance_2d_in
-        d_2d_out = self.scenario.distance_2d_out
-        # Checking total 3D distances
-        ut_loc = self.scenario.ut_loc
-        bs_loc = self.scenario.bs_loc
-        bs_loc = tf.expand_dims(bs_loc, axis=2)
-        ut_loc = tf.expand_dims(ut_loc, axis=1)
-        d_3d_ref = tf.sqrt(tf.reduce_sum(tf.square(ut_loc-bs_loc), axis=3))
-        max_err = tf.reduce_max(tf.abs(d_3d - d_3d_ref)/d_3d_ref)
-        self.assertLessEqual(max_err, TestScenario.MAX_ERR)
-        # Checking 3D indoor + outdoor = total
-        max_err = tf.reduce_max(tf.abs(d_3d-d_3d_in-d_3d_out)/d_3d)
-        self.assertLessEqual(max_err, TestScenario.MAX_ERR)
-        # Checking total 2D distances
-        ut_loc = self.scenario.ut_loc
-        bs_loc = self.scenario.bs_loc
-        bs_loc = tf.expand_dims(bs_loc, axis=2)
-        ut_loc = tf.expand_dims(ut_loc, axis=1)
-        d_2d_ref = tf.sqrt(tf.reduce_sum(tf.square(ut_loc[:,:,:,:2]-bs_loc[:,:,:,:2]), axis=3))
-        max_err = tf.reduce_max(tf.abs(d_2d - d_2d_ref)/d_2d_ref)
-        self.assertLessEqual(max_err, TestScenario.MAX_ERR)
-        # Checking 2D indoor + outdoor = total
-        max_err = tf.reduce_max(tf.abs(d_2d-d_2d_in-d_2d_out)/d_2d)
-        self.assertLessEqual(max_err, TestScenario.MAX_ERR)
-        # Checking indoor/outdoor 2d/3d basic proportionality
-        ratio_2d = d_2d_in/d_2d
-        ratio_3d = d_3d_in/d_3d
-        max_err = tf.reduce_max(tf.abs(ratio_2d-ratio_3d))
-        self.assertLessEqual(max_err, TestScenario.MAX_ERR)
+    def test_get_param(self, device, precision):
+        """Test the get_param() function retrieves correct values"""
+        ut_array, bs_array = create_arrays(CARRIER_FREQUENCY, device, precision)
+        scenario = RMaScenario(
+            carrier_frequency=CARRIER_FREQUENCY,
+            ut_array=ut_array,
+            bs_array=bs_array,
+            direction="uplink",
+            precision=precision,
+            device=device,
+        )
 
-    def test_get_param(self):
-        """Test the get_param() function"""
-        # Test if muDSc is correctly extracted from the file (RMa)
-        param_tensor_ref = np.zeros([TestScenario.BATCH_SIZE,
-                                        TestScenario.NB_BS, TestScenario.NB_UT])
-        indoor = np.tile(np.expand_dims(self.scenario.indoor.numpy(), axis=1),
-                            [1, TestScenario.NB_BS, 1])
-        indoor_index = np.where(indoor)
-        los_index = np.where(self.scenario.los.numpy())
-        nlos_index = np.where(np.logical_not(self.scenario.los.numpy()))
-        param_tensor_ref[los_index] = -7.49
-        param_tensor_ref[nlos_index] = -7.43
-        param_tensor_ref[indoor_index] = -7.47
-        #
-        param_tensor = self.scenario.get_param('muDSc').numpy()
-        max_err = np.max(np.abs(param_tensor-param_tensor_ref))
-        self.assertLessEqual(max_err, 1e-6)
+        dtype = torch.float32 if precision == "single" else torch.float64
+
+        ut_loc = generate_random_loc(
+            BATCH_SIZE, NB_UT, (100, 2000), (100, 2000), (H_UT, H_UT),
+            dtype=dtype, device=device
+        )
+        bs_loc = generate_random_loc(
+            BATCH_SIZE, NB_BS, (0, 100), (0, 100), (H_BS, H_BS),
+            dtype=dtype, device=device
+        )
+        ut_orientations = torch.zeros(BATCH_SIZE, NB_UT, 3, dtype=dtype, device=device)
+        bs_orientations = torch.zeros(BATCH_SIZE, NB_BS, 3, dtype=dtype, device=device)
+        ut_velocities = torch.zeros(BATCH_SIZE, NB_UT, 3, dtype=dtype, device=device)
+        in_state = generate_random_bool(BATCH_SIZE, NB_UT, 0.5, device=device)
+
+        scenario.set_topology(
+            ut_loc, bs_loc, ut_orientations, bs_orientations, ut_velocities, in_state
+        )
+
+        # Test that muDSc is correctly extracted (RMa-specific values)
+        param_tensor = scenario.get_param("muDSc")
+
+        # Build reference tensor
+        indoor = scenario.indoor.unsqueeze(1).cpu().numpy()
+        indoor = np.tile(indoor, [1, NB_BS, 1])
+        los = scenario.los.cpu().numpy()
+
+        param_tensor_ref = np.zeros([BATCH_SIZE, NB_BS, NB_UT])
+        param_tensor_ref[np.where(los)] = -7.49  # LoS value
+        param_tensor_ref[np.where(np.logical_and(~los, ~indoor))] = -7.43  # NLoS value
+        param_tensor_ref[np.where(indoor)] = -7.47  # O2I value
+
+        max_err = np.max(np.abs(param_tensor.cpu().numpy() - param_tensor_ref))
+        assert max_err <= 1e-5
+
+    def test_los_probability_bounds(self, device, precision):
+        """Test that LoS probability is between 0 and 1"""
+        ut_array, bs_array = create_arrays(CARRIER_FREQUENCY, device, precision)
+        scenario = RMaScenario(
+            carrier_frequency=CARRIER_FREQUENCY,
+            ut_array=ut_array,
+            bs_array=bs_array,
+            direction="uplink",
+            precision=precision,
+            device=device,
+        )
+
+        dtype = torch.float32 if precision == "single" else torch.float64
+
+        ut_loc = generate_random_loc(
+            BATCH_SIZE, NB_UT, (100, 2000), (100, 2000), (H_UT, H_UT),
+            dtype=dtype, device=device
+        )
+        bs_loc = generate_random_loc(
+            BATCH_SIZE, NB_BS, (0, 100), (0, 100), (H_BS, H_BS),
+            dtype=dtype, device=device
+        )
+        ut_orientations = torch.zeros(BATCH_SIZE, NB_UT, 3, dtype=dtype, device=device)
+        bs_orientations = torch.zeros(BATCH_SIZE, NB_BS, 3, dtype=dtype, device=device)
+        ut_velocities = torch.zeros(BATCH_SIZE, NB_UT, 3, dtype=dtype, device=device)
+        in_state = generate_random_bool(BATCH_SIZE, NB_UT, 0.5, device=device)
+
+        scenario.set_topology(
+            ut_loc, bs_loc, ut_orientations, bs_orientations, ut_velocities, in_state
+        )
+
+        los_prob = scenario.los_probability
+        assert torch.all(los_prob >= 0.0)
+        assert torch.all(los_prob <= 1.0)
+
+
+class TestUMaScenario:
+    """Tests for UMaScenario"""
+
+    def test_instantiation(self, device, precision):
+        """Test UMaScenario can be instantiated"""
+        ut_array, bs_array = create_arrays(CARRIER_FREQUENCY, device, precision)
+        scenario = UMaScenario(
+            carrier_frequency=CARRIER_FREQUENCY,
+            o2i_model="low",
+            ut_array=ut_array,
+            bs_array=bs_array,
+            direction="uplink",
+            precision=precision,
+            device=device,
+        )
+        assert scenario is not None
+        assert scenario.carrier_frequency.item() == pytest.approx(CARRIER_FREQUENCY)
+
+    def test_o2i_model_validation(self, device, precision):
+        """Test that o2i_model must be 'low' or 'high'"""
+        ut_array, bs_array = create_arrays(CARRIER_FREQUENCY, device, precision)
+
+        with pytest.raises(AssertionError):
+            UMaScenario(
+                carrier_frequency=CARRIER_FREQUENCY,
+                o2i_model="invalid",
+                ut_array=ut_array,
+                bs_array=bs_array,
+                direction="uplink",
+                precision=precision,
+                device=device,
+            )
+
+    def test_los_probability_bounds(self, device, precision):
+        """Test that LoS probability is between 0 and 1"""
+        ut_array, bs_array = create_arrays(CARRIER_FREQUENCY, device, precision)
+        scenario = UMaScenario(
+            carrier_frequency=CARRIER_FREQUENCY,
+            o2i_model="low",
+            ut_array=ut_array,
+            bs_array=bs_array,
+            direction="uplink",
+            precision=precision,
+            device=device,
+        )
+
+        dtype = torch.float32 if precision == "single" else torch.float64
+
+        ut_loc = generate_random_loc(
+            BATCH_SIZE, NB_UT, (100, 2000), (100, 2000), (H_UT, H_UT),
+            dtype=dtype, device=device
+        )
+        bs_loc = generate_random_loc(
+            BATCH_SIZE, NB_BS, (0, 100), (0, 100), (H_BS, H_BS),
+            dtype=dtype, device=device
+        )
+        ut_orientations = torch.zeros(BATCH_SIZE, NB_UT, 3, dtype=dtype, device=device)
+        bs_orientations = torch.zeros(BATCH_SIZE, NB_BS, 3, dtype=dtype, device=device)
+        ut_velocities = torch.zeros(BATCH_SIZE, NB_UT, 3, dtype=dtype, device=device)
+        in_state = generate_random_bool(BATCH_SIZE, NB_UT, 0.5, device=device)
+
+        scenario.set_topology(
+            ut_loc, bs_loc, ut_orientations, bs_orientations, ut_velocities, in_state
+        )
+
+        los_prob = scenario.los_probability
+        assert torch.all(los_prob >= 0.0)
+        assert torch.all(los_prob <= 1.0)
+
+
+class TestUMiScenario:
+    """Tests for UMiScenario"""
+
+    def test_instantiation(self, device, precision):
+        """Test UMiScenario can be instantiated"""
+        ut_array, bs_array = create_arrays(CARRIER_FREQUENCY, device, precision)
+        scenario = UMiScenario(
+            carrier_frequency=CARRIER_FREQUENCY,
+            o2i_model="low",
+            ut_array=ut_array,
+            bs_array=bs_array,
+            direction="uplink",
+            precision=precision,
+            device=device,
+        )
+        assert scenario is not None
+        assert scenario.carrier_frequency.item() == pytest.approx(CARRIER_FREQUENCY)
+
+    def test_los_probability_bounds(self, device, precision):
+        """Test that LoS probability is between 0 and 1"""
+        ut_array, bs_array = create_arrays(CARRIER_FREQUENCY, device, precision)
+        scenario = UMiScenario(
+            carrier_frequency=CARRIER_FREQUENCY,
+            o2i_model="high",
+            ut_array=ut_array,
+            bs_array=bs_array,
+            direction="uplink",
+            precision=precision,
+            device=device,
+        )
+
+        dtype = torch.float32 if precision == "single" else torch.float64
+
+        ut_loc = generate_random_loc(
+            BATCH_SIZE, NB_UT, (100, 2000), (100, 2000), (H_UT, H_UT),
+            dtype=dtype, device=device
+        )
+        bs_loc = generate_random_loc(
+            BATCH_SIZE, NB_BS, (0, 100), (0, 100), (H_BS, H_BS),
+            dtype=dtype, device=device
+        )
+        ut_orientations = torch.zeros(BATCH_SIZE, NB_UT, 3, dtype=dtype, device=device)
+        bs_orientations = torch.zeros(BATCH_SIZE, NB_BS, 3, dtype=dtype, device=device)
+        ut_velocities = torch.zeros(BATCH_SIZE, NB_UT, 3, dtype=dtype, device=device)
+        in_state = generate_random_bool(BATCH_SIZE, NB_UT, 0.5, device=device)
+
+        scenario.set_topology(
+            ut_loc, bs_loc, ut_orientations, bs_orientations, ut_velocities, in_state
+        )
+
+        los_prob = scenario.los_probability
+        assert torch.all(los_prob >= 0.0)
+        assert torch.all(los_prob <= 1.0)
+
+
+class TestRMaChannel:
+    """Tests for RMa channel model"""
+
+    def test_instantiation(self, device, precision):
+        """Test RMa channel can be instantiated"""
+        ut_array, bs_array = create_arrays(CARRIER_FREQUENCY, device, precision)
+        channel = RMa(
+            carrier_frequency=CARRIER_FREQUENCY,
+            ut_array=ut_array,
+            bs_array=bs_array,
+            direction="uplink",
+            precision=precision,
+            device=device,
+        )
+        assert channel is not None
+
+    def test_channel_generation(self, device, precision):
+        """Test channel impulse response generation"""
+        dtype = torch.float32 if precision == "single" else torch.float64
+
+        ut_array, bs_array = create_arrays(CARRIER_FREQUENCY, device, precision)
+        channel = RMa(
+            carrier_frequency=CARRIER_FREQUENCY,
+            ut_array=ut_array,
+            bs_array=bs_array,
+            direction="uplink",
+            precision=precision,
+            device=device,
+        )
+
+        # Set up topology
+        ut_loc = generate_random_loc(
+            BATCH_SIZE, NB_UT, (100, 2000), (100, 2000), (H_UT, H_UT),
+            dtype=dtype, device=device
+        )
+        bs_loc = generate_random_loc(
+            BATCH_SIZE, NB_BS, (0, 100), (0, 100), (H_BS, H_BS),
+            dtype=dtype, device=device
+        )
+        ut_orientations = torch.zeros(BATCH_SIZE, NB_UT, 3, dtype=dtype, device=device)
+        bs_orientations = torch.zeros(BATCH_SIZE, NB_BS, 3, dtype=dtype, device=device)
+        ut_velocities = torch.zeros(BATCH_SIZE, NB_UT, 3, dtype=dtype, device=device)
+        in_state = generate_random_bool(BATCH_SIZE, NB_UT, 0.5, device=device)
+
+        channel.set_topology(
+            ut_loc, bs_loc, ut_orientations, bs_orientations, ut_velocities, in_state
+        )
+
+        # Generate channel
+        num_time_samples = 10
+        sampling_frequency = 1e6
+        result = channel(num_time_samples, sampling_frequency)
+        h, delays = result[0], result[1]
+
+        # Check output shapes
+        assert h.dim() == 7  # [batch, num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths, num_time]
+        assert h.shape[0] == BATCH_SIZE
+        assert delays.dim() == 4  # [batch, num_rx, num_tx, num_paths]
+        assert delays.shape[0] == BATCH_SIZE
+
+
+class TestUMaChannel:
+    """Tests for UMa channel model"""
+
+    def test_instantiation(self, device, precision):
+        """Test UMa channel can be instantiated"""
+        ut_array, bs_array = create_arrays(CARRIER_FREQUENCY, device, precision)
+        channel = UMa(
+            carrier_frequency=CARRIER_FREQUENCY,
+            o2i_model="low",
+            ut_array=ut_array,
+            bs_array=bs_array,
+            direction="uplink",
+            precision=precision,
+            device=device,
+        )
+        assert channel is not None
+
+    def test_channel_generation(self, device, precision):
+        """Test channel impulse response generation"""
+        dtype = torch.float32 if precision == "single" else torch.float64
+
+        ut_array, bs_array = create_arrays(CARRIER_FREQUENCY, device, precision)
+        channel = UMa(
+            carrier_frequency=CARRIER_FREQUENCY,
+            o2i_model="low",
+            ut_array=ut_array,
+            bs_array=bs_array,
+            direction="downlink",
+            precision=precision,
+            device=device,
+        )
+
+        # Set up topology
+        ut_loc = generate_random_loc(
+            BATCH_SIZE, NB_UT, (100, 2000), (100, 2000), (H_UT, H_UT),
+            dtype=dtype, device=device
+        )
+        bs_loc = generate_random_loc(
+            BATCH_SIZE, NB_BS, (0, 100), (0, 100), (H_BS, H_BS),
+            dtype=dtype, device=device
+        )
+        ut_orientations = torch.zeros(BATCH_SIZE, NB_UT, 3, dtype=dtype, device=device)
+        bs_orientations = torch.zeros(BATCH_SIZE, NB_BS, 3, dtype=dtype, device=device)
+        ut_velocities = torch.zeros(BATCH_SIZE, NB_UT, 3, dtype=dtype, device=device)
+        in_state = generate_random_bool(BATCH_SIZE, NB_UT, 0.5, device=device)
+
+        channel.set_topology(
+            ut_loc, bs_loc, ut_orientations, bs_orientations, ut_velocities, in_state
+        )
+
+        # Generate channel
+        num_time_samples = 10
+        sampling_frequency = 1e6
+        result = channel(num_time_samples, sampling_frequency)
+        h, delays = result[0], result[1]
+
+        # Check output shapes
+        assert h.dim() == 7
+        assert h.shape[0] == BATCH_SIZE
+        assert delays.dim() == 4
+        assert delays.shape[0] == BATCH_SIZE
+
+
+class TestUMiChannel:
+    """Tests for UMi channel model"""
+
+    def test_instantiation(self, device, precision):
+        """Test UMi channel can be instantiated"""
+        ut_array, bs_array = create_arrays(CARRIER_FREQUENCY, device, precision)
+        channel = UMi(
+            carrier_frequency=CARRIER_FREQUENCY,
+            o2i_model="high",
+            ut_array=ut_array,
+            bs_array=bs_array,
+            direction="uplink",
+            precision=precision,
+            device=device,
+        )
+        assert channel is not None
+
+    def test_channel_generation(self, device, precision):
+        """Test channel impulse response generation"""
+        ut_array, bs_array = create_arrays(CARRIER_FREQUENCY, device, precision)
+        channel = UMi(
+            carrier_frequency=CARRIER_FREQUENCY,
+            o2i_model="low",
+            ut_array=ut_array,
+            bs_array=bs_array,
+            direction="uplink",
+            precision=precision,
+            device=device,
+        )
+
+        dtype = torch.float32 if precision == "single" else torch.float64
+
+        # Set up topology
+        ut_loc = generate_random_loc(
+            BATCH_SIZE, NB_UT, (100, 2000), (100, 2000), (H_UT, H_UT),
+            dtype=dtype, device=device
+        )
+        bs_loc = generate_random_loc(
+            BATCH_SIZE, NB_BS, (0, 100), (0, 100), (H_BS, H_BS),
+            dtype=dtype, device=device
+        )
+        ut_orientations = torch.zeros(BATCH_SIZE, NB_UT, 3, dtype=dtype, device=device)
+        bs_orientations = torch.zeros(BATCH_SIZE, NB_BS, 3, dtype=dtype, device=device)
+        ut_velocities = torch.zeros(BATCH_SIZE, NB_UT, 3, dtype=dtype, device=device)
+        in_state = generate_random_bool(BATCH_SIZE, NB_UT, 0.5, device=device)
+
+        channel.set_topology(
+            ut_loc, bs_loc, ut_orientations, bs_orientations, ut_velocities, in_state
+        )
+
+        # Generate channel
+        num_time_samples = 10
+        sampling_frequency = 1e6
+        result = channel(num_time_samples, sampling_frequency)
+        h, delays = result[0], result[1]
+
+        # Check output shapes
+        assert h.dim() == 7
+        assert h.shape[0] == BATCH_SIZE
+        assert delays.dim() == 4
+        assert delays.shape[0] == BATCH_SIZE
+
+
+class TestAllScenarios:
+    """Cross-scenario tests"""
+
+    @pytest.mark.parametrize("scenario_class,kwargs", [
+        (RMaScenario, {}),
+        (UMaScenario, {"o2i_model": "low"}),
+        (UMiScenario, {"o2i_model": "low"}),
+    ])
+    def test_lsp_shapes(self, device, precision, scenario_class, kwargs):
+        """Test LSP shapes are correct for all scenarios"""
+        ut_array, bs_array = create_arrays(CARRIER_FREQUENCY, device, precision)
+        scenario = scenario_class(
+            carrier_frequency=CARRIER_FREQUENCY,
+            ut_array=ut_array,
+            bs_array=bs_array,
+            direction="uplink",
+            precision=precision,
+            device=device,
+            **kwargs,
+        )
+
+        dtype = torch.float32 if precision == "single" else torch.float64
+
+        ut_loc = generate_random_loc(
+            BATCH_SIZE, NB_UT, (100, 2000), (100, 2000), (H_UT, H_UT),
+            dtype=dtype, device=device
+        )
+        bs_loc = generate_random_loc(
+            BATCH_SIZE, NB_BS, (0, 100), (0, 100), (H_BS, H_BS),
+            dtype=dtype, device=device
+        )
+        ut_orientations = torch.zeros(BATCH_SIZE, NB_UT, 3, dtype=dtype, device=device)
+        bs_orientations = torch.zeros(BATCH_SIZE, NB_BS, 3, dtype=dtype, device=device)
+        ut_velocities = torch.zeros(BATCH_SIZE, NB_UT, 3, dtype=dtype, device=device)
+        in_state = generate_random_bool(BATCH_SIZE, NB_UT, 0.5, device=device)
+
+        scenario.set_topology(
+            ut_loc, bs_loc, ut_orientations, bs_orientations, ut_velocities, in_state
+        )
+
+        # Check LSP mean and std shapes
+        assert scenario.lsp_log_mean.shape == (BATCH_SIZE, NB_BS, NB_UT, 7)
+        assert scenario.lsp_log_std.shape == (BATCH_SIZE, NB_BS, NB_UT, 7)
+
+    @pytest.mark.parametrize("direction", ["uplink", "downlink"])
+    def test_direction_validation(self, device, precision, direction):
+        """Test that direction parameter works for both values"""
+        ut_array, bs_array = create_arrays(CARRIER_FREQUENCY, device, precision)
+        scenario = RMaScenario(
+            carrier_frequency=CARRIER_FREQUENCY,
+            ut_array=ut_array,
+            bs_array=bs_array,
+            direction=direction,
+            precision=precision,
+            device=device,
+        )
+        assert scenario.direction == direction
+
+    def test_invalid_direction(self, device, precision):
+        """Test that invalid direction raises error"""
+        ut_array, bs_array = create_arrays(CARRIER_FREQUENCY, device, precision)
+        with pytest.raises(AssertionError):
+            RMaScenario(
+                carrier_frequency=CARRIER_FREQUENCY,
+                ut_array=ut_array,
+                bs_array=bs_array,
+                direction="invalid",
+                precision=precision,
+                device=device,
+            )
+

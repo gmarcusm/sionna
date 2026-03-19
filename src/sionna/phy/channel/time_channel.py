@@ -1,13 +1,20 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
 """Layer for implementing the channel in the time domain"""
 
-import tensorflow as tf
+from typing import Optional, Tuple, Union
+
+import torch
 
 from sionna.phy import Block
-from . import GenerateTimeChannel, ApplyTimeChannel
-from .utils import time_lag_discrete_time_channel
+from sionna.phy.channel.generate_time_channel import GenerateTimeChannel
+from sionna.phy.channel.apply_time_channel import ApplyTimeChannel
+from sionna.phy.channel.utils import time_lag_discrete_time_channel
+
+__all__ = ["TimeChannel"]
+
 
 class TimeChannel(Block):
     # pylint: disable=line-too-long
@@ -16,7 +23,7 @@ class TimeChannel(Block):
 
     The channel output consists of ``num_time_samples`` + ``l_max`` - ``l_min``
     time samples, as it is the result of filtering the channel input of length
-    ``num_time_samples`` with the time-variant channel filter  of length
+    ``num_time_samples`` with the time-variant channel filter of length
     ``l_max`` - ``l_min`` + 1. In the case of a single-input single-output link and given a sequence of channel
     inputs :math:`x_0,\cdots,x_{N_B}`, where :math:`N_B` is ``num_time_samples``, this
     layer outputs
@@ -44,54 +51,33 @@ class TimeChannel(Block):
 
     For multiple-input multiple-output (MIMO) links, the channel output is computed for each antenna of each receiver and by summing over all the antennas of all transmitters.
 
-    Parameters
-    ----------
-    channel_model : :class:`~sionna.phy.channel.ChannelModel`
-        Used channel model
-
-    bandwidth : `float`
-        Bandwidth (:math:`W`) [Hz]
-
-    num_time_samples : `int`
-        Number of time samples forming the channel input (:math:`N_B`)
-
-    maximum_delay_spread : `float`, (default 3e-6)
-        Maximum delay spread [s].
-        Used to compute the default value of ``l_max`` if ``l_max`` is set to
-        `None`. If a value is given for ``l_max``, this parameter is not used.
-        It defaults to 3us, which was found
-        to be large enough to include most significant paths with all channel
-        models included in Sionna assuming a nominal delay spread of 100ns.
-
-    l_min : `None` (default) | `int`
-        Smallest time-lag for the discrete complex baseband channel (:math:`L_{\text{min}}`).
+    :param channel_model: Used channel model
+    :param bandwidth: Bandwidth (:math:`W`) [Hz]
+    :param num_time_samples: Number of time samples forming the channel input (:math:`N_B`)
+    :param maximum_delay_spread: Maximum delay spread [s]. Used to compute the default value of
+        ``l_max`` if ``l_max`` is set to `None`. If a value is given for ``l_max``, this parameter
+        is not used. Defaults to 3e-6, which was found to be large enough to include most
+        significant paths with all channel models included in Sionna assuming a nominal delay
+        spread of 100ns.
+    :param l_min: Smallest time-lag for the discrete complex baseband channel (:math:`L_{\text{min}}`).
         If set to `None`, defaults to the value given by :func:`time_lag_discrete_time_channel`.
-
-    l_max : `None` (default) | `int`
-        Largest time-lag for the discrete complex baseband channel (:math:`L_{\text{max}}`).
+    :param l_max: Largest time-lag for the discrete complex baseband channel (:math:`L_{\text{max}}`).
         If set to `None`, it is computed from ``bandwidth`` and ``maximum_delay_spread``
         using :func:`time_lag_discrete_time_channel`. If it is not set to `None`,
         then the parameter ``maximum_delay_spread`` is not used.
+    :param normalize_channel: If set to `True`, the channel is normalized over the block size
+        to ensure unit average energy per time step. Defaults to `False`.
+    :param return_channel: If set to `True`, the channel response is returned in addition to the
+        channel output. Defaults to `False`.
+    :param precision: Precision used for internal calculations and outputs.
+        If set to `None`, :attr:`~sionna.phy.config.Config.precision` is used.
+    :param device: Device for computation. If `None`,
+        :attr:`~sionna.phy.config.Config.device` is used.
 
-    normalize_channel : `bool`, (default `False`)
-        If set to `True`, the channel is normalized over the block size
-        to ensure unit average energy per time step.
+    :input x: [batch size, num_tx, num_tx_ant, num_time_samples], `torch.complex`.
+        Channel inputs.
 
-    return_channel : `bool`, (default `False`)
-        If set to `True`, the channel response is returned in addition to the
-        channel output.
-
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
-        If set to `None`,
-        :attr:`~sionna.phy.config.Config.precision` is used.
-
-    Input
-    -----
-    x :  [batch size, num_tx, num_tx_ant, num_time_samples], `tf.complex`
-        Channel inputs
-
-    no : `None` (default) | Tensor, `tf.float`
+    :input no: `None` (default) | `torch.Tensor`, `torch.float`.
         Tensor whose shape can be broadcast to the shape of the
         channel outputs: [batch size, num_rx, num_rx_ant, num_time_samples].
         The (optional) noise power ``no`` is per complex dimension. If ``no`` is a scalar,
@@ -100,34 +86,67 @@ class TimeChannel(Block):
         the shape of the channel outputs. This allows, e.g., adding noise of
         different variance to each example in a batch. If ``no`` has a lower
         rank than the channel outputs, then ``no`` will be broadcast to the
-        shape of the channel outputs by adding dummy dimensions after the last
-        axis.
+        shape of the channel outputs by adding dummy dimensions after the
+        last axis.
 
-    Output
-    -------
-    y : [batch size, num_rx, num_rx_ant, num_time_samples + l_max - l_min], `tf.complex`
-        Channel outputs
+    :output y: [batch size, num_rx, num_rx_ant, num_time_samples + l_max - l_min], `torch.complex`.
+        Channel outputs.
         The channel output consists of ``num_time_samples`` + ``l_max`` - ``l_min``
         time samples, as it is the result of filtering the channel input of length
-        ``num_time_samples`` with the time-variant channel filter  of length
+        ``num_time_samples`` with the time-variant channel filter of length
         ``l_max`` - ``l_min`` + 1.
 
-    h_time : [batch size, num_rx, num_rx_ant, num_tx, num_tx_ant, num_time_samples + l_max - l_min, l_max - l_min + 1], `tf.complex`
+    :output h_time: [batch size, num_rx, num_rx_ant, num_tx, num_tx_ant, num_time_samples + l_max - l_min, l_max - l_min + 1], `torch.complex`.
         (Optional) Channel responses. Returned only if ``return_channel``
         is set to `True`.
         For each batch example, ``num_time_samples`` + ``l_max`` - ``l_min`` time
         steps of the channel realizations are generated to filter the channel input.
-    """
-    def __init__(self, channel_model, bandwidth, num_time_samples,
-                 maximum_delay_spread=3e-6, l_min=None, l_max=None,
-                 normalize_channel=False, return_channel=False,
-                 precision=None, **kwargs):
 
-        super().__init__(precision=precision, **kwargs)
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        import torch
+        from sionna.phy.channel import RayleighBlockFading, TimeChannel
+
+        channel_model = RayleighBlockFading(num_rx=1, num_rx_ant=2, num_tx=1, num_tx_ant=4)
+        channel = TimeChannel(
+            channel_model,
+            bandwidth=1e6,
+            num_time_samples=100,
+            l_min=-6,
+            l_max=20,
+            return_channel=True
+        )
+
+        x = torch.randn(32, 1, 4, 100, dtype=torch.complex64)
+        y, h_time = channel(x)
+        print(y.shape)
+        # torch.Size([32, 1, 2, 126])
+        print(h_time.shape)
+        # torch.Size([32, 1, 2, 1, 4, 126, 27])
+    """
+
+    def __init__(
+        self,
+        channel_model,
+        bandwidth: float,
+        num_time_samples: int,
+        maximum_delay_spread: float = 3e-6,
+        l_min: Optional[int] = None,
+        l_max: Optional[int] = None,
+        normalize_channel: bool = False,
+        return_channel: bool = False,
+        precision: Optional[str] = None,
+        device: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(precision=precision, device=device, **kwargs)
 
         # Setting l_min and l_max to default values if not given by the user
-        l_min_default, l_max_default = time_lag_discrete_time_channel(bandwidth,
-                                                            maximum_delay_spread)
+        l_min_default, l_max_default = time_lag_discrete_time_channel(
+            bandwidth, maximum_delay_spread
+        )
         if l_min is None:
             l_min = l_min_default
         if l_max is None:
@@ -138,25 +157,66 @@ class TimeChannel(Block):
         self._num_time_steps = num_time_samples
         self._l_min = l_min
         self._l_max = l_max
-        self._l_tot = l_max-l_min+1
+        self._l_tot = l_max - l_min + 1
         self._normalize_channel = normalize_channel
         self._return_channel = return_channel
 
-        self._generate_channel = GenerateTimeChannel(self._cir_sampler,
-                                                     self._bandwidth,
-                                                     self._num_time_steps,
-                                                     self._l_min,
-                                                     self._l_max,
-                                                     self._normalize_channel,
-                                                     precision=self.precision)
+        self._generate_channel = GenerateTimeChannel(
+            self._cir_sampler,
+            self._bandwidth,
+            self._num_time_steps,
+            self._l_min,
+            self._l_max,
+            self._normalize_channel,
+            precision=self.precision,
+            device=self.device,
+        )
 
-        self._apply_channel = ApplyTimeChannel( self._num_time_steps,
-                                                self._l_tot,
-                                                precision=self.precision)
+        self._apply_channel = ApplyTimeChannel(
+            self._num_time_steps,
+            self._l_tot,
+            precision=self.precision,
+            device=self.device,
+        )
 
-    def call(self, x, no=None):
-        h_time = self._generate_channel(tf.shape(x)[0])
+    @property
+    def l_min(self) -> int:
+        """Smallest time-lag"""
+        return self._l_min
+
+    @property
+    def l_max(self) -> int:
+        """Largest time-lag"""
+        return self._l_max
+
+    @property
+    def l_tot(self) -> int:
+        """Total number of channel taps"""
+        return self._l_tot
+
+    @property
+    def bandwidth(self) -> float:
+        """Bandwidth [Hz]"""
+        return self._bandwidth
+
+    @property
+    def num_time_samples(self) -> int:
+        """Number of time samples"""
+        return self._num_time_steps
+
+    def call(
+        self,
+        x: torch.Tensor,
+        no: Optional[Union[float, torch.Tensor]] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """Apply time channel to input signal.
+
+        :param x: Channel inputs
+        :param no: Noise power per complex dimension
+        """
+        h_time = self._generate_channel(x.shape[0])
         y = self._apply_channel(x, h_time, no)
+
         if self._return_channel:
             return y, h_time
         else:

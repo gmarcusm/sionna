@@ -1,809 +1,759 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
-import unittest
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+"""Unit tests for sionna.phy.fec.interleaving module."""
+
 import numpy as np
-import tensorflow as tf
+import pytest
+import torch
+
 from sionna.phy import config
-from sionna.phy.fec.interleaving import RandomInterleaver, RowColumnInterleaver, Deinterleaver, Turbo3GPPInterleaver
+from sionna.phy.fec.interleaving import (
+    RandomInterleaver,
+    RowColumnInterleaver,
+    Deinterleaver,
+    Turbo3GPPInterleaver,
+)
 from sionna.phy.fec.scrambling import Scrambler
 
-class TestRandomInterleaver(unittest.TestCase):
-    """Test random interleaver for consistency."""
 
-    def test_sequence_dimension(self):
+class TestRandomInterleaver:
+    """Tests for RandomInterleaver class."""
+
+    @pytest.mark.parametrize("keep_batch", [True, False])
+    @pytest.mark.parametrize("inverse", [True, False])
+    @pytest.mark.parametrize("seq_length", [1, 100, 256, 1000])
+    @pytest.mark.parametrize("batch_size", [1, 100, 256, 1000])
+    def test_sequence_dimension(
+        self, device, keep_batch, inverse, seq_length, batch_size
+    ):
         """Test against correct dimensions of the sequence."""
-        seq_lengths = [1, 100, 256, 1000]
-        batch_sizes = [1, 100, 256, 1000]
-        for m in [True, False]: # keep_batch mode
-            for inv in [True, False]: # inverse mode
-                i = RandomInterleaver(keep_batch_constant=m, inverse=inv)
-                for seq_length in seq_lengths:
-                    for batch_size in batch_sizes:
-                        x = i(tf.zeros([batch_size, seq_length]))
-                        self.assertEqual(x.shape,
-                                        [int(batch_size),int(seq_length)])
+        inter = RandomInterleaver(
+            keep_batch_constant=keep_batch, inverse=inverse, device=device
+        )
+        x = inter(torch.zeros(batch_size, seq_length, device=device))
+        assert x.shape == (batch_size, seq_length)
 
-    def test_inverse(self):
+    @pytest.mark.parametrize("keep_batch", [True, False])
+    def test_inverse(self, device, keep_batch):
         """Test that inverse permutation matches to permutation."""
-        seq_length = int(1e3)
-        batch_size = int(1e2)
-        for m in [True, False]:
-            inter = RandomInterleaver(keep_batch_constant=m, seed=123)
-            inter2 = RandomInterleaver(keep_batch_constant=m, inverse=True,
-                                       seed=123)
+        seq_length = 1000
+        batch_size = 100
 
-            x = np.arange(seq_length)
-            x = np.expand_dims(x, axis=0)
-            x = np.tile(x, [batch_size, 1])
-            y = inter(x)
-            z = inter2(y)
-            for i in range(batch_size):
-                # result must be sorted integers
-                self.assertTrue(np.array_equal(z[i,:], np.arange(seq_length)))
+        inter = RandomInterleaver(
+            keep_batch_constant=keep_batch, seed=123, device=device
+        )
+        inter2 = RandomInterleaver(
+            keep_batch_constant=keep_batch, inverse=True, seed=123, device=device
+        )
 
-            # also test explicit seed
-            y = inter(x, seed=12345)
-            z = inter2(y, seed=12345)
-            for i in range(batch_size):
-                # result must be sorted integers
-                self.assertTrue(np.array_equal(z[i,:], np.arange(seq_length)))
+        x = torch.arange(seq_length, device=device, dtype=torch.float32)
+        x = x.unsqueeze(0).expand(batch_size, -1)
 
-            ###################
-            # test without batch dim
-            # test RowColumnInterleaver
-            inter = RandomInterleaver(row_depth=3, keep_batch_constant=m)
-            # inherits precision from inter
-            deinter = Deinterleaver(inter)
+        y = inter(x)
+        z = inter2(y)
 
-            x = np.arange(seq_length)
-            y = inter(x)
-            z = deinter(y)
-            self.assertFalse(np.array_equal(x,y))
-            self.assertTrue(np.array_equal(x,z))
+        for i in range(batch_size):
+            expected = torch.arange(seq_length, device=device, dtype=torch.float32)
+            assert torch.allclose(z[i, :], expected)
 
-    def test_sequence_batch(self):
+        # Also test explicit seed
+        y = inter(x, seed=12345)
+        z = inter2(y, seed=12345)
+
+        for i in range(batch_size):
+            expected = torch.arange(seq_length, device=device, dtype=torch.float32)
+            assert torch.allclose(z[i, :], expected)
+
+    def test_inverse_no_batch_dim(self, device):
+        """Test inverse interleaving without batch dimension."""
+        seq_length = 1000
+
+        inter = RandomInterleaver(keep_batch_constant=True, seed=42, device=device)
+        deinter = Deinterleaver(inter)
+
+        x = torch.arange(seq_length, device=device, dtype=torch.float32)
+        y = inter(x)
+        z = deinter(y)
+
+        assert not torch.allclose(x, y)
+        assert torch.allclose(x, z)
+
+    def test_sequence_batch(self, device):
         """Test that interleaver sequence is random per batch sample.
-        Remark: this tests must fail for keep_batch_constant=True."""
-        seq_length = int(1e3)
-        batch_size = int(1e1)
-        i1 = RandomInterleaver(keep_batch_constant=False) # test valid iff False
-        i2 = RandomInterleaver(keep_batch_constant=True) # test valid iff False
-        x = np.arange(seq_length)
-        x = np.expand_dims(x, axis=0)
-        x = np.tile(x, [batch_size, 1])
+
+        Remark: this test must fail for keep_batch_constant=True.
+        """
+        seq_length = 1000
+        batch_size = 10
+
+        i1 = RandomInterleaver(keep_batch_constant=False, device=device)
+        i2 = RandomInterleaver(keep_batch_constant=True, device=device)
+
+        x = torch.arange(seq_length, device=device, dtype=torch.float32)
+        x = x.unsqueeze(0).expand(batch_size, -1)
+
         y1 = i1(x)
         y2 = i2(x)
-        for i in range(batch_size-1):
-            for j in range(i+1,batch_size):
-                self.assertFalse(np.array_equal(y1[i,:],y1[j,:]))
-                self.assertTrue(np.array_equal(y2[i,:],y2[j,:]))
 
-    def test_sequence_realization(self):
-        """Test that interleaver sequence are random for each new realization
-        iff keep_state==False."""
+        for i in range(batch_size - 1):
+            for j in range(i + 1, batch_size):
+                # Different sequences per batch for keep_batch_constant=False
+                assert not torch.allclose(y1[i, :], y1[j, :])
+                # Same sequences per batch for keep_batch_constant=True
+                assert torch.allclose(y2[i, :], y2[j, :])
 
-        seq_length = int(1e3)
-        batch_size = int(1e1)
-        for m in [True, False]:
-            i = RandomInterleaver(keep_batch_constant=m, keep_state=True)
-            x = np.arange(seq_length)
-            x = np.expand_dims(x, axis=0)
-            x = np.tile(x, [batch_size, 1])
+    @pytest.mark.parametrize("keep_batch", [True, False])
+    def test_sequence_realization(self, device, keep_batch):
+        """Test that interleaver sequences are random for each new realization
+        iff keep_state==False.
+        """
+        seq_length = 1000
+        batch_size = 10
 
-            # same results if keep_state=True
-            x1 = i(x).numpy()
-            x2 = i(x).numpy()
-            self.assertTrue(np.array_equal(x1, x2))
+        inter = RandomInterleaver(
+            keep_batch_constant=keep_batch, keep_state=True, device=device
+        )
 
-            i = RandomInterleaver(keep_batch_constant=m, keep_state=False)
-            # different results if keep_state=False
-            x1 = i(x).numpy()
-            x2 = i(x).numpy()
-            self.assertFalse(np.array_equal(x1, x2))
+        x = torch.arange(seq_length, device=device, dtype=torch.float32)
+        x = x.unsqueeze(0).expand(batch_size, -1)
 
-    def test_dimension(self):
-        """Test that dimensions can be changed."""
-        seq_length = int(1e1)
-        batch_size = int(1e2)
+        # Same results if keep_state=True
+        x1 = inter(x)
+        x2 = inter(x)
+        assert torch.allclose(x1, x2)
 
-        cases = np.array([[1e2, 1e1-1],[1e2, 1e1+1]])
+        inter2 = RandomInterleaver(
+            keep_batch_constant=keep_batch, keep_state=False, device=device
+        )
+        # Different results if keep_state=False
+        x1 = inter2(x)
+        x2 = inter2(x)
+        assert not torch.allclose(x1, x2)
 
-        # test that bs can be variable
-        cases = np.array([[1e2+2, 1e1],[1e2+1, 1e1+1]])
-
-        for m in [True, False]:
-            llr = config.tf_rng.uniform([tf.cast(batch_size, dtype=tf.int32),
-                                     tf.cast(seq_length, dtype=tf.int32)])
-            for c in cases:
-                for states in [True, False]:
-                    S = RandomInterleaver(keep_batch_constant=m,
-                                          keep_state=states)
-                    llr = config.tf_rng.uniform([tf.cast(c[0], dtype=tf.int32),
-                                            tf.cast(c[1], dtype=tf.int32)])
-                    S(llr)
-
-    def test_multi_dim(self):
+    @pytest.mark.parametrize("keep_batch", [True, False])
+    @pytest.mark.parametrize(
+        "shape,axis",
+        [
+            (shape, -1 if a == 0 else a)
+            for shape in [
+                [1000],
+                [10, 20, 30],
+                [10, 22, 33, 44],
+                [20, 10, 10, 10, 6],
+            ]
+            for a in range(len(shape))
+        ],
+    )
+    def test_multi_dim(self, device, keep_batch, shape, axis):
         """Test that 2+D Tensors permutation can be inverted/removed.
+
         Inherently tests that the output dimensions match.
         """
+        llr = torch.rand(shape, device=device) * 200 - 100
 
-        # note: test can fail for small dimension_sizes as it may
-        # randomly result in the identity interleaver pattern
-        shapes=[[1000],[10,20,30], [10,22,33,44], [20,10,10,10,6]]
+        inter = RandomInterleaver(
+            keep_batch_constant=keep_batch,
+            axis=axis,
+            keep_state=True,
+            device=device,
+        )
+        inter2 = RandomInterleaver(
+            keep_batch_constant=keep_batch,
+            axis=axis,
+            keep_state=True,
+            inverse=True,
+            device=device,
+        )
 
-        for s in shapes:
-            #check soft-value scrambling (flipp sign)
-            llr = config.tf_rng.uniform(tf.constant(s, dtype=tf.int32),
-                                    minval=-100,
-                                    maxval=100)
-            for a in range(0, len(s)):
-                for m in [True, False]:
-                    if a==0: # check that axis=-1 works as well...axis=0 is
-                        # invalid (=batch_dim) and does not need to be checked
-                        i = RandomInterleaver(keep_batch_constant=m,
-                                              axis=-1,
-                                              keep_state=True)
-                        i2 = RandomInterleaver(keep_batch_constant=m,
-                                               axis=-1,
-                                               keep_state=True,
-                                               inverse=True)
-                    else:
-                        i = RandomInterleaver(keep_batch_constant=m,
-                                              axis=a,
-                                              keep_state=True)
-                        i2 = RandomInterleaver(keep_batch_constant=m,
-                                               axis=a,
-                                               keep_state=True,
-                                               inverse=True)
+        x = inter(llr, seed=1234)
+        # After interleaving arrays must be different
+        assert not torch.allclose(x, llr)
 
-                    x = i(llr, seed=1234)
-                    # after interleaving arrays must be different
-                    self.assertTrue(np.any(np.not_equal(x.numpy(),llr.numpy())))
+        # After deinterleaving arrays should be equal again
+        x = inter2(x, seed=1234)
+        assert torch.allclose(x, llr)
 
-                    # after deinterleaving arrays should be equal again
-                    x = i2(x, seed=1234)
-                    self.assertIsNone(np.testing.assert_array_equal(x.numpy(), llr.numpy()))
+    @pytest.mark.parametrize(
+        "shape", [[10, 20, 30], [10, 22, 33, 44], [20, 10, 10, 10, 6]]
+    )
+    def test_invalid_shapes(self, device, shape):
+        """Test that invalid shapes/axis parameter raise error."""
+        with pytest.raises(ValueError):
+            # Axis out of bounds must raise error
+            inter = RandomInterleaver(axis=len(shape), device=device)
+            llr = torch.rand(shape, device=device)
+            inter(llr)
 
-    def test_invalid_shapes(self):
-        """Test that invalid shapes/axis parameter raise error.
-        """
-
-        shapes=[[10,20,30], [10,22,33,44], [20,10,10,10,6]]
-
-        for s in shapes:
-            with self.assertRaises(ValueError):
-                # axis out bounds...must raise error
-                i = RandomInterleaver(axis=len(s))
-                llr = config.tf_rng.uniform(tf.constant(s, dtype=tf.int32))
-                i(llr)
-
-    def test_tf_fun(self):
-        """Test that tf.function works as expected and XLA work as expected.
-
-        Also tests that arrays are different.
-        """
-        @tf.function()
-        def run_graph(llr):
-            return i(llr)
-
-        @tf.function(jit_compile=True)
-        def run_graph_xla(llr):
-           return i(llr)
-
-        shapes=[[10,20,30], [10,22,33,44], [20,10,10,10,9]]
-        modes = [True, False]
-        for m in modes:
-            for s in shapes:
-                #check soft-value scrambling (flipp sign)
-                llr = config.tf_rng.uniform(tf.constant(s, dtype=tf.int32))
-                i = RandomInterleaver(keep_batch_constant=m)
-                x1 = run_graph(llr)
-                x2 = run_graph_xla(llr)
-                # after interleaving arrays must be different
-                self.assertTrue(np.any(np.not_equal(x1.numpy(),llr.numpy())))
-                self.assertTrue(np.any(np.not_equal(x2.numpy(),llr.numpy())))
-
-    def test_seed(self):
+    @pytest.mark.parametrize("keep_batch", [True, False])
+    def test_seed(self, device, keep_batch):
         """Test that seed can be fed.
 
         Remark: this test generates multiple interleavers to test the
-        influence of different seeds."""
-
-        seq_length = int(1e3)
-        batch_size = int(1e1)
-
+        influence of different seeds.
+        """
+        seq_length = 1000
+        batch_size = 10
         seed = 123456
 
-        for m in [True, False]:
-            i1 = RandomInterleaver(keep_batch_constant=m,
-                                   seed=seed,
-                                   keep_state=True)
-            i2 = RandomInterleaver(keep_batch_constant=m, keep_state=True)
-            i3 = RandomInterleaver(keep_batch_constant=m,
-                                   seed=seed,
-                                   keep_state=True)
-            i4 = RandomInterleaver(keep_batch_constant=m,
-                                   seed=seed+1,
-                                   keep_state=True)
-            x = np.arange(seq_length)
-            x = np.expand_dims(x, axis=0)
-            x = np.tile(x, [batch_size, 1])
+        i1 = RandomInterleaver(
+            keep_batch_constant=keep_batch,
+            seed=seed,
+            keep_state=True,
+            device=device,
+        )
+        i2 = RandomInterleaver(
+            keep_batch_constant=keep_batch, keep_state=True, device=device
+        )
+        i3 = RandomInterleaver(
+            keep_batch_constant=keep_batch,
+            seed=seed,
+            keep_state=True,
+            device=device,
+        )
+        i4 = RandomInterleaver(
+            keep_batch_constant=keep_batch,
+            seed=seed + 1,
+            keep_state=True,
+            device=device,
+        )
 
-            # same results if keep_state=True
-            x1 = i1(x).numpy()
-            x2 = i2(x).numpy()
-            x3 = i3(x).numpy()
-            x4 = i4(x).numpy()
+        x = torch.arange(seq_length, device=device, dtype=torch.float32)
+        x = x.unsqueeze(0).expand(batch_size, -1)
 
-            #x1 and x3 must be the same (same seed)
-            self.assertTrue(np.array_equal(x1, x3))
+        x1 = i1(x)
+        x2 = i2(x)
+        x3 = i3(x)
+        x4 = i4(x)
 
-            #x1 and x2/x4  are not the same (different seed)
-            self.assertFalse(np.array_equal(x1, x2))
-            self.assertFalse(np.array_equal(x1, x4))
+        # x1 and x3 must be the same (same seed)
+        assert torch.allclose(x1, x3)
 
-            i11 = RandomInterleaver(keep_batch_constant=m,
-                                    seed=seed,
-                                    keep_state=False)
-            i31 = RandomInterleaver(keep_batch_constant=m,
-                                    seed=seed,
-                                    keep_state=True)
+        # x1 and x2/x4 are not the same (different seed)
+        assert not torch.allclose(x1, x2)
+        assert not torch.allclose(x1, x4)
 
-            # different results if keep_state=False
-            x5 = i11(x).numpy()
-            x6 = i31(x).numpy()
-            self.assertFalse(np.array_equal(x5, x6))
+        # Test that seed can be also provided to call
+        test_seed = 987654
+        i11 = RandomInterleaver(
+            keep_batch_constant=keep_batch,
+            seed=seed,
+            keep_state=False,
+            device=device,
+        )
+        i21 = RandomInterleaver(
+            keep_batch_constant=keep_batch,
+            keep_state=False,
+            inverse=True,
+            device=device,
+        )
 
-            # test that seed can be also provided to call
-            seed = 987654
-            x7 = i11(x, seed=seed).numpy()
-            x8 = i11(x, seed=seed+1).numpy()
-            x9 = i11(x, seed=seed).numpy()
-            x10 = i1(x, seed=seed).numpy()
-            self.assertFalse(np.array_equal(x7, x8)) # different seed
-            self.assertTrue(np.array_equal(x7, x9)) # same seed
-            self.assertTrue(np.array_equal(x7, x10)) # same seed (keep_state=f)
+        x7 = i11(x, seed=test_seed)
+        x8 = i11(x, seed=test_seed + 1)
+        x9 = i11(x, seed=test_seed)
+        x10 = i1(x, seed=test_seed)
 
-            # test that random seed allows inverse
-            x11 = i11(x, seed=seed)
-            i21 = RandomInterleaver(keep_batch_constant=m,
-                                    keep_state=False,
-                                    inverse=True)
-            # use different interleaver with same seed to de-interleave
-            x12 = i21(x11, seed=seed).numpy()
-            self.assertTrue(np.array_equal(x, x12)) # identity
+        assert not torch.allclose(x7, x8)  # Different seed
+        assert torch.allclose(x7, x9)  # Same seed
+        assert torch.allclose(x7, x10)  # Same seed (keep_state=False)
 
-    def test_s_param(self):
+        # Test that random seed allows inverse
+        x11 = i11(x, seed=test_seed)
+        # Use different interleaver with same seed to de-interleave
+        x12 = i21(x11, seed=test_seed)
+        assert torch.allclose(x, x12)  # Identity
+
+    @pytest.mark.parametrize("seed", range(50))
+    def test_s_param(self, device, seed):
         """Test that interleaver outputs correct S parameter for given seed."""
-        N_tests = 100
         k = 100
-        inter = RandomInterleaver()
+        inter = RandomInterleaver(device=device)
 
-        for s in range(N_tests):
-            x = np.arange(k)
-            x = np.expand_dims(x, axis=0)
-            x_int = inter(x, seed=s).numpy()
-            x_int = np.squeeze(x_int, axis=0)
+        x = torch.arange(k, device=device, dtype=torch.float32).unsqueeze(0)
+        x_int = inter(x, seed=seed).squeeze(0).cpu().numpy()
 
-            s_inter = inter.find_s_min(seed=s, seq_length=k)
+        s_inter = inter.find_s_min(seed=seed, seq_length=k)
 
-            #s_min = 0
-            cont = True
-            for s_min in range(1, k, 1):
-                for i in range(k):
-                    a = x_int[i]
-                    if i-s_min>=0:
-                        b = x_int[i-s_min]
-                        if np.abs(a-b)<=s_min:
-                            cont=False
-                            #break
-                    if i+s_min<k:
-                        b = x_int[i+s_min]
-                        if np.abs(a-b)<=s_min:
-                            cont=False
-                            #break
-                if not cont:
-                    break
+        # Verify S parameter
+        cont = True
+        for s_min in range(1, k):
+            for i in range(k):
+                a = x_int[i]
+                if i - s_min >= 0:
+                    b = x_int[i - s_min]
+                    if np.abs(a - b) <= s_min:
+                        cont = False
+                if i + s_min < k:
+                    b = x_int[i + s_min]
+                    if np.abs(a - b) <= s_min:
+                        cont = False
+            if not cont:
+                break
 
-            self.assertTrue(s_inter==s_min)
+        assert s_inter == s_min
 
-    def test_dtype(self):
+    @pytest.mark.parametrize("dt_in", [torch.float32, torch.float64])
+    def test_dtype(self, device, precision, dt_in):
         """Test that variable dtypes are supported."""
-        seq_length = int(1e1)
-        batch_size = int(1e2)
+        seq_length = 10
+        batch_size = 100
 
-        precisions = ["single", "double"]
-        dt_supported = [tf.float32, tf.float64]
-        for p, dt in zip(precisions, dt_supported):
-            for dt_in in dt_supported:
-                b = tf.zeros([batch_size, seq_length], dtype=dt_in)
-                inter = RandomInterleaver(precision=p)
-                x = inter(b)
-                assert (x.dtype==dt)
+        dtypes_supported = {
+            "single": torch.float32,
+            "double": torch.float64,
+        }
+        dt_out = dtypes_supported[precision]
 
-class TestInterleaverRC(unittest.TestCase):
-    def test_sequence_dimension(self):
-        """Test against correct dimensions of the perm sequence"""
-        seq_lengths = [1, 100, 256, 1000]
-        depths = [1, 2, 4, 7, 8]
-        for d in depths:
-            i = RowColumnInterleaver(row_depth=d)
-            for seq_length in seq_lengths:
-                x, y = i._generate_perm_rc(int(seq_length), d)
-                self.assertEqual(x.shape[0],int(seq_length))
-                self.assertEqual(y.shape[0],int(seq_length))
+        b = torch.zeros(batch_size, seq_length, dtype=dt_in, device=device)
+        inter = RandomInterleaver(precision=precision, device=device)
+        x = inter(b)
+        assert x.dtype == dt_out
+
+    @pytest.mark.parametrize("shape", [[10, 20, 30], [10, 22, 33, 44]])
+    def test_torch_compile(self, device, shape):
+        """Test that torch.compile works as expected."""
+        llr = torch.rand(shape, device=device)
+        inter = RandomInterleaver(keep_batch_constant=True, device=device)
+
+        compiled_inter = torch.compile(inter)
+        x1 = compiled_inter(llr)
+        x2 = compiled_inter(llr)
+
+        # After interleaving arrays must be different
+        assert not torch.allclose(x1, llr)
+        assert torch.allclose(x1, x2)
 
 
-    def test_dimension(self):
-        """Test against dimension mismatches"""
-        seq_length = int(1e1)
-        batch_size = int(1e2)
+class TestRowColumnInterleaver:
+    """Tests for RowColumnInterleaver class."""
 
-        cases = np.array([[1e2, 1e1-1],[1e2, 1e1+1]])
-        depths = [1, 2, 4, 7, 8]
-        for d in depths:
-            i = RowColumnInterleaver(row_depth=d)
-            llr = config.tf_rng.uniform([tf.cast(batch_size, dtype=tf.int32),
-                                     tf.cast(seq_length, dtype=tf.int32)])
-            i(llr)
-            for c in cases:
-                llr = config.tf_rng.uniform([tf.cast(c[0], dtype=tf.int32),
-                                         tf.cast(c[1], dtype=tf.int32)])
-                # should run without error
-                i(llr)
+    @pytest.mark.parametrize("depth", [1, 2, 4, 7, 8])
+    @pytest.mark.parametrize("seq_length", [1, 100, 256, 1000])
+    def test_sequence_dimension(self, device, depth, seq_length):
+        """Test against correct dimensions of the perm sequence."""
+        inter = RowColumnInterleaver(row_depth=depth, device=device)
+        x, y = inter._generate_perm_rc(seq_length, depth)
+        assert x.shape[0] == seq_length
+        assert y.shape[0] == seq_length
 
-        # test that bs can be changed
-        cases = np.array([[1e2+2, 1e1],[1e2+1, 1e1]])
+    @pytest.mark.parametrize("depth", [1, 2, 4, 7, 8])
+    @pytest.mark.parametrize("case", [(100, 9), (100, 11)])
+    def test_dimension(self, device, depth, case):
+        """Test against dimension mismatches."""
+        seq_length = 10
+        batch_size = 100
 
-        for d in depths:
-            i = RowColumnInterleaver(row_depth=d)
-            llr = config.tf_rng.uniform([tf.cast(batch_size, dtype=tf.int32),
-                            tf.cast(seq_length, dtype=tf.int32)])
-            i(llr)
-            for c in cases:
-                llr = config.tf_rng.uniform([tf.cast(c[0], dtype=tf.int32),
-                                         tf.cast(c[1], dtype=tf.int32)])
-                i(llr)
+        inter = RowColumnInterleaver(row_depth=depth, device=device)
+        llr = torch.rand(batch_size, seq_length, device=device)
+        inter(llr)
 
-    def test_inverse(self):
-        """Test that permutation can be inverted/removed"""
+        llr = torch.rand(int(case[0]), int(case[1]), device=device)
+        # Should run without error
+        inter(llr)
 
-        seq_length = int(1e3)
-        batch_size = int(1e2)
+    @pytest.mark.parametrize("depth", [1, 2, 4, 7, 8])
+    def test_inverse(self, device, depth):
+        """Test that permutation can be inverted/removed."""
+        seq_length = 1000
+        batch_size = 100
 
-        # check soft-value scrambling (flip sign)
-        llr = config.tf_rng.uniform([tf.cast(batch_size, dtype=tf.int32),
-                            tf.cast(seq_length, dtype=tf.int32)])
+        llr = torch.rand(batch_size, seq_length, device=device)
 
-        depths = [1, 2, 4, 7, 8]
-        for d in depths:
-            i = RowColumnInterleaver(row_depth=d)
-            i2 = RowColumnInterleaver(row_depth=d, inverse=True)
-            x = i(llr)
-            y = i2(x)
-            self.assertIsNone(np.testing.assert_array_equal(y.numpy(),
-                                                            llr.numpy()))
+        inter = RowColumnInterleaver(row_depth=depth, device=device)
+        inter2 = RowColumnInterleaver(row_depth=depth, inverse=True, device=device)
 
-        # test non batch dim
-        # test RowColumnInterleaver
-        inter = RowColumnInterleaver(row_depth=3)
-        # inherits precision from inter
+        x = inter(llr)
+        y = inter2(x)
+        assert torch.allclose(y, llr)
+
+    def test_inverse_no_batch_dim(self, device):
+        """Test inverse without batch dimension."""
+        inter = RowColumnInterleaver(row_depth=3, device=device)
         deinter = Deinterleaver(inter)
 
-        x = np.arange(100)
+        x = torch.arange(100, device=device, dtype=torch.float32)
         y = inter(x)
         z = deinter(y)
-        self.assertFalse(np.array_equal(x,y))
-        self.assertTrue(np.array_equal(x,z))
 
-    def test_multi_dim(self):
+        assert not torch.allclose(x, y)
+        assert torch.allclose(x, z)
+
+    @pytest.mark.parametrize("depth", [2, 4, 7, 8])
+    @pytest.mark.parametrize(
+        "shape,axis",
+        [
+            (shape, a)
+            for shape in [
+                [1000],
+                [10, 20, 30],
+                [10, 22, 33, 44],
+                [20, 10, 10, 10, 9],
+            ]
+            for a in range(len(shape))
+        ],
+    )
+    def test_multi_dim(self, device, depth, shape, axis):
         """Test that 2+D Tensors permutation can be inverted/removed.
-        inherently tests that the output dimensions match.
 
+        Inherently tests that the output dimensions match.
         Also tests that arrays are different.
         """
+        llr = torch.rand(shape, device=device)
 
-        shapes=[[1000],[10,20,30],[10,22,33,44],[20,10,10,10,9]]
+        inter = RowColumnInterleaver(row_depth=depth, axis=axis, device=device)
+        inter2 = RowColumnInterleaver(
+            row_depth=depth, axis=axis, inverse=True, device=device
+        )
 
-        for s in shapes:
-            #check soft-value scrambling (flip sign)
-            llr = config.tf_rng.uniform(tf.constant(s, dtype=tf.int32))
-            for a in range(0,len(s)):
-                depths = [2, 4, 7, 8]
-                for d in depths:
-                    i = RowColumnInterleaver(row_depth=d, axis=a)
-                    i2 = RowColumnInterleaver(row_depth=d, axis=a, inverse=True)
-                    x = i(llr)
-                    # after interleaving arrays must be different
-                    self.assertTrue(np.any(np.not_equal(x.numpy(),llr.numpy())))
+        x = inter(llr)
+        # After interleaving arrays must be different
+        assert not torch.allclose(x, llr)
 
-                    # after deinterleaving it should be equal again
-                    x = i2(x)
-                    self.assertIsNone(np.testing.assert_array_equal(x.numpy(), llr.numpy()))
+        # After deinterleaving it should be equal again
+        x = inter2(x)
+        assert torch.allclose(x, llr)
 
-    def test_tf_fun(self):
-        """Test that tf.function works as expected and XLA work as expected.
+    @pytest.mark.parametrize(
+        "shape", [[10, 20, 30], [10, 22, 33, 44], [20, 10, 10, 10, 6]]
+    )
+    def test_invalid_axis(self, device, shape):
+        """Test that 2+D Tensors and invalid axis raise error."""
+        with pytest.raises(ValueError):
+            inter = RowColumnInterleaver(row_depth=4, axis=len(shape), device=device)
+            llr = torch.rand(shape, device=device)
+            inter(llr)
 
-        Also tests that arrays are different.
-        """
-        @tf.function()
-        def run_graph(llr):
-            return i(llr)
-
-        @tf.function(jit_compile=True)
-        def run_graph_xla(llr):
-            return i(llr)
-
-        shapes=[[10,20,30],[10,22,33,44],[20,10,10,10,9]]
-
-        for s in shapes:
-            #check soft-value scrambling (flip sign)
-            llr = config.tf_rng.uniform(tf.constant(s, dtype=tf.int32))
-            for a in range(0,len(s)):
-                depths = [2, 4, 7, 8]
-                for d in depths:
-                    i = RowColumnInterleaver(row_depth=d, axis=a)
-                    x1 = run_graph(llr)
-                    x2 = run_graph_xla(llr)
-                    # after interleaving arrays must be different
-                    self.assertTrue(np.any(np.not_equal(x1.numpy(),
-                                                        llr.numpy())))
-                    self.assertTrue(np.any(np.not_equal(x2.numpy(),
-                                                        llr.numpy())))
-
-
-    def test_invalid_axis(self):
-        """Test that 2+D Tensors and invalid axis raise error
-        """
-
-        shapes=[[10,20,30], [10,22,33,44], [20,10,10,10,6]]
-
-        for s in shapes:
-            with self.assertRaises(ValueError):
-                i = RowColumnInterleaver(row_depth=4, axis=len(s))
-                # axis is out bounds; must raise an error
-                llr = config.tf_rng.uniform(tf.constant(s, dtype=tf.int32))
-                i(llr)
-
-    def test_dtype(self):
+    @pytest.mark.parametrize("dt_in", [torch.float32, torch.float64])
+    def test_dtype(self, device, precision, dt_in):
         """Test that variable dtypes are supported."""
-        seq_length = int(1e1)
-        batch_size = int(1e2)
+        seq_length = 10
+        batch_size = 100
 
-        precisions = ["single", "double"]
-        dt_supported = [tf.float32, tf.float64]
-        for p, dt in zip(precisions, dt_supported):
-            for dt_in in dt_supported:
-                b = tf.zeros([batch_size, seq_length], dtype=dt_in)
-                inter = RowColumnInterleaver(row_depth=4, precision=p)
-                x = inter(b)
-                assert (x.dtype==dt)
+        dtypes_supported = {
+            "single": torch.float32,
+            "double": torch.float64,
+        }
+        dt_out = dtypes_supported[precision]
 
-class TestDeinterleaver(unittest.TestCase):
-    """Test Deinterleaver class."""
+        b = torch.zeros(batch_size, seq_length, dtype=dt_in, device=device)
+        inter = RowColumnInterleaver(
+            row_depth=4, precision=precision, device=device
+        )
+        x = inter(b)
+        assert x.dtype == dt_out
 
-    def test_identity(self):
+    @pytest.mark.parametrize("depth", [2, 4, 7, 8])
+    @pytest.mark.parametrize(
+        "shape,axis",
+        [
+            (shape, a)
+            for shape in [[10, 20, 30], [10, 22, 33, 44]]
+            for a in range(len(shape))
+        ],
+    )
+    def test_torch_compile(self, device, depth, shape, axis):
+        """Test that torch.compile works as expected."""
+        llr = torch.rand(shape, device=device)
+
+        inter = RowColumnInterleaver(row_depth=depth, axis=axis, device=device)
+
+        compiled_inter = torch.compile(inter)
+        x1 = compiled_inter(llr)
+        x2 = compiled_inter(llr)
+
+        # After interleaving arrays must be different
+        assert not torch.allclose(x1, llr)
+        assert torch.allclose(x1, x2)
+
+
+class TestDeinterleaver:
+    """Tests for Deinterleaver class."""
+
+    @pytest.mark.parametrize("keep_batch", [True, False])
+    @pytest.mark.parametrize("seed", [None, 1234, 876])
+    def test_identity(self, device, keep_batch, seed):
         """Test that deinterleave can invert Random-/RCInterleaver."""
-        seq_length = int(1e1)
-        batch_size = int(1e2)
+        seq_length = 10
+        batch_size = 100
 
-        # test RowColumnInterleaver
-        inter_rc = RowColumnInterleaver(row_depth=3)
+        x = torch.rand(batch_size, seq_length, device=device)
+
+        # Test RowColumnInterleaver
+        inter_rc = RowColumnInterleaver(row_depth=3, device=device)
         deinter_rc = Deinterleaver(inter_rc)
-
-        x = config.tf_rng.uniform([tf.cast(batch_size, dtype=tf.int32),
-                               tf.cast(seq_length, dtype=tf.int32)])
 
         y = inter_rc(x)
         z = deinter_rc(y)
 
-        self.assertFalse(np.array_equal(x.numpy(), y.numpy()))
-        self.assertTrue(np.array_equal(x.numpy(), z.numpy()))
+        assert not torch.allclose(x, y)
+        assert torch.allclose(x, z)
 
-        # test RandomInterleaver
-        for k in (True, False): # same sequence per batch
-            for s in (None, 1234, 876): # test different seeds
-                inter_random = RandomInterleaver(keep_batch_constant=k, seed=s)
-                deinter_random = Deinterleaver(inter_random)
+        # Test RandomInterleaver
+        inter_random = RandomInterleaver(
+            keep_batch_constant=keep_batch, seed=seed, device=device
+        )
+        deinter_random = Deinterleaver(inter_random)
 
-                y = inter_random(x)
-                z = deinter_random(y)
+        y = inter_random(x)
+        z = deinter_random(y)
 
-                self.assertFalse(np.array_equal(x.numpy(), y.numpy()))
-                self.assertTrue(np.array_equal(x.numpy(), z.numpy()))
+        assert not torch.allclose(x, y)
+        assert torch.allclose(x, z)
 
-
-    def test_tf_fun(self):
-        """Test that tf.function works as expected and XLA work as expected.
-        """
-        @tf.function()
-        def run_graph(llr):
-            return de_int_rc(int_rc(llr)), de_int_rand(int_rand(llr))
-
-        @tf.function(jit_compile=True)
-        def run_graph_xla(llr):
-            return de_int_rc(int_rc(llr)), de_int_rand(int_rand(llr))
-
-        shapes=[[10,20,30],[10,22,33,44],[20,10,10,10,9]]
-
-        for s in shapes:
-            # check soft-value scrambling (flip sign)
-            llr = config.tf_rng.uniform(tf.constant(s, dtype=tf.int32))
-            for a in range(0,len(s)):
-                depths = [2, 4, 7, 8]
-                for d in depths:
-                    int_rc = RowColumnInterleaver(row_depth=d, axis=a)
-                    int_rand = RandomInterleaver()
-
-                    de_int_rc = Deinterleaver(int_rc)
-                    de_int_rand = Deinterleaver(int_rand)
-
-                    x1, x2 = run_graph(llr)
-                    x3, x4 = run_graph_xla(llr)
-                    # after interleaving arrays must be different
-                    for x in (x1, x2, x3, x4):
-                        self.assertTrue(np.array_equal(llr.numpy(), x.numpy()))
-
-    def test_axis(self):
+    @pytest.mark.parametrize("axis", [1, 2, 3, -1, -2])
+    def test_axis(self, device, axis):
         """Test that deinterleaver operates on correct axis."""
+        x = torch.rand(10, 20, 20, 20, device=device)
 
-        x = config.tf_rng.uniform([10, 20, 20, 20])
+        # Test RowColumnInterleaver
+        inter_rc = RowColumnInterleaver(row_depth=3, axis=axis, device=device)
+        deinter_rc = Deinterleaver(inter_rc)
 
-        for a in (1, 2, 3, -1, -2):
+        y = inter_rc(x)
+        z = deinter_rc(y)
 
-            # test RowColumnInterleaver
-            inter_rc = RowColumnInterleaver(row_depth=3, axis=a)
-            deinter_rc = Deinterleaver(inter_rc)
+        assert not torch.allclose(x, y)
+        assert torch.allclose(x, z)
 
-            y = inter_rc(x)
-            z = deinter_rc(y)
+        # Test RandomInterleaver
+        inter_random = RandomInterleaver(axis=axis, device=device)
+        deinter_random = Deinterleaver(inter_random)
 
-            self.assertFalse(np.array_equal(x.numpy(), y.numpy()))
-            self.assertTrue(np.array_equal(x.numpy(), z.numpy()))
+        y = inter_random(x)
+        z = deinter_random(y)
 
-            # test RandomInterleaver
+        assert not torch.allclose(x, y)
+        assert torch.allclose(x, z)
 
-            inter_random = RandomInterleaver(axis=a)
-            deinter_random = Deinterleaver(inter_random)
+    @pytest.mark.parametrize(
+        "dt_in",
+        [
+            torch.float32,
+            torch.float64,
+            torch.int32,
+            torch.int64,
+            torch.complex64,
+            torch.complex128,
+        ],
+    )
+    def test_dtype(self, device, precision, dt_in):
+        """Test that arbitrary dtypes are supported."""
+        if dt_in.is_complex:
+            x_real = torch.rand(10, 20, device=device)
+            x = torch.complex(x_real, torch.zeros_like(x_real))
+            x = x.to(dt_in)
+        else:
+            x = torch.rand(10, 20, device=device).to(dt_in)
 
-            y = inter_random(x)
-            z = deinter_random(y)
+        # Test RowColumnInterleaver
+        inter_rc = RowColumnInterleaver(
+            row_depth=3, precision=precision, device=device
+        )
+        deinter_rc1 = Deinterleaver(inter_rc)
+        deinter_rc2 = Deinterleaver(inter_rc, precision=precision)
 
-            self.assertFalse(np.array_equal(x.numpy(), y.numpy()))
-            self.assertTrue(np.array_equal(x.numpy(), z.numpy()))
+        y = inter_rc(x)
+        z1 = deinter_rc1(y)
+        z2 = deinter_rc2(y)
 
-    def test_dtype(self):
-        """test that arbitrary dtypes are supported."""
+        assert z1.dtype == y.dtype
+        assert z2.dtype == y.dtype
 
-        dtypes_supported = (tf.float32, tf.float64, tf.int32,
-                            tf.int64, tf.complex128, tf.complex64)
+        # Test RandomInterleaver
+        inter_rand = RandomInterleaver(precision=precision, device=device)
+        deinter_rand1 = Deinterleaver(inter_rand)
+        deinter_rand2 = Deinterleaver(inter_rand, precision=precision)
 
-        precisions = ["single", "double"]
-        dt_precision = [tf.float32, tf.float64]
+        y = inter_rand(x)
+        z1 = deinter_rand1(y)
+        z2 = deinter_rand2(y)
 
-        for p, dt in zip(precisions, dt_precision):
-            for dt_in in dtypes_supported:
+        assert z1.dtype == y.dtype
+        assert z2.dtype == y.dtype
 
-                # tf.uniform does not support complex dtypes
-                if dt_in is (tf.complex64):
-                    x = config.tf_rng.uniform([10, 20], maxval=10, dtype=tf.float32)
-                    x = tf.complex(x, tf.zeros_like(x))
-                elif dt_in is (tf.complex128):
-                    x = config.tf_rng.uniform([10, 20], maxval=10, dtype=tf.float64)
-                    x = tf.complex(x, tf.zeros_like(x))
-                else:
-                    x = config.tf_rng.uniform([10, 20], maxval=10, dtype=dt_in)
+    def test_invalid_input(self, device):
+        """Test against invalid parameters."""
+        inter1 = RandomInterleaver(device=device)
+        scram = Scrambler(device=device)
 
-                # test RowColumnInterleaver
-                inter_rc = RowColumnInterleaver(row_depth=3,
-                                                precision=p)
-
-                # inherits precision from inter
-                deinter_rc1 = Deinterleaver(inter_rc)
-
-                # custom precision
-                deinter_rc2 = Deinterleaver(inter_rc, precision=p)
-
-                y = inter_rc(x)
-                z1 = deinter_rc1(y)
-                z2 = deinter_rc2(y)
-
-                self.assertTrue(z1.dtype==y.dtype)
-                self.assertTrue(z2.dtype==y.dtype)
-
-                # test RandomInterleaver
-                inter_rand = RandomInterleaver(precision=p)
-
-                # inherits precision from inter
-                deinter_rand1 = Deinterleaver(inter_rand)
-                # custom precision
-                deinter_rand2 = Deinterleaver(inter_rand,
-                                              precision=p)
-
-                y = inter_rand(x)
-                z1 = deinter_rand1(y)
-                z2 = deinter_rand2(y)
-
-                self.assertTrue(z1.dtype==y.dtype)
-                self.assertTrue(z2.dtype==y.dtype)
-
-    def test_invalid_input(self):
-        """test against invalid parameters."""
-
-        inter1 = RandomInterleaver()
-        inter2 = RowColumnInterleaver(3)
-        scram = Scrambler()
-
-        # invalid input
+        # Invalid input
         for s in (scram, None, 124):
-            with self.assertRaises(ValueError):
-                x = Deinterleaver(s)
+            with pytest.raises(ValueError):
+                Deinterleaver(s)
 
-class TestTurbo3GPPInterleaver(unittest.TestCase):
-    """Test Turbo3GPP interleaver for consistency."""
+    @pytest.mark.parametrize("depth", [2, 4, 7, 8])
+    @pytest.mark.parametrize(
+        "shape,axis",
+        [
+            (shape, a)
+            for shape in [[10, 20, 30], [10, 22, 33, 44]]
+            for a in range(len(shape))
+        ],
+    )
+    def test_torch_compile(self, device, depth, shape, axis):
+        """Test that torch.compile works as expected."""
+        llr = torch.rand(shape, device=device)
 
-    def test_sequence_dimension(self):
+        int_rc = RowColumnInterleaver(row_depth=depth, axis=axis, device=device)
+        int_rand = RandomInterleaver(device=device)
+
+        de_int_rc = Deinterleaver(int_rc)
+        de_int_rand = Deinterleaver(int_rand)
+
+        # Compile deinterleavers
+        compiled_deint_rc = torch.compile(de_int_rc)
+        compiled_deint_rand = torch.compile(de_int_rand)
+
+        x1 = compiled_deint_rc(int_rc(llr))
+        x2 = compiled_deint_rand(int_rand(llr))
+
+        # After interleaving+deinterleaving arrays should match
+        assert torch.allclose(llr, x1)
+        assert torch.allclose(llr, x2)
+
+
+class TestTurbo3GPPInterleaver:
+    """Tests for Turbo3GPPInterleaver class."""
+
+    @pytest.mark.parametrize("inverse", [True, False])
+    @pytest.mark.parametrize("seq_length", [1, 100, 256, 1000])
+    @pytest.mark.parametrize("batch_size", [1, 100, 256, 1000])
+    def test_sequence_dimension(self, device, inverse, seq_length, batch_size):
         """Test against correct dimensions of the sequence."""
+        inter = Turbo3GPPInterleaver(inverse=inverse, device=device)
+        x = inter(torch.zeros(batch_size, seq_length, device=device))
+        assert x.shape == (batch_size, seq_length)
 
-        seq_lengths = [1, 100, 256, 1000]
-        batch_sizes = [1, 100, 256, 1000]
-        for inv in [True, False]: # inverse mode
-            i = Turbo3GPPInterleaver(inverse=inv)
-            for seq_length in seq_lengths:
-                for batch_size in batch_sizes:
-                    x = i(tf.zeros([batch_size, seq_length]))
-                    self.assertEqual(x.shape,
-                                    [int(batch_size),int(seq_length)])
-
-    def test_inverse(self):
+    def test_inverse(self, device):
         """Test that inverse permutation matches to permutation."""
-        seq_length = int(1e3)
-        batch_size = int(1e2)
+        seq_length = 1000
+        batch_size = 100
 
-        inter = Turbo3GPPInterleaver()
-        inter2 = Turbo3GPPInterleaver(inverse=True)
-        # also test that the deinterleaver can be used
+        inter = Turbo3GPPInterleaver(device=device)
+        inter2 = Turbo3GPPInterleaver(inverse=True, device=device)
         deinter = Deinterleaver(inter)
 
-        x = np.arange(seq_length)
-        x = np.expand_dims(x, axis=0)
-        x = np.tile(x, [batch_size, 1])
+        x = torch.arange(seq_length, device=device, dtype=torch.float32)
+        x = x.unsqueeze(0).expand(batch_size, -1)
+
         y = inter(x)
         z = inter2(y)
         z2 = deinter(y)
-        for i in range(batch_size):
-            # result must be sorted integers
-            self.assertTrue(np.array_equal(z[i,:], np.arange(seq_length)))
-            self.assertTrue(np.array_equal(z2[i,:], np.arange(seq_length)))
 
-        ###################
-        # test without batch dim
-        # test RowColumnInterleaver
-        inter = Turbo3GPPInterleaver()
-        # inherits precision from inter
+        for i in range(batch_size):
+            expected = torch.arange(seq_length, device=device, dtype=torch.float32)
+            assert torch.allclose(z[i, :], expected)
+            assert torch.allclose(z2[i, :], expected)
+
+    def test_inverse_no_batch_dim(self, device):
+        """Test inverse without batch dimension."""
+        seq_length = 1000
+
+        inter = Turbo3GPPInterleaver(device=device)
         deinter = Deinterleaver(inter)
 
-        x = np.arange(seq_length)
+        x = torch.arange(seq_length, device=device, dtype=torch.float32)
         y = inter(x)
         z = deinter(y)
-        self.assertFalse(np.array_equal(x,y))
-        self.assertTrue(np.array_equal(x,z))
 
-    def test_dimension(self):
+        assert not torch.allclose(x, y)
+        assert torch.allclose(x, z)
+
+    @pytest.mark.parametrize("case", [(102, 10), (101, 11)])
+    def test_dimension(self, device, case):
         """Test that dimensions can be changed."""
-        seq_length = int(1e1)
-        batch_size = int(1e2)
+        seq_length = 10
+        batch_size = 100
 
-        cases = np.array([[1e2, 1e1-1], [1e2, 1e1+1]])
+        inter = Turbo3GPPInterleaver(device=device)
+        inter(torch.rand(batch_size, seq_length, device=device))
 
-        # test that bs can be variable
-        cases = np.array([[1e2+2, 1e1], [1e2+1, 1e1+1]])
+        llr = torch.rand(int(case[0]), int(case[1]), device=device)
+        inter(llr)
 
-        llr = config.tf_rng.uniform([tf.cast(batch_size, dtype=tf.int32),
-                                tf.cast(seq_length, dtype=tf.int32)])
-        for c in cases:
-                i = Turbo3GPPInterleaver()
-                llr = config.tf_rng.uniform([tf.cast(c[0], dtype=tf.int32),
-                                         tf.cast(c[1], dtype=tf.int32)])
-                i(llr)
-
-    def test_multi_dim(self):
+    @pytest.mark.parametrize(
+        "shape,axis",
+        [
+            (shape, -1 if a == 0 else a)
+            for shape in [[10, 20, 30], [10, 22, 33, 44], [20, 10, 10, 10, 6]]
+            for a in range(len(shape))
+        ],
+    )
+    def test_multi_dim(self, device, shape, axis):
         """Test that 2+D Tensors permutation can be inverted/removed.
+
         Inherently tests that the output dimensions match.
         """
+        llr = torch.rand(shape, device=device) * 200 - 100
 
-        shapes=[[10,20,30], [10,22,33,44], [20,10,10,10,6]]
+        inter = Turbo3GPPInterleaver(axis=axis, device=device)
+        inter2 = Turbo3GPPInterleaver(axis=axis, inverse=True, device=device)
 
-        for s in shapes:
-            #check soft-value scrambling (flipp sign)
-            llr = config.tf_rng.uniform(tf.constant(s, dtype=tf.int32),
-                                    minval=-100,
-                                    maxval=100)
-            for a in range(0, len(s)):
-                    if a==0: # check that axis=-1 works as well...axis=0 is
-                        # invalid (=batch_dim) and does not need to be checked
-                        i = Turbo3GPPInterleaver(axis=-1)
-                        i2 = Turbo3GPPInterleaver(axis=-1,
-                                                  inverse=True)
-                    else:
-                        i = Turbo3GPPInterleaver(axis=a)
-                        i2 = Turbo3GPPInterleaver(axis=a,
-                                                  inverse=True)
+        x = inter(llr)
+        # After interleaving arrays must be different
+        assert not torch.allclose(x, llr)
 
-                    x = i(llr)
-                    # after interleaving arrays must be different
-                    self.assertTrue(np.any(np.not_equal(x.numpy(),llr.numpy())))
+        # After deinterleaving arrays should be equal again
+        x = inter2(x)
+        assert torch.allclose(x, llr)
 
-                    # after deinterleaving arrays should be equal again
-                    x = i2(x)
-                    self.assertIsNone(np.testing.assert_array_equal(x.numpy(), llr.numpy()))
-
-    def test_invalid_shapes(self):
-        """Test that invalid shapes/axis parameter raise error.
-        """
-
-        # k>6144
-        i = Turbo3GPPInterleaver(axis=-1)
+    def test_invalid_shapes(self, device):
+        """Test that invalid shapes/axis parameter raise error."""
+        # k > 6144
+        inter = Turbo3GPPInterleaver(axis=-1, device=device)
         s = [10, 6145]
-        llr = config.tf_rng.uniform(tf.constant(s, dtype=tf.int32))
-        with self.assertRaises(ValueError):
-            i(llr)
+        llr = torch.rand(s, device=device)
+        with pytest.raises(ValueError):
+            inter(llr)
 
-        s=[[10, 20, 30], [20, 10, 10, 10, 6]]
+        # Axis out of bounds
+        s = [10, 20, 30]
+        with pytest.raises(ValueError):
+            inter2 = Turbo3GPPInterleaver(axis=len(s), device=device)
+            llr = torch.rand(s, device=device)
+            inter2(llr)
 
-        with self.assertRaises(ValueError):
-            # axis out bounds...must raise error
-            i = Turbo3GPPInterleaver(axis=len(s))
-            llr = config.tf_rng.uniform(tf.constant(s, dtype=tf.int32))
-            i(llr)
-
-    def test_tf_fun(self):
-        """Test that tf.function works as expected and XLA work as expected.
-
-        Also tests that arrays are different.
-        """
-        @tf.function()
-        def run_graph(llr):
-            return i(llr)
-
-        @tf.function(jit_compile=True)
-        def run_graph_xla(llr):
-           return i(llr)
-
-        shapes=[[10,20,30], [10,22,33,44], [20,10,10,10,9]]
-        for s in shapes:
-            #check soft-value scrambling (flip sign)
-            llr = config.tf_rng.uniform(tf.constant(s, dtype=tf.int32))
-            i = Turbo3GPPInterleaver()
-            x1 = run_graph(llr)
-            x2 = run_graph_xla(llr)
-            # after interleaving arrays must be different
-            self.assertTrue(np.any(np.not_equal(x1.numpy(),llr.numpy())))
-            self.assertTrue(np.any(np.not_equal(x2.numpy(),llr.numpy())))
-
-            # XLA and graph mode should result in the same array
-            self.assertTrue(np.array_equal(x1.numpy(),x2.numpy()))
-
-        # test for variable lengths
-        i = Turbo3GPPInterleaver()
-        llr = config.tf_rng.uniform(tf.constant((10,100), dtype=tf.int32))
-        x = run_graph(llr)
-        x = run_graph_xla(llr)
-        llr = config.tf_rng.uniform(tf.constant((10,101), dtype=tf.int32))
-        x = run_graph(llr)
-        x = run_graph_xla(llr)
-
-    def test_dtype(self):
+    @pytest.mark.parametrize("dt_in", [torch.float32, torch.float64])
+    def test_dtype(self, device, precision, dt_in):
         """Test that variable dtypes are supported."""
-        seq_length = int(1e1)
-        batch_size = int(1e2)
+        seq_length = 10
+        batch_size = 100
 
-        precisions = ["single", "double"]
-        dt_supported = [tf.float32, tf.float64]
-        for p, dt in zip(precisions, dt_supported):
-            for dt_in in dt_supported:
-                b = tf.zeros([batch_size, seq_length], dtype=dt_in)
-                inter = Turbo3GPPInterleaver(precision=p)
-                x = inter(b)
-                assert (x.dtype==dt)
+        dtypes_supported = {
+            "single": torch.float32,
+            "double": torch.float64,
+        }
+        dt_out = dtypes_supported[precision]
+
+        b = torch.zeros(batch_size, seq_length, dtype=dt_in, device=device)
+        inter = Turbo3GPPInterleaver(precision=precision, device=device)
+        x = inter(b)
+        assert x.dtype == dt_out
+
+    @pytest.mark.parametrize(
+        "shape", [[10, 20, 30], [10, 22, 33, 44], [20, 10, 10, 10, 9]]
+    )
+    def test_torch_compile(self, device, shape):
+        """Test that torch.compile works as expected."""
+        llr = torch.rand(shape, device=device)
+        inter = Turbo3GPPInterleaver(device=device)
+
+        compiled_inter = torch.compile(inter)
+        x1 = compiled_inter(llr)
+        x2 = compiled_inter(llr)
+
+        # After interleaving arrays must be different
+        assert not torch.allclose(x1, llr)
+
+        # XLA and graph mode should result in the same array
+        assert torch.allclose(x1, x2)
+
+    def test_torch_compile_variable_lengths(self, device):
+        """Test that torch.compile works with variable input lengths."""
+        inter = Turbo3GPPInterleaver(device=device)
+        compiled_inter = torch.compile(inter)
+        llr = torch.rand(10, 100, device=device)
+        x = compiled_inter(llr)
+        llr = torch.rand(10, 101, device=device)
+        x = compiled_inter(llr)

@@ -1,155 +1,93 @@
-
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
-"""Definition of Sionna PHY Object and Block classes"""
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+"""Definition of Sionna Block"""
 
-from abc import ABC
-from abc import abstractmethod
-import tensorflow as tf
-import numpy as np
-from .config import config, dtypes
+from typing import Any, Optional
+from .object import Object
+from .config import Precision
+import torch
 
-class Object(ABC):
-    """Abstract class for Sionna PHY objects
+__all__ = ["Block"]
 
-    Parameters
-    ----------
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations.
-        If set to `None`, the default
-        :attr:`~sionna.phy.config.Config.precision` is used.
-    """
-
-    # pylint: disable=unused-argument
-    def __init__(self, *args, precision=None, **kwargs):
-        if precision is None:
-            self._precision = config.precision
-        elif precision in ['single', 'double']:
-            self._precision = precision
-        else:
-            raise ValueError("'precision' must be 'single' or 'double'")
-
-    @property
-    def precision(self):
-        """
-        `str`, "single" | "double" : Precision used for all compuations
-        """
-        return self._precision
-
-    @property
-    def cdtype(self):
-        """
-        `tf.complex` : Type for complex floating point numbers
-        """
-        return dtypes[self.precision]['tf']['cdtype']
-
-    @property
-    def rdtype(self):
-        """
-        `tf.float` : Type for real floating point numbers
-        """
-        return dtypes[self.precision]['tf']['rdtype']
-
-    def _cast_or_check_precision(self, v):
-        """Cast tensor to internal precision or check
-           if a variable has the right precision
-        """
-        # Check correct dtype for Variables
-        if isinstance(v, tf.Variable):
-            if v.dtype.is_complex:
-                if v.dtype != self.cdtype:
-                    msg = f"Wrong dtype. Expected {self.cdtype}" + \
-                          f", got {v.dtype}"
-                    raise ValueError(msg)
-            elif v.dtype.is_floating:
-                if v.dtype != self.rdtype:
-                    msg = f"Wrong dtype. Expected {self.cdtype}" + \
-                          f", got {v.dtype}"
-                    raise ValueError("Wrong dtype")
-
-        # Cast tensors to the correct dtype
-        else:
-            if not isinstance(v, tf.Tensor):
-                v = tf.convert_to_tensor(v)
-            if v.dtype.is_complex:
-                v = tf.cast(v, self.cdtype)
-            else:
-                v = tf.cast(v, self.rdtype)
-
-        return v
 
 class Block(Object):
-    """Abstract class for Sionna PHY processing blocks
+    """Abstract class for Sionna PHY processing blocks.
 
-    Parameters
-    ----------
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
-        If set to `None`, the default
-        :attr:`~sionna.phy.config.Config.precision` is used.
+    All Sionna PHY processing blocks inherit from this class. It provides
+    automatic input casting to the block's precision, lazy building based
+    on input shapes, and compatibility with ``torch.compile``.
+
+    :param precision: Precision used for internal calculations and outputs.
+        `None` (default) | ``"single"`` | ``"double"``.
+        If `None`, :attr:`~sionna.phy.config.Config.precision` is used.
+        Defaults to `None`.
+    :param device: Device for computation (e.g., ``'cpu'``, ``'cuda:0'``).
+        If `None`, :attr:`~sionna.phy.config.Config.device` is used.
+        Defaults to `None`.
     """
-    # pylint: disable=unused-argument
-    def __init__(self, *args, precision=None, **kwargs):
-        super().__init__(precision=precision, **kwargs)
 
-        # Boolean flag indicating if the block's build function has been called
-        # This will prevent rebuilding the block in Eager mode each time it is
-        # called.
+    def __init__(
+        self,
+        *args: Any,
+        precision: Optional[Precision] = None,
+        device: Optional[str] = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(precision=precision, device=device)
         self._built = False
 
     @property
-    def built(self):
-        """
-        `bool` : Indicates if the blocks' build function was called
-        """
+    def built(self) -> bool:
+        """Indicates if the block's build function was called."""
         return self._built
 
     def build(self, *arg_shapes, **kwarg_shapes):
+        r"""Initialize the block based on the inputs' shapes.
+
+        Subclasses can override this method to create tensors or
+        sub-blocks whose sizes depend on the input shapes.
+
+        :param \*arg_shapes: Shapes of the positional arguments. Can be
+            tuples (for tensors) or nested structures thereof (for
+            lists/dicts of tensors).
+        :param \*\*kwarg_shapes: Shapes of the keyword arguments. Can be
+            tuples (for tensors) or nested structures thereof (for
+            lists/dicts of tensors).
         """
-        Method to (optionally) initialize the block based on the inputs' shapes
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Call the block, with setup code skipped during ``torch.compile`` tracing.
+
+        When using ``torch.compile``, Dynamo traces this method and creates
+        guards on state like ``_built``. To avoid recompilation when ``_built``
+        changes from `False` to `True` after the first call, the setup code
+        (input conversion and lazy build) is skipped when being traced. This
+        is detected using ``torch.compiler.is_compiling()``.
+
+        The setup code runs in eager mode (when ``is_compiling()`` is `False`),
+        ensuring inputs are properly converted and blocks are built before the
+        compiled ``forward()`` executes.
         """
-        pass
+        # Skip setup during Dynamo tracing to avoid guards on _built
+        # Setup runs in eager mode on actual execution
+        if not torch.compiler.is_compiling():
+            args = self._convert(args)
+            kwargs = self._convert(kwargs)
 
-    @abstractmethod
-    def call(self, *args, **kwargs):
-        """
-        Abstract call method with arbitrary arguments and keyword
-        arguments
-        """
-        raise NotImplementedError("Subclasses must implement this method.")
-
-    def _convert_to_tensor(self, v):
-        """Casts floating or complex tensors to the block's precision"""
-        if isinstance(v, np.ndarray):
-            v = tf.convert_to_tensor(v)
-        if isinstance(v, tf.Tensor):
-            if v.dtype.is_floating:
-                v = tf.cast(v, self.rdtype)
-            elif v.dtype.is_complex:
-                v = tf.cast(v, self.cdtype)
-        return v
-
-    def _get_shape(self, v):
-        """Converts an input to the corresponding TensorShape"""
-        try :
-            v = tf.convert_to_tensor(v)
-        except (TypeError, ValueError):
-            pass
-        if hasattr(v, "shape"):
-            return tf.TensorShape(v.shape)
-        else:
-            return tf.TensorShape([])
-
-    def __call__(self, *args, **kwargs):
-
-        args, kwargs = tf.nest.map_structure(self._convert_to_tensor,
-                                             [args, kwargs])
-        with tf.init_scope(): # pylint: disable=not-context-manager
             if not self._built:
-                shapes =  tf.nest.map_structure(self._get_shape,
-                                             [args, kwargs])
-                self.build(*shapes[0], **shapes[1])
+                arg_shapes = self._get_shape(args)
+                kwarg_shapes = self._get_shape(kwargs)
+                self.build(*arg_shapes, **kwarg_shapes)
                 self._built = True
 
+        return super().__call__(*args, **kwargs)
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        """Delegates to :meth:`call`."""
         return self.call(*args, **kwargs)
+
+    def call(self, *args: Any, **kwargs: Any) -> Any:
+        """Process inputs. Must be implemented by subclasses."""
+        raise NotImplementedError("Subclasses must implement 'call'.")

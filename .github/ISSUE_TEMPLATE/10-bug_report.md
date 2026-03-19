@@ -1,5 +1,5 @@
 <!--
-SPDX-FileCopyrightText: Copyright (c) 2021-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0
 -->
 ---
@@ -30,16 +30,16 @@ A clear and concise description of what you expected to happen.
 If applicable, add screenshots to help explain your problem.
 
 **System:**
- - OS: [e.g. Ubuntu 20.04]
- - NVIDIA Driver version: [e.g. 450.00]
- - CUDA version: [e.g. 11.0]
- - Python version: [e.g. 3.9.5]
- - TensorFlow version: [e.g. 2.5.0]
-
+ - OS: [e.g. Ubuntu 24.04]
+ - NVIDIA Driver version: [e.g. 590.00]
+ - CUDA version: [e.g. 13.0]
+ - Python version: [e.g. 3.11]
+ - PyTorch version: [e.g. 2.10]
+ - Sionna version: [e.g. 2.0]
 
 **GPUs:**
- - Model: [e.g. RTX 3090]
- - Memory: [e.g. 24GB]
+ - Model: [e.g. RTX 5090]
+ - Memory: [e.g. 32GB]
 
 **Additional context**
 Add any other context about the problem here.

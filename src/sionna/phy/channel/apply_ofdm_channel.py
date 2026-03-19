@@ -1,20 +1,23 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
-"""
-Block for applying OFDM channel: single-tap channel response in the frequency
-domain
-"""
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+"""Block for applying OFDM channel: single-tap channel response in the frequency domain"""
 
-import tensorflow as tf
+from typing import Optional, Union
+
+import torch
+
 from sionna.phy import Block
+from sionna.phy.config import Precision
 from sionna.phy.utils import expand_to_rank
 from .awgn import AWGN
 
+__all__ = ["ApplyOFDMChannel"]
+
+
 class ApplyOFDMChannel(Block):
-    # pylint: disable=line-too-long
-    r"""
-    Apply single-tap channel frequency responses to channel inputs
+    r"""Apply single-tap channel frequency responses to channel inputs
 
     For each OFDM symbol :math:`s` and subcarrier :math:`n`, the single-tap channel
     is applied as follows:
@@ -29,22 +32,18 @@ class ApplyOFDMChannel(Block):
     For multiple-input multiple-output (MIMO) links, the channel output is computed for each antenna
     of each receiver and by summing over all the antennas of all transmitters.
 
-    Parameters
-    ----------
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
-        If set to `None`,
-        :attr:`~sionna.phy.config.Config.precision` is used.
+    :param precision: Precision used for internal calculations and outputs.
+        If set to `None`, :attr:`~sionna.phy.config.Config.precision` is used.
+    :param device: Device for computation (e.g., 'cpu', 'cuda:0').
+        If `None`, :attr:`~sionna.phy.config.Config.device` is used.
 
-    Input
-    -----
-    x :  [batch size, num_tx, num_tx_ant, num_ofdm_symbols, fft_size], `tf.complex`
-        Channel inputs
+    :input x: [batch size, num_tx, num_tx_ant, num_ofdm_symbols, fft_size], `torch.complex`.
+        Channel inputs.
 
-    h_freq : [batch size, num_rx, num_rx_ant, num_tx, num_tx_ant, num_ofdm_symbols, fft_size], `tf.complex`
-        Channel frequency responses
+    :input h_freq: [batch size, num_rx, num_rx_ant, num_tx, num_tx_ant, num_ofdm_symbols, fft_size], `torch.complex`.
+        Channel frequency responses.
 
-    no : `None` (default) | tensor, `tf.float`
+    :input no: `None` (default) | Tensor, `torch.float`.
         Tensor whose shape can be broadcast to the shape of the
         channel outputs:
         [batch size, num_rx, num_rx_ant, num_ofdm_symbols, fft_size].
@@ -57,21 +56,66 @@ class ApplyOFDMChannel(Block):
         shape of the channel outputs by adding dummy dimensions after the
         last axis.
 
-    Output
-    -------
-    y : [batch size, num_rx, num_rx_ant, num_ofdm_symbols, fft_size], `tf.complex`
-        Channel outputs
+    :output y: [batch size, num_rx, num_rx_ant, num_ofdm_symbols, fft_size], `torch.complex`.
+        Channel outputs.
+
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        import torch
+        from sionna.phy.channel import ApplyOFDMChannel
+
+        apply_ch = ApplyOFDMChannel()
+
+        # Create dummy inputs
+        batch_size, num_tx, num_tx_ant = 16, 2, 4
+        num_rx, num_rx_ant = 1, 8
+        num_ofdm_symbols, fft_size = 14, 64
+
+        x = torch.randn(batch_size, num_tx, num_tx_ant, num_ofdm_symbols, fft_size,
+                        dtype=torch.complex64)
+        h_freq = torch.randn(batch_size, num_rx, num_rx_ant, num_tx, num_tx_ant,
+                             num_ofdm_symbols, fft_size, dtype=torch.complex64)
+
+        y = apply_ch(x, h_freq)
+        print(y.shape)
+        # torch.Size([16, 1, 8, 14, 64])
     """
 
-    def __init__(self, precision=None, **kwargs):
-        super().__init__(precision=precision, **kwargs)
-        self._awgn = AWGN(precision=self.precision)
+    def __init__(
+        self,
+        precision: Optional[Precision] = None,
+        device: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(precision=precision, device=device, **kwargs)
+        self._awgn = AWGN(precision=self.precision, device=self.device)
 
-    def call(self, x, h_freq, no=None):
+    def call(
+        self,
+        x: torch.Tensor,
+        h_freq: torch.Tensor,
+        no: Optional[Union[float, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """Apply OFDM channel frequency response to input.
 
+        :param x: Channel inputs
+        :param h_freq: Channel frequency responses
+        :param no: Optional noise power per complex dimension
+
+        :output y: Channel outputs
+        """
         # Apply the channel response
-        x = expand_to_rank(x, h_freq.shape.rank, axis=1)
-        y = tf.reduce_sum(tf.reduce_sum(h_freq*x, axis=4), axis=3)
+        # x: [batch, num_tx, num_tx_ant, num_ofdm_symbols, fft_size]
+        # h_freq: [batch, num_rx, num_rx_ant, num_tx, num_tx_ant, num_ofdm_symbols, fft_size]
+        # Expand x to match h_freq rank by adding num_rx and num_rx_ant dimensions
+        x = expand_to_rank(x, h_freq.dim(), axis=1)
+        # x is now: [batch, 1, 1, num_tx, num_tx_ant, num_ofdm_symbols, fft_size]
+
+        # Element-wise multiply and sum over num_tx_ant (dim=4) and num_tx (dim=3)
+        y = (h_freq * x).sum(dim=4).sum(dim=3)
+        # y: [batch, num_rx, num_rx_ant, num_ofdm_symbols, fft_size]
 
         # Add AWGN if requested
         if no is not None:

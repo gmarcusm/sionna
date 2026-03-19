@@ -1,19 +1,25 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
-"""
-Block for implementing an ideal OFDM channel response, i.e., single-tap
-channel response in the frequency domain
-"""
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+"""Block for implementing an ideal OFDM channel response, i.e., single-tap channel response in the frequency domain"""
 
-import tensorflow as tf
+from typing import Optional, Tuple, Union
+
+import torch
+
 from sionna.phy import Block
-from . import GenerateOFDMChannel, ApplyOFDMChannel
+from sionna.phy.config import Precision
+from sionna.phy.ofdm import ResourceGrid
+from .channel_model import ChannelModel
+from .generate_ofdm_channel import GenerateOFDMChannel
+from .apply_ofdm_channel import ApplyOFDMChannel
+
+__all__ = ["OFDMChannel"]
+
 
 class OFDMChannel(Block):
-    # pylint: disable=line-too-long
-    r"""
-    Generate channel frequency responses and apply them to channel inputs
+    r"""Generate channel frequency responses and apply them to channel inputs
     assuming an OFDM waveform with no ICI nor ISI
 
     For each OFDM symbol :math:`s` and subcarrier :math:`n`, the channel output is computed as follows:
@@ -41,33 +47,23 @@ class OFDMChannel(Block):
     next in the event of mobility, even if it is assumed static over the duration
     of an OFDM symbol.
 
-    Parameters
-    ----------
-    channel_model : :class:`~sionna.phy.channel.ChannelModel`
-        Used channel model
+    :param channel_model: Channel model to be used. Must be callable with signature
+        ``(batch_size, num_time_steps, sampling_frequency) -> (h, tau)``.
+    :param resource_grid: Resource grid object. Must have properties: ``num_ofdm_symbols``,
+        ``subcarrier_spacing``, ``fft_size``, and ``ofdm_symbol_duration``.
+    :param normalize_channel: If set to `True`, the channel is normalized over the resource grid
+        to ensure unit average energy per resource element. Defaults to `False`.
+    :param return_channel: If set to `True`, the channel response is returned in addition to the
+        channel output. Defaults to `False`.
+    :param precision: Precision used for internal calculations and outputs.
+        If set to `None`, :attr:`~sionna.phy.config.Config.precision` is used.
+    :param device: Device for computation (e.g., 'cpu', 'cuda:0').
+        If `None`, :attr:`~sionna.phy.config.Config.device` is used.
 
-    resource_grid : :class:`~sionna.phy.ofdm.ResourceGrid`
-        Resource grid
+    :input x: [batch size, num_tx, num_tx_ant, num_ofdm_symbols, fft_size], `torch.complex`.
+        Channel inputs.
 
-    normalize_channel : `bool`, (default `False`)
-        If set to `True`, the channel is normalized over the resource grid
-        to ensure unit average energy per resource element.
-
-    return_channel : `bool`, (default `False`)
-        If set to `True`, the channel response is returned in addition to the
-        channel output.
-
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
-        If set to `None`,
-        :attr:`~sionna.phy.config.Config.precision` is used.
-
-    Input
-    -----
-    x : [batch size, num_tx, num_tx_ant, num_ofdm_symbols, fft_size], `tf.complex`
-        Channel inputs
-
-    no : `None` (default) | tensor, `tf.float`
+    :input no: `None` (default) | Tensor, `torch.float`.
         Tensor whose shape can be broadcast to the shape of the
         channel outputs:
         [batch size, num_rx, num_rx_ant, num_ofdm_symbols, fft_size].
@@ -80,35 +76,104 @@ class OFDMChannel(Block):
         shape of the channel outputs by adding dummy dimensions after the last
         axis.
 
-    Output
-    -------
-    y : [batch size, num_rx, num_rx_ant, num_ofdm_symbols, fft_size], `tf.complex`
-        Channel outputs
-    h_freq : [batch size, num_rx, num_rx_ant, num_tx, num_tx_ant, num_ofdm_symbols, fft_size], `tf.complex`
+    :output y: [batch size, num_rx, num_rx_ant, num_ofdm_symbols, fft_size], `torch.complex`.
+        Channel outputs.
+
+    :output h_freq: [batch size, num_rx, num_rx_ant, num_tx, num_tx_ant, num_ofdm_symbols, fft_size], `torch.complex`.
         (Optional) Channel frequency responses. Returned only if
         ``return_channel`` is set to `True`.
+
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        import torch
+        from sionna.phy.channel import OFDMChannel, RayleighBlockFading
+
+        # Create a simple resource grid-like object
+        class SimpleResourceGrid:
+            num_ofdm_symbols = 14
+            fft_size = 64
+            subcarrier_spacing = 15e3
+            cyclic_prefix_length = 4
+
+            @property
+            def ofdm_symbol_duration(self):
+                return (1 + self.cyclic_prefix_length / self.fft_size) / self.subcarrier_spacing
+
+        rg = SimpleResourceGrid()
+        channel_model = RayleighBlockFading(num_rx=1, num_rx_ant=2, num_tx=1, num_tx_ant=4)
+        ofdm_channel = OFDMChannel(channel_model, rg, return_channel=True)
+
+        x = torch.randn(32, 1, 4, 14, 64, dtype=torch.complex64)
+        y, h_freq = ofdm_channel(x)
+        print(y.shape)
+        # torch.Size([32, 1, 2, 14, 64])
+        print(h_freq.shape)
+        # torch.Size([32, 1, 2, 1, 4, 14, 64])
     """
 
-    def __init__(self, channel_model, resource_grid, normalize_channel=False,
-                 return_channel=False,
-                 precision=None, **kwargs):
-        super().__init__(precision=precision, **kwargs)
+    def __init__(
+        self,
+        channel_model: ChannelModel,
+        resource_grid: ResourceGrid,
+        normalize_channel: bool = False,
+        return_channel: bool = False,
+        precision: Optional[Precision] = None,
+        device: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(precision=precision, device=device, **kwargs)
 
         self._cir_sampler = channel_model
         self._rg = resource_grid
         self._normalize_channel = normalize_channel
         self._return_channel = return_channel
 
-        self._generate_channel = GenerateOFDMChannel(self._cir_sampler,
-                                                     self._rg,
-                                                     self._normalize_channel,
-                                                     self.precision)
+        self._generate_channel = GenerateOFDMChannel(
+            self._cir_sampler,
+            self._rg,
+            self._normalize_channel,
+            precision=self.precision,
+            device=self.device,
+        )
 
-        self._apply_channel = ApplyOFDMChannel(self.precision)
+        self._apply_channel = ApplyOFDMChannel(
+            precision=self.precision,
+            device=self.device,
+        )
 
-    def call(self, x, no=None):
-        h_freq = self._generate_channel(tf.shape(x)[0])
+    @property
+    def generate(self) -> GenerateOFDMChannel:
+        """Access the internal :class:`GenerateOFDMChannel`"""
+        return self._generate_channel
+
+    @property
+    def apply(self) -> ApplyOFDMChannel:
+        """Access the internal :class:`ApplyOFDMChannel`"""
+        return self._apply_channel
+
+    def call(
+        self,
+        x: torch.Tensor,
+        no: Optional[Union[float, torch.Tensor]] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """Apply OFDM channel to input.
+
+        :param x: Channel inputs
+        :param no: Optional noise power per complex dimension
+
+        :output y: Channel output.
+
+        :output h_freq: (Optional) Channel frequency responses. Returned only if
+            ``return_channel`` is `True`.
+        """
+        # Generate channel frequency responses
+        h_freq = self._generate_channel(x.shape[0])
+
+        # Apply channel to input
         y = self._apply_channel(x, h_freq, no)
+
         if self._return_channel:
             return y, h_freq
         else:

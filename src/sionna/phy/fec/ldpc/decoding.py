@@ -1,19 +1,37 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
 """Blocks for channel decoding and utility functions."""
 
-import tensorflow as tf
+from typing import Callable, List, Optional, Tuple, Union
+import types
+
 import numpy as np
-import scipy as sp # for sparse H matrix computations
+import scipy as sp
+import torch
+
 from sionna.phy import Block
 from sionna.phy.fec.ldpc.encoding import LDPC5GEncoder
-import types
+
+
+__all__ = [
+    "LDPCBPDecoder",
+    "LDPC5GDecoder",
+    "vn_update_sum",
+    "vn_node_update_identity",
+    "cn_update_tanh",
+    "cn_update_phi",
+    "cn_update_minsum",
+    "cn_update_offset_minsum",
+    "cn_node_update_identity",
+]
+
 
 class LDPCBPDecoder(Block):
     # pylint: disable=line-too-long
     r"""Iterative belief propagation decoder for low-density parity-check (LDPC)
-    codes and other `codes on graphs`.
+    codes and other codes on graphs.
 
     This class defines a generic belief propagation decoder for decoding
     with arbitrary parity-check matrices. It can be used to iteratively
@@ -21,7 +39,8 @@ class LDPCBPDecoder(Block):
     LLR-values of the received noisy codeword observation.
 
     Per default, the decoder implements the flooding message passing algorithm
-    [Ryan]_, i.e., all nodes are updated in a parallel fashion. Different check node update functions are available
+    :cite:p:`Ryan`, i.e., all nodes are updated in a parallel fashion. Different check
+    node update functions are available:
 
     (1) `boxplus`
 
@@ -33,131 +52,111 @@ class LDPCBPDecoder(Block):
         .. math::
             y_{j \to i} = \alpha_{j \to i} \cdot \phi \left( \sum_{i' \in \mathcal{N}(j) \setminus i} \phi \left( |x_{i' \to j}|\right) \right)
 
-        with :math:`\phi(x)=-\operatorname{log}(\operatorname{tanh} \left(\frac{x}{2}) \right)`
+        with :math:`\phi(x)=-\operatorname{log}\left(\operatorname{tanh}\left(\frac{x}{2}\right)\right)`
 
     (3) `minsum`
 
         .. math::
-            \qquad y_{j \to i} = \alpha_{j \to i} \cdot {min}_{i' \in \mathcal{N}(j) \setminus i} \left(|x_{i' \to j}|\right)
+            \qquad y_{j \to i} = \alpha_{j \to i} \cdot \min_{i' \in \mathcal{N}(j) \setminus i} \left(|x_{i' \to j}|\right)
 
     (4) `offset-minsum`
 
     .. math::
-            \qquad y_{j \to i} = \alpha_{j \to i} \cdot {max} \left( {min}_{i' \in \mathcal{N}(j) \setminus i} \left(|x_{i' \to j}| \right)-\beta , 0\right)
+            \qquad y_{j \to i} = \alpha_{j \to i} \cdot \max \left( \min_{i' \in \mathcal{N}(j) \setminus i} \left(|x_{i' \to j}| \right)-\beta , 0\right)
 
-    where :math:`\beta=0.5` and and :math:`y_{j \to i}` denotes the message
+    where :math:`\beta=0.5` and :math:`y_{j \to i}` denotes the message
     from check node (CN) *j* to variable node (VN) *i* and :math:`x_{i \to j}`
-    from VN *i* to CN *j*, respectively.  Further, :math:`\mathcal{N}(j)`
+    from VN *i* to CN *j*, respectively. Further, :math:`\mathcal{N}(j)`
     denotes all indices of connected VNs to CN *j* and
 
     .. math::
         \alpha_{j \to i} = \prod_{i' \in \mathcal{N}(j) \setminus i} \operatorname{sign}(x_{i' \to j})
 
     is the sign of the outgoing message. For further details we refer to
-    [Ryan]_ and [Chen]_ for offset corrected minsum.
+    :cite:p:`Ryan` and :cite:p:`Chen` for offset corrected minsum.
 
     Note that for full 5G 3GPP NR compatibility, the correct puncturing and
-    shortening patterns must be applied (cf. [Richardson]_ for details), this
+    shortening patterns must be applied (cf. :cite:p:`Richardson` for details), this
     can be done by :class:`~sionna.phy.fec.ldpc.encoding.LDPC5GEncoder` and
     :class:`~sionna.phy.fec.ldpc.decoding.LDPC5GDecoder`, respectively.
 
     If required, the decoder can be made trainable and is fully differentiable
-    by following the concept of `weighted BP` [Nachmani]_. For this, custom
+    by following the concept of *weighted BP* :cite:p:`Nachmani`. For this, custom
     callbacks can be registered that scale the messages during decoding. Please
     see the corresponding tutorial notebook for details.
 
-    For numerical stability, the decoder applies LLR clipping of +/- `llr_max`
+    For numerical stability, the decoder applies LLR clipping of +/- ``llr_max``
     to the input LLRs.
 
-    Parameters
-    ----------
-    pcm: ndarray
-        An ndarray of shape `[n-k, n]` defining the parity-check matrix
-        consisting only of `0` or `1` entries. Can be also of type `scipy.
-        sparse.csr_matrix` or `scipy.sparse.csc_matrix`.
-
-    cn_update: str, "boxplus-phi" (default) | "boxplus" | "minsum" | "offset-minsum" | "identity" | callable
-        Check node update rule to be used as described above.
+    :param pcm: An ndarray of shape `[n-k, n]` defining the parity-check
+        matrix consisting only of `0` or `1` entries. Can also be of type
+        `scipy.sparse.csr_matrix` or `scipy.sparse.csc_matrix`.
+    :param cn_update: Check node update rule to be used as described above.
+        One of "boxplus-phi" (default), "boxplus", "minsum", "offset-minsum",
+        "identity", or a callable.
         If a callable is provided, it will be used instead as CN update.
-        The input of the function is a ragged tensor of v2c messages of shape
-        `[num_cns, None, batch_size]` where the second dimension is ragged
-        (i.e., depends on the individual CN degree).
-
-    vn_update: str, "sum" (default) | "identity" | callable
-        Variable node update rule to be used.
+        The input of the function is a tensor of v2c messages of shape
+        `[batch_size, num_cns, max_degree]` with a mask of shape
+        `[num_cns, max_degree]`.
+    :param vn_update: Variable node update rule to be used.
+        One of "sum" (default), "identity", or a callable.
         If a callable is provided, it will be used instead as VN update.
-        The input of the function is a ragged tensor of c2v messages of shape
-        `[num_vns, None, batch_size]` where the second dimension is ragged
-        (i.e., depends on the individual VN degree).
-
-    cn_schedule: "flooding" | [num_update_steps, num_active_nodes], tf.int
-        Defines the CN update scheduling per BP iteration. Can be either
-        "flooding" to update all nodes in parallel (recommended) or an 2D tensor
-        where each row defines the `num_active_nodes` node indices to be
-        updated per subiteration. In this case each BP iteration runs
-        `num_update_steps` subiterations, thus the decoder's level of
-        parallelization is lower and usually the decoding throughput decreases.
-
-    hard_out: `bool`, (default `True`)
-        If `True`,  the decoder provides hard-decided codeword bits instead of
-        soft-values.
-
-    num_iter: int
-        Defining the number of decoder iteration (due to batching, no early
-        stopping used at the moment!).
-
-    llr_max: float (default 20) | `None`
-        Internal clipping value for all internal messages. If `None`, no
-        clipping is applied.
-
-    v2c_callbacks, `None` (default) | list of callables
-        Each callable will be executed after each VN update with the following
-        arguments `msg_vn_rag_`, `it`, `x_hat`,where `msg_vn_rag_` are the v2c
-        messages as ragged tensor of shape `[num_vns, None, batch_size]`,
-        `x_hat` is the current estimate of each VN of shape
-        `[num_vns, batch_size]` and `it` is the current iteration counter.
-        It must return and updated version of `msg_vn_rag_` of same shape.
-
-    c2v_callbacks: `None` (default) | list of callables
-        Each callable will be executed after each CN update with the following
-        arguments `msg_cn_rag_` and `it` where `msg_cn_rag_` are the c2v
-        messages as ragged tensor of shape `[num_cns, None, batch_size]` and
-        `it` is the current iteration counter.
-        It must return and updated version of `msg_cn_rag_` of same shape.
-
-    return_state: `bool`, (default `False`)
-        If `True`,  the internal VN messages ``msg_vn`` from the last decoding
-        iteration are returned, and ``msg_vn`` or `None` needs to be given as a
-        second input when calling the decoder.
+        The input of the function is a tensor of c2v messages of shape
+        `[batch_size, num_vns, max_degree]` with a mask of shape
+        `[num_vns, max_degree]`.
+    :param cn_schedule: Defines the CN update scheduling per BP iteration.
+        Can be either "flooding" to update all nodes in parallel (recommended)
+        or a 2D tensor of shape `[num_update_steps, num_active_nodes]` where
+        each row defines the node indices to be updated per subiteration.
+        In this case each BP iteration runs ``num_update_steps``
+        subiterations, thus the decoder's level of parallelization is lower
+        and usually the decoding throughput decreases.
+    :param hard_out: If `True`, the decoder provides hard-decided codeword
+        bits instead of soft-values.
+    :param num_iter: Defining the number of decoder iterations (due to
+        batching, no early stopping used at the moment!).
+    :param llr_max: Internal clipping value for all internal messages. If
+        `None`, no clipping is applied.
+    :param v2c_callbacks: Each callable will be executed after each VN update
+        with the following arguments ``msg_vn``, ``it``, ``x_hat``, where
+        ``msg_vn`` are the v2c messages as tensor of shape
+        `[batch_size, num_vns, max_degree]`, ``x_hat`` is the current
+        estimate of each VN of shape `[batch_size, num_vns]`, and ``it`` is
+        the current iteration counter.
+        It must return an updated version of ``msg_vn`` of same shape.
+    :param c2v_callbacks: Each callable will be executed after each CN update
+        with the following arguments ``msg_cn`` and ``it`` where ``msg_cn``
+        are the c2v messages as tensor of shape
+        `[batch_size, num_cns, max_degree]` and ``it`` is the current
+        iteration counter.
+        It must return an updated version of ``msg_cn`` of same shape.
+    :param return_state: If `True`, the internal VN messages ``msg_vn`` from
+        the last decoding iteration are returned, and ``msg_vn`` or `None`
+        needs to be given as a second input when calling the decoder.
         This can be used for iterative demapping and decoding.
-
-    precision : `None` (default) | 'single' | 'double'
-        Precision used for internal calculations and outputs.
+    :param precision: Precision used for internal calculations and outputs.
         If set to `None`, :py:attr:`~sionna.phy.config.precision` is used.
+    :param device: Device for computation (e.g., 'cpu', 'cuda:0').
 
-    Input
-    -----
-    llr_ch: [...,n], tf.float
+    :input llr_ch: [..., n], `torch.float`.
         Tensor containing the channel logits/llr values.
 
-    msg_v2c: `None` | [num_edges, batch_size], tf.float
+    :input msg_v2c: `None` | [batch_size, num_edges], `torch.float`.
         Tensor of VN messages representing the internal decoder state.
-        Required only if the decoder shall use its previous internal state, e.g.
-        for iterative detection and decoding (IDD) schemes.
+        Required only if the decoder shall use its previous internal state,
+        e.g., for iterative detection and decoding (IDD) schemes.
 
-    Output
-    ------
-    : [...,n], tf.float
+    :output x_hat: [..., n], `torch.float`.
         Tensor of same shape as ``llr_ch`` containing
         bit-wise soft-estimates (or hard-decided bit-values) of all
         codeword bits.
 
-    : [num_edges, batch_size], tf.float:
+    :output msg_v2c: [batch_size, num_edges], `torch.float`.
         Tensor of VN messages representing the internal decoder state.
         Returned only if ``return_state`` is set to `True`.
 
-    Note
-    ----
+    .. rubric:: Notes
+
     As decoding input logits :math:`\operatorname{log} \frac{p(x=1)}{p(x=0)}`
     are assumed for compatibility with the learning framework, but internally
     log-likelihood ratios (LLRs) with definition
@@ -166,76 +165,91 @@ class LDPCBPDecoder(Block):
     The decoder is not (particularly) optimized for quasi-cyclic (QC) LDPC
     codes and, thus, supports arbitrary parity-check matrices.
 
-    The decoder is implemented by using '"ragged Tensors"' [TF_ragged]_ to
-    account for arbitrary node degrees. To avoid a performance degradation
-    caused by a severe indexing overhead, the batch-dimension is shifted to
-    the last dimension during decoding.
+    .. rubric:: Examples
+
+
+    .. code-block:: python
+
+        import torch
+        from sionna.phy.fec.utils import load_parity_check_examples
+        from sionna.phy.fec.ldpc import LDPCBPDecoder
+
+        # Load (7,4) Hamming code
+        pcm, k, n, _ = load_parity_check_examples(0)
+        decoder = LDPCBPDecoder(pcm, num_iter=10)
+
+        # Decode random LLRs
+        llr_ch = torch.randn(100, n) * 2.0
+        c_hat = decoder(llr_ch)
+        print(c_hat.shape)
+        # torch.Size([100, 7])
     """
 
-    def __init__(self,
-                 pcm,
-                 cn_update="boxplus-phi",
-                 vn_update="sum",
-                 cn_schedule="flooding",
-                 hard_out=True,
-                 num_iter=20,
-                 llr_max=20.,
-                 v2c_callbacks=None,
-                 c2v_callbacks=None,
-                 return_state=False,
-                 precision=None,
-                 **kwargs):
+    def __init__(
+        self,
+        pcm: Union[np.ndarray, sp.sparse.csr_matrix, sp.sparse.csc_matrix],
+        cn_update: Union[str, Callable] = "boxplus-phi",
+        vn_update: Union[str, Callable] = "sum",
+        cn_schedule: Union[str, np.ndarray, torch.Tensor] = "flooding",
+        hard_out: bool = True,
+        num_iter: int = 20,
+        llr_max: Optional[float] = 20.0,
+        v2c_callbacks: Optional[List[Callable]] = None,
+        c2v_callbacks: Optional[List[Callable]] = None,
+        return_state: bool = False,
+        precision: Optional[str] = None,
+        device: Optional[str] = None,
+        **kwargs,
+    ):
+        super().__init__(precision=precision, device=device, **kwargs)
 
-        super().__init__(precision=precision, **kwargs)
-
-        # check inputs for consistency
+        # Check inputs for consistency
         if not isinstance(hard_out, bool):
-            raise TypeError('hard_out must be bool.')
+            raise TypeError("hard_out must be bool.")
         if not isinstance(num_iter, int):
-            raise TypeError('num_iter must be int.')
-        if num_iter<0:
-            raise ValueError('num_iter cannot be negative.')
+            raise TypeError("num_iter must be int.")
+        if num_iter < 0:
+            raise ValueError("num_iter cannot be negative.")
         if not isinstance(return_state, bool):
-            raise TypeError('return_state must be bool.')
+            raise TypeError("return_state must be bool.")
 
         if isinstance(pcm, np.ndarray):
             if not np.array_equal(pcm, pcm.astype(bool)):
-                raise ValueError('PC matrix must be binary.')
+                raise ValueError("PC matrix must be binary.")
         elif isinstance(pcm, sp.sparse.csr_matrix):
             if not np.array_equal(pcm.data, pcm.data.astype(bool)):
-                raise ValueError('PC matrix must be binary.')
+                raise ValueError("PC matrix must be binary.")
         elif isinstance(pcm, sp.sparse.csc_matrix):
             if not np.array_equal(pcm.data, pcm.data.astype(bool)):
-                raise ValueError('PC matrix must be binary.')
+                raise ValueError("PC matrix must be binary.")
         else:
             raise TypeError("Unsupported dtype of pcm.")
 
         # Deprecation warning for cn_type
-        if 'cn_type' in kwargs:
+        if "cn_type" in kwargs:
             raise TypeError("'cn_type' is deprecated; use 'cn_update' instead.")
 
-        # init decoder parameters
+        # Init decoder parameters
         self._pcm = pcm
         self._hard_out = hard_out
-        self._num_iter = tf.constant(num_iter, dtype=tf.int32)
+        self._num_iter = num_iter
         self._return_state = return_state
 
-        self._num_cns = pcm.shape[0] # total number of check nodes
-        self._num_vns = pcm.shape[1] # total number of variable nodes
+        self._num_cns = pcm.shape[0]  # total number of check nodes
+        self._num_vns = pcm.shape[1]  # total number of variable nodes
 
-        # internal value for llr clipping
-        if not isinstance(llr_max, (int, float)):
+        # Internal value for LLR clipping
+        if llr_max is not None and not isinstance(llr_max, (int, float)):
             raise TypeError("llr_max must be int or float.")
-        self._llr_max = tf.cast(llr_max, self.rdtype)
+        self._llr_max = float(llr_max) if llr_max is not None else None
 
         if v2c_callbacks is None:
             self._v2c_callbacks = []
         else:
             if isinstance(v2c_callbacks, (list, tuple)):
-                self._v2c_callbacks = v2c_callbacks
+                self._v2c_callbacks = list(v2c_callbacks)
             elif isinstance(v2c_callbacks, types.FunctionType):
-                # allow that user provides single function
-                self._v2c_callbacks = [v2c_callbacks,]
+                self._v2c_callbacks = [v2c_callbacks]
             else:
                 raise TypeError("v2c_callbacks must be a list of callables.")
 
@@ -243,442 +257,699 @@ class LDPCBPDecoder(Block):
             self._c2v_callbacks = []
         else:
             if isinstance(c2v_callbacks, (list, tuple)):
-                self._c2v_callbacks = c2v_callbacks
+                self._c2v_callbacks = list(c2v_callbacks)
             elif isinstance(c2v_callbacks, types.FunctionType):
-                # allow that user provides single function
-                self._c2v_callbacks = [c2v_callbacks,]
+                self._c2v_callbacks = [c2v_callbacks]
             else:
                 raise TypeError("c2v_callbacks must be a list of callables.")
 
-        if isinstance(cn_schedule, str) and cn_schedule=="flooding":
-            self._scheduling = "flooding"
-            self._cn_schedule = tf.stack([tf.range(self._num_cns)], axis=0)
-        elif tf.is_tensor(cn_schedule) or isinstance(cn_schedule, np.ndarray):
-            cn_schedule = tf.cast(cn_schedule, tf.int32)
-            self._scheduling = "custom"
-            # check custom schedule for consistency
-            if len(cn_schedule.shape)!=2:
-                raise ValueError("cn_schedule must be of rank 2.")
-            if tf.reduce_max(cn_schedule)>=self._num_cns:
-                msg = "cn_schedule can only contain values smaller number_cns."
-                raise ValueError(msg)
-            if tf.reduce_min(cn_schedule)<0:
-                msg = "cn_schedule cannot contain negative values."
-                raise ValueError(msg)
-            self._cn_schedule = cn_schedule
-        else:
-            msg = "cn_schedule can be 'flooding' or an array of ints."
-            raise ValueError(msg)
-
-        ######################
-        # Init graph structure
-        ######################
-
-        # make pcm sparse first if ndarray is provided
+        # Make pcm sparse first if ndarray is provided
         if isinstance(pcm, np.ndarray):
-            pcm = sp.sparse.csr_matrix(pcm)
+            pcm_sparse = sp.sparse.csr_matrix(pcm)
+        else:
+            pcm_sparse = pcm
 
         # Assign all edges to CN and VN nodes, respectively
-        self._cn_idx, self._vn_idx, _ = sp.sparse.find(pcm)
+        cn_idx, vn_idx, _ = sp.sparse.find(pcm_sparse)
 
-        # sort indices explicitly, as scipy.sparse.find changed from column to
-        # row sorting in scipy>=1.11
-        idx = np.argsort(self._vn_idx)
-        self._cn_idx = self._cn_idx[idx]
-        self._vn_idx = self._vn_idx[idx]
+        # Sort indices explicitly (scipy.sparse.find changed from column to
+        # row sorting in scipy>=1.11)
+        idx = np.argsort(vn_idx)
+        self._cn_idx = cn_idx[idx]
+        self._vn_idx = vn_idx[idx]
 
-        # number of edges equals number of non-zero elements in the
-        # parity-check matrix
+        # Number of edges equals number of non-zero elements in PCM
         self._num_edges = len(self._vn_idx)
 
-        # pre-load the CN function
-        if cn_update=='boxplus':
-            # check node update using the tanh function
+        # Pre-load the CN function
+        if cn_update == "boxplus":
             self._cn_update = cn_update_tanh
-        elif cn_update=='boxplus-phi':
-            # check node update using the "_phi" function
+        elif cn_update == "boxplus-phi":
             self._cn_update = cn_update_phi
-        elif cn_update in ('minsum', 'min'):
-            # check node update using the min-sum approximation
+        elif cn_update in ("minsum", "min"):
             self._cn_update = cn_update_minsum
-        elif cn_update=="offset-minsum":
-            # check node update using the min-sum approximation
+        elif cn_update == "offset-minsum":
             self._cn_update = cn_update_offset_minsum
-        elif cn_update=='identity':
+        elif cn_update == "identity":
             self._cn_update = cn_node_update_identity
-        elif isinstance(cn_update, types.FunctionType):
+        elif callable(cn_update):
             self._cn_update = cn_update
         else:
             raise TypeError("Provided cn_update not supported.")
 
-        # pre-load the VN function
-        if vn_update=='sum':
+        # Pre-load the VN function
+        if vn_update == "sum":
             self._vn_update = vn_update_sum
-        elif vn_update=='identity':
+        elif vn_update == "identity":
             self._vn_update = vn_node_update_identity
-        elif isinstance(vn_update, types.FunctionType):
+        elif callable(vn_update):
             self._vn_update = vn_update
         else:
             raise TypeError("Provided vn_update not supported.")
 
         ######################
-        # init graph structure
+        # Init graph structure
         ######################
 
+        # Handle scheduling
+        # Register as buffers for CUDAGraph compatibility
+        if isinstance(cn_schedule, str) and cn_schedule == "flooding":
+            self._scheduling = "flooding"
+            self.register_buffer(
+                "_cn_schedule",
+                torch.arange(
+                    self._num_cns, dtype=torch.long, device=self.device
+                ).unsqueeze(0),
+            )
+        elif isinstance(cn_schedule, (np.ndarray, torch.Tensor)):
+            if isinstance(cn_schedule, np.ndarray):
+                cn_schedule = torch.tensor(
+                    cn_schedule, dtype=torch.long, device=self.device
+                )
+            else:
+                cn_schedule = cn_schedule.to(dtype=torch.long, device=self.device)
+            self._scheduling = "custom"
+            if len(cn_schedule.shape) != 2:
+                raise ValueError("cn_schedule must be of rank 2.")
+            if cn_schedule.max() >= self._num_cns:
+                raise ValueError(
+                    "cn_schedule can only contain values smaller than num_cns."
+                )
+            if cn_schedule.min() < 0:
+                raise ValueError("cn_schedule cannot contain negative values.")
+            self.register_buffer("_cn_schedule", cn_schedule)
+        else:
+            raise ValueError("cn_schedule can be 'flooding' or an array of ints.")
+
+        # Build index arrays for message permutation
         # Permutation index to rearrange edge messages into CN perspective
         v2c_perm = np.argsort(self._cn_idx)
-        # and the inverse operation;
+        # And the inverse operation
         v2c_perm_inv = np.argsort(v2c_perm)
-        # only required for layered decoding
-        self._v2c_perm_inv = tf.constant(v2c_perm_inv)
 
-        # Initialize a ragged tensor that allows to gather
-        # from the v2c messages (from VN perspective) and returns
-        # a ragged tensor of incoming messages of each CN.
-        # This needs to be ragged as the CN degree can be irregular.
-        self._v2c_perm = tf.RaggedTensor.from_value_rowids(
-                                values=v2c_perm,
-                                value_rowids=self._cn_idx[v2c_perm])
+        self.register_buffer(
+            "_v2c_perm", torch.tensor(v2c_perm, dtype=torch.long, device=self.device)
+        )
+        self.register_buffer(
+            "_v2c_perm_inv",
+            torch.tensor(v2c_perm_inv, dtype=torch.long, device=self.device),
+        )
+        self.register_buffer(
+            "_vn_idx_t",
+            torch.tensor(self._vn_idx, dtype=torch.long, device=self.device),
+        )
+        self.register_buffer(
+            "_cn_idx_t",
+            torch.tensor(self._cn_idx, dtype=torch.long, device=self.device),
+        )
 
-        self._c2v_perm = tf.RaggedTensor.from_value_rowids(
-                                values=v2c_perm_inv,
-                                value_rowids=self._vn_idx)
+        # Compute row splits for CN perspective (after v2c_perm)
+        cn_idx_sorted = self._cn_idx[v2c_perm]
+        cn_row_splits = self._compute_row_splits(cn_idx_sorted, self._num_cns)
+        self.register_buffer(
+            "_cn_row_splits",
+            torch.tensor(cn_row_splits, dtype=torch.long, device=self.device),
+        )
+
+        # Compute row splits for VN perspective
+        vn_row_splits = self._compute_row_splits(self._vn_idx, self._num_vns)
+        self.register_buffer(
+            "_vn_row_splits",
+            torch.tensor(vn_row_splits, dtype=torch.long, device=self.device),
+        )
+
+        # Compute max degrees for padding
+        cn_degrees = np.diff(cn_row_splits)
+        vn_degrees = np.diff(vn_row_splits)
+        self._max_cn_degree = int(cn_degrees.max()) if len(cn_degrees) > 0 else 0
+        self._max_vn_degree = int(vn_degrees.max()) if len(vn_degrees) > 0 else 0
+
+        # Build padded index arrays for vectorized operations
+        self._cn_gather_idx, self._cn_mask = self._build_padded_indices(
+            cn_idx_sorted, cn_row_splits, self._num_cns, self._max_cn_degree
+        )
+        self._vn_gather_idx, self._vn_mask = self._build_padded_indices(
+            self._vn_idx, vn_row_splits, self._num_vns, self._max_vn_degree
+        )
+
+        # Build scatter indices for CN update
+        # This maps from padded CN messages back to edge format
+        self._cn_scatter_idx = self._build_scatter_indices(
+            cn_row_splits, self._num_cns, self._max_cn_degree
+        )
+
+        # Build scatter indices for VN update
+        self._vn_scatter_idx = self._build_scatter_indices(
+            vn_row_splits, self._num_vns, self._max_vn_degree
+        )
+
+        # Precompute valid position indices for scatter operations (avoids dynamic shapes)
+        # For CN: which positions in the flattened padded array are valid
+        cn_valid_positions, cn_valid_edge_idx = self._build_valid_scatter_indices(
+            cn_row_splits, self._num_cns, self._max_cn_degree
+        )
+        self.register_buffer("_cn_valid_positions", cn_valid_positions)
+        self.register_buffer("_cn_valid_edge_idx", cn_valid_edge_idx)
+
+        # For VN: which positions in the flattened padded array are valid
+        vn_valid_positions, vn_valid_edge_idx = self._build_valid_scatter_indices(
+            vn_row_splits, self._num_vns, self._max_vn_degree
+        )
+        self.register_buffer("_vn_valid_positions", vn_valid_positions)
+        self.register_buffer("_vn_valid_edge_idx", vn_valid_edge_idx)
+
+        # Precompute per-subiteration index arrays for custom scheduling
+        if self._scheduling == "custom":
+            self._build_custom_schedule_indices(cn_row_splits, v2c_perm)
+
+    def _compute_row_splits(self, idx: np.ndarray, num_nodes: int) -> np.ndarray:
+        """Compute row splits from sorted indices."""
+        row_splits = np.zeros(num_nodes + 1, dtype=np.int64)
+        for i in idx:
+            row_splits[i + 1] += 1
+        row_splits = np.cumsum(row_splits)
+        return row_splits
+
+    def _build_padded_indices(
+        self, idx: np.ndarray, row_splits: np.ndarray, num_nodes: int, max_degree: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build padded gather indices and mask for vectorized operations."""
+        # Create padded index array
+        gather_idx = np.zeros((num_nodes, max_degree), dtype=np.int64)
+        mask = np.zeros((num_nodes, max_degree), dtype=np.float32)
+
+        for node in range(num_nodes):
+            start = row_splits[node]
+            end = row_splits[node + 1]
+            degree = end - start
+            if degree > 0:
+                gather_idx[node, :degree] = np.arange(start, end)
+                mask[node, :degree] = 1.0
+
+        return (
+            torch.tensor(gather_idx, dtype=torch.long, device=self.device),
+            torch.tensor(mask, dtype=self.dtype, device=self.device),
+        )
+
+    def _build_scatter_indices(
+        self, row_splits: np.ndarray, num_nodes: int, max_degree: int
+    ) -> torch.Tensor:
+        """Build scatter indices for converting padded format back to flat."""
+        scatter_idx = np.zeros((num_nodes, max_degree), dtype=np.int64)
+        for node in range(num_nodes):
+            start = row_splits[node]
+            end = row_splits[node + 1]
+            degree = end - start
+            if degree > 0:
+                scatter_idx[node, :degree] = np.arange(start, end)
+        return torch.tensor(scatter_idx, dtype=torch.long, device=self.device)
+
+    def _build_valid_scatter_indices(
+        self, row_splits: np.ndarray, num_nodes: int, max_degree: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build precomputed valid position and edge indices for scatter operations.
+
+        This precomputes which positions in the flattened padded format are valid
+        and their corresponding edge indices, avoiding dynamic shape operations
+        during forward pass.
+
+        :param row_splits: Row splits array for the nodes.
+        :param num_nodes: Number of nodes.
+        :param max_degree: Maximum degree (padding size).
+
+        :output valid_positions: [num_edges] indices into flattened padded
+            array.
+
+        :output valid_edge_idx: [num_edges] corresponding edge indices.
+        """
+        valid_positions = []
+        valid_edge_idx = []
+
+        for node in range(num_nodes):
+            start = row_splits[node]
+            end = row_splits[node + 1]
+            degree = end - start
+            for d in range(degree):
+                # Position in flattened padded array: node * max_degree + d
+                flat_pos = node * max_degree + d
+                # Corresponding edge index
+                edge_idx = start + d
+                valid_positions.append(flat_pos)
+                valid_edge_idx.append(edge_idx)
+
+        return (
+            torch.tensor(valid_positions, dtype=torch.long, device=self.device),
+            torch.tensor(valid_edge_idx, dtype=torch.long, device=self.device),
+        )
+
+    def _build_custom_schedule_indices(
+        self, cn_row_splits: np.ndarray, v2c_perm: np.ndarray
+    ) -> None:
+        """Build index arrays for custom/layered CN scheduling.
+
+        For each sub-iteration, we need indices to:
+        1. Gather messages for only the active CNs
+        2. Scatter updated messages back to the correct edge positions
+
+        v2c_perm[cn_order_pos] gives the VN-order index of the edge at
+        CN-order position cn_order_pos.
+        """
+        num_sub_iters = self._cn_schedule.shape[0]
+        self._schedule_gather_idx = []
+        self._schedule_cn_mask = []
+        self._schedule_edge_idx = []  # Edge indices in VN order for scatter update
+        self._schedule_valid_positions = (
+            []
+        )  # Precomputed valid positions (avoids dynamic shapes)
+
+        cn_schedule_np = self._cn_schedule.cpu().numpy()
+
+        for j in range(num_sub_iters):
+            active_cns = cn_schedule_np[j]
+            num_active = len(active_cns)
+
+            # Compute max degree for active CNs in this sub-iteration
+            active_degrees = []
+            for cn in active_cns:
+                start = cn_row_splits[cn]
+                end = cn_row_splits[cn + 1]
+                active_degrees.append(end - start)
+            max_active_degree = max(active_degrees) if active_degrees else 0
+
+            # Build gather indices for active CNs
+            gather_idx = np.zeros((num_active, max_active_degree), dtype=np.int64)
+            mask = np.zeros((num_active, max_active_degree), dtype=np.float32)
+            edge_indices = []  # Edge indices in VN order
+            valid_positions = []  # Valid positions in flattened padded array
+
+            for i, cn in enumerate(active_cns):
+                start = cn_row_splits[cn]
+                end = cn_row_splits[cn + 1]
+                degree = end - start
+                if degree > 0:
+                    gather_idx[i, :degree] = np.arange(start, end)
+                    mask[i, :degree] = 1.0
+                    # Edge positions in CN order
+                    edge_cn_order = np.arange(start, end)
+                    # v2c_perm[cn_pos] gives the VN-order index of edge at cn_pos
+                    edge_vn_order = v2c_perm[edge_cn_order]
+                    edge_indices.extend(edge_vn_order.tolist())
+                    # Precompute valid positions in flattened format
+                    for d in range(degree):
+                        valid_positions.append(i * max_active_degree + d)
+
+            self._schedule_gather_idx.append(
+                torch.tensor(gather_idx, dtype=torch.long, device=self.device)
+            )
+            self._schedule_cn_mask.append(
+                torch.tensor(mask, dtype=self.dtype, device=self.device)
+            )
+            self._schedule_edge_idx.append(
+                torch.tensor(edge_indices, dtype=torch.long, device=self.device)
+            )
+            self._schedule_valid_positions.append(
+                torch.tensor(valid_positions, dtype=torch.long, device=self.device)
+            )
 
     ###############################
     # Public methods and properties
     ###############################
 
     @property
-    def pcm(self):
-        """Parity-check matrix of LDPC code"""
+    def pcm(self) -> Union[np.ndarray, sp.sparse.csr_matrix]:
+        """Parity-check matrix of LDPC code."""
         return self._pcm
 
     @property
-    def num_cns(self):
-        """Number of check nodes"""
+    def num_cns(self) -> int:
+        """Number of check nodes."""
         return self._num_cns
 
     @property
-    def num_vns(self):
-        """Number of variable nodes"""
+    def num_vns(self) -> int:
+        """Number of variable nodes."""
         return self._num_vns
 
     @property
-    def n(self):
-        """codeword length"""
+    def n(self) -> int:
+        """Codeword length."""
         return self._num_vns
 
     @property
-    def coderate(self):
-        """codrate assuming independent parity checks"""
+    def coderate(self) -> float:
+        """Coderate assuming independent parity checks."""
         return (self._num_vns - self._num_cns) / self._num_vns
 
     @property
-    def num_edges(self):
-        """Number of edges in decoding graph"""
+    def num_edges(self) -> int:
+        """Number of edges in decoding graph."""
         return self._num_edges
 
     @property
-    def num_iter(self):
-        "Number of decoding iterations"
+    def num_iter(self) -> int:
+        """Number of decoding iterations."""
         return self._num_iter
 
     @num_iter.setter
-    def num_iter(self, num_iter):
-        "Number of decoding iterations"
+    def num_iter(self, num_iter: int) -> None:
+        """Set number of decoding iterations."""
         if not isinstance(num_iter, int):
-            raise TypeError('num_iter must be int.')
-        if num_iter<0:
-            raise ValueError('num_iter cannot be negative.')
-        self._num_iter = tf.constant(num_iter, dtype=tf.int32)
+            raise TypeError("num_iter must be int.")
+        if num_iter < 0:
+            raise ValueError("num_iter cannot be negative.")
+        self._num_iter = num_iter
 
     @property
-    def llr_max(self):
-        """Max LLR value used for internal calculations and rate-matching"""
+    def llr_max(self) -> Optional[float]:
+        """Max LLR value used for internal calculations."""
         return self._llr_max
 
     @llr_max.setter
-    def llr_max(self, value):
-        """Max LLR value used for internal calculations"""
-        if value<0:
-            raise ValueError('llr_max cannot be negative.')
-        self._llr_max = tf.cast(value, dtype=self.rdtype)
+    def llr_max(self, value: float) -> None:
+        """Set max LLR value."""
+        if value is not None and value < 0:
+            raise ValueError("llr_max cannot be negative.")
+        self._llr_max = float(value) if value is not None else None
 
     @property
-    def return_state(self):
-        """Return internal decoder state for IDD schemes"""
+    def return_state(self) -> bool:
+        """Return internal decoder state for IDD schemes."""
         return self._return_state
 
     #########################
     # Decoding functions
     #########################
 
-    def _bp_iter(self, msg_v2c, msg_c2v, llr_ch, x_hat, it, num_iter):
-        """Main decoding loop
+    def _gather_to_cn(self, msg_v2c: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Gather v2c messages to CN perspective with padding.
 
-        Parameters
-        ----------
-        msg_v2c: [num_edges, batch_size], tf.float
-            Tensor of VN messages representing the internal decoder state.
+        :param msg_v2c: [batch_size, num_edges] tensor of v2c messages.
 
-        msg_c2v: [num_edges, batch_size], tf.float
-            Tensor of CN messages representing the internal decoder state.
+        :output msg_cn: [batch_size, num_cns, max_cn_degree] tensor of CN
+            messages.
 
-        llr_ch: [...,n], tf.float
-            Tensor containing the channel logits/llr values.
-
-        x_hat : [...,n] or [...,k], tf.float
-            Tensor of same shape as ``llr_ch`` containing bit-wise
-            soft-estimates of all `n` codeword bits.
-
-        it: tf.int
-            Current iteration number
-
-        num_iter: int
-            Total number of decoding iterations
-
-        Returns
-        -------
-        msg_v2c: [num_edges, batch_size], tf.float
-            Tensor of VN messages representing the internal decoder state.
-
-        msg_c2v: [num_edges, batch_size], tf.float
-            Tensor of CN messages representing the internal decoder state.
-
-        llr_ch: [...,n], tf.float
-            Tensor containing the channel logits/llr values.
-
-        x_hat : [...,n] or [...,k], tf.float
-            Tensor of same shape as ``llr_ch`` containing bit-wise
-            soft-estimates of all `n` codeword bits.
-
-        it: tf.int
-            Current iteration number
-
-        num_iter: int
-            Total number of decoding iterations
+        :output mask: [num_cns, max_cn_degree] mask tensor.
         """
+        msg_cn_flat = msg_v2c[:, self._v2c_perm]  # [bs, num_edges]
+        msg_cn = msg_cn_flat[
+            :, self._cn_gather_idx
+        ]  # [bs, num_cns, max_cn_degree]
 
-        # Unroll loop to keep XLA / Keras compatibility
-        # For flooding this will be unrolled to a single loop iteration
+        # mask [num_cns, max_cn_degree] broadcasts with [bs, num_cns, max_deg]
+        msg_cn = msg_cn * self._cn_mask
+
+        return msg_cn, self._cn_mask
+
+    def _scatter_from_cn(
+        self, msg_cn: torch.Tensor, mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Scatter CN messages back to flat edge format.
+
+        :param msg_cn: [batch_size, num_cns, max_cn_degree] tensor.
+        :param mask: [num_cns, max_cn_degree] mask tensor (unused, kept for API).
+
+        :output msg_c2v: [batch_size, num_edges] tensor in VN order.
+        """
+        batch_size = msg_cn.shape[0]
+
+        msg_flat = msg_cn.reshape(
+            batch_size, -1
+        )  # [bs, num_cns * max_cn_degree]
+
+        msg_c2v = torch.zeros(
+            batch_size, self._num_edges, dtype=msg_cn.dtype, device=msg_cn.device
+        )
+
+        valid_msg = msg_flat[:, self._cn_valid_positions]  # [bs, num_edges]
+        msg_c2v[:, self._cn_valid_edge_idx] = valid_msg
+
+        msg_c2v = msg_c2v[:, self._v2c_perm_inv]
+
+        return msg_c2v
+
+    def _gather_to_vn(self, msg_c2v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Gather c2v messages to VN perspective with padding.
+
+        :param msg_c2v: [batch_size, num_edges] tensor of c2v messages (VN order).
+
+        :output msg_vn: [batch_size, num_vns, max_vn_degree] padded VN messages.
+
+        :output mask: [num_vns, max_vn_degree] VN mask tensor.
+        """
+        msg_vn = msg_c2v[
+            :, self._vn_gather_idx
+        ]  # [bs, num_vns, max_vn_degree]
+
+        # mask [num_vns, max_vn_degree] broadcasts with [bs, num_vns, max_deg]
+        msg_vn = msg_vn * self._vn_mask
+
+        return msg_vn, self._vn_mask
+
+    def _scatter_from_vn(
+        self, msg_vn: torch.Tensor, mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Scatter VN messages back to flat edge format.
+
+        :param msg_vn: [batch_size, num_vns, max_vn_degree] tensor.
+        :param mask: [num_vns, max_vn_degree] mask tensor (unused, kept for API).
+
+        :output msg_v2c: [batch_size, num_edges] tensor.
+        """
+        batch_size = msg_vn.shape[0]
+
+        msg_flat = msg_vn.reshape(batch_size, -1)
+
+        msg_v2c = torch.zeros(
+            batch_size, self._num_edges, dtype=msg_vn.dtype, device=msg_vn.device
+        )
+
+        valid_msg = msg_flat[:, self._vn_valid_positions]  # [bs, num_edges]
+        msg_v2c[:, self._vn_valid_edge_idx] = valid_msg
+
+        return msg_v2c
+
+    def _bp_iter(
+        self,
+        msg_v2c: torch.Tensor,
+        msg_c2v: torch.Tensor,
+        llr_ch: torch.Tensor,
+        x_hat: torch.Tensor,
+        it: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Main decoding iteration.
+
+        :param msg_v2c: [batch_size, num_edges] v2c messages.
+        :param msg_c2v: [batch_size, num_edges] c2v messages.
+        :param llr_ch: [batch_size, num_vns] channel LLRs.
+        :param x_hat: [batch_size, num_vns] current estimate.
+        :param it: Current iteration number.
+
+        :output msg_v2c: Updated v2c messages.
+
+        :output msg_c2v: Updated c2v messages.
+
+        :output x_hat: Updated VN estimates.
+        """
+        # Process all sub-iterations
         for j in range(self._cn_schedule.shape[0]):
+            if self._scheduling == "flooding":
+                # Flooding: update all CNs in parallel
+                # Gather messages to CN perspective
+                msg_cn, cn_mask = self._gather_to_cn(msg_v2c)
 
-            # get active check nodes
-            if self._scheduling=="flooding":
-                # for flooding all CNs are active
-                v2c_perm = self._v2c_perm
-            else: # select active CNs for j-th subiteration
-                cn_idx = tf.gather(self._cn_schedule, j, axis=0)
-                v2c_perm = tf.gather(self._v2c_perm, cn_idx, axis=0)
+                # Apply CN update
+                msg_cn_out = self._cn_update(msg_cn, cn_mask, self._llr_max)
 
-            # Gather ragged tensor of incoming messages at CN.
-            # The shape is [num_cns, None, batch_size,...].
-            # The None dimension is the ragged dimension and depends on the
-            # individual check node degree
+                # Apply CN callbacks
+                for cb in self._c2v_callbacks:
+                    msg_cn_out = cb(msg_cn_out, it)
 
-            msg_cn_rag = tf.gather(msg_v2c, v2c_perm, axis=0)
-
-            # Apply the CN update
-            msg_cn_rag_ = self._cn_update(msg_cn_rag, self.llr_max)
-
-            # Apply CN callbacks
-            for cb in self._c2v_callbacks:
-                msg_cn_rag_ = cb(msg_cn_rag_, it)
-
-            # Apply partial message updates for layered decoding
-            if self._scheduling!="flooding":
-                # note: the scatter update operation is quite expensive
-                up_idx = tf.gather(self._c2v_perm.flat_values,
-                                   v2c_perm.flat_values)
-                # update only active cns are updated
-                msg_c2v = tf.tensor_scatter_nd_update(
-                                     msg_c2v,
-                                     tf.expand_dims(up_idx, axis=1),
-                                     msg_cn_rag_.flat_values)
+                # Scatter back to edge format
+                msg_c2v = self._scatter_from_cn(msg_cn_out, cn_mask)
             else:
-                # for flodding all nodes are updated
-                msg_c2v = msg_cn_rag_.flat_values
+                # Custom/layered scheduling: update only active CNs
+                msg_c2v = self._bp_iter_custom_cn(msg_v2c, msg_c2v, j, it)
 
-            # Gather ragged tensor of incoming messages at VN.
-            # Note for performance reasons this includes the re-permute
-            # of edges from CN to VN perspective.
-            # The shape is [num_vns, None, batch_size,...].
-            msg_vn_rag = tf.gather(msg_c2v, self._c2v_perm, axis=0)
+            # Gather messages to VN perspective
+            msg_vn, vn_mask = self._gather_to_vn(msg_c2v)
 
-            # Apply the VN update
-            msg_vn_rag_, x_hat = self._vn_update(msg_vn_rag,
-                                                 llr_ch,
-                                                 self.llr_max)
+            # Apply VN update
+            msg_vn_out, x_hat = self._vn_update(msg_vn, vn_mask, llr_ch, self._llr_max)
 
-            # apply v2c callbacks
+            # Apply VN callbacks
             for cb in self._v2c_callbacks:
-                msg_vn_rag_ = cb(msg_vn_rag_, it+1, x_hat)
+                msg_vn_out = cb(msg_vn_out, it + 1, x_hat)
 
-            # we return flat values to avoid ragged tensors passing the tf.
-            # while boundary (possible issues with XLA)
-            msg_v2c = msg_vn_rag_.flat_values
+            # Scatter back to edge format
+            msg_v2c = self._scatter_from_vn(msg_vn_out, vn_mask)
 
-        #increase iteration coutner
-        it += 1
+        return msg_v2c, msg_c2v, x_hat
 
-        return msg_v2c, msg_c2v, llr_ch, x_hat, it, num_iter
+    def _bp_iter_custom_cn(
+        self,
+        msg_v2c: torch.Tensor,
+        msg_c2v: torch.Tensor,
+        sub_iter: int,
+        it: int,
+    ) -> torch.Tensor:
+        """Process CN update for custom scheduling (only active CNs).
 
-    # pylint: disable=unused-argument,unused-variable
-    def _stop_cond(self, msg_v2c, msg_c2v, llr_ch, x_hat, it, num_iter):
-        """stops decoding loop after num_iter iterations.
-        Most inputs are ignored, just for compatibility with tf.while.
+        :param msg_v2c: [batch_size, num_edges] v2c messages in VN order.
+        :param msg_c2v: [batch_size, num_edges] current c2v messages.
+        :param sub_iter: Sub-iteration index (which CNs to update).
+        :param it: Current iteration number.
+
+        :output msg_c2v: Updated c2v messages.
         """
-        return it < num_iter
+        batch_size = msg_v2c.shape[0]
+        gather_idx = self._schedule_gather_idx[sub_iter]
+        cn_mask = self._schedule_cn_mask[sub_iter]
+        edge_idx = self._schedule_edge_idx[sub_iter]
+        valid_positions = self._schedule_valid_positions[sub_iter]
 
-    #########################
-    # Sionna Block functions
-    #########################
+        msg_v2c_cn_order = msg_v2c[:, self._v2c_perm]
 
-    # pylint: disable=(unused-argument)
-    def build(self, input_shape, **kwargs):
-        # Raise AssertionError if shape of x is invalid
+        msg_cn = msg_v2c_cn_order[
+            :, gather_idx
+        ]  # [bs, num_active_cns, max_degree]
 
-        assert (input_shape[-1]==self._num_vns), \
-                            'Last dimension must be of length n.'
+        # mask [num_active_cns, max_degree] broadcasts with [bs, ...]
+        msg_cn = msg_cn * cn_mask
 
-    def call(self, llr_ch, /, *, num_iter=None, msg_v2c=None):
+        msg_cn_out = self._cn_update(msg_cn, cn_mask, self._llr_max)
+
+        for cb in self._c2v_callbacks:
+            msg_cn_out = cb(msg_cn_out, it)
+
+        msg_flat = msg_cn_out.reshape(batch_size, -1)
+        valid_msg = msg_flat[:, valid_positions]
+
+        msg_c2v = msg_c2v.clone()
+        msg_c2v[:, edge_idx] = valid_msg
+
+        return msg_c2v
+
+    def build(self, input_shape: tuple, **kwargs) -> None:
+        """Build block and validate input shape."""
+        if input_shape[-1] != self._num_vns:
+            raise ValueError("Last dimension must be of length n.")
+
+    def call(
+        self,
+        llr_ch: torch.Tensor,
+        /,
+        *,
+        num_iter: Optional[int] = None,
+        msg_v2c: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Iterative BP decoding function.
+
+        :param llr_ch: Channel LLRs of shape [..., n].
+        :param num_iter: Number of iterations. If `None`, uses default.
+        :param msg_v2c: Initial v2c messages for IDD schemes.
+
+        :output x_hat: Decoded bits of shape [..., n].
+
+        :output msg_v2c: Decoder state. Returned only if ``return_state``
+            is `True`.
         """
-
         if num_iter is None:
-            num_iter=self.num_iter
+            num_iter = self._num_iter
 
-        # clip LLRs for numerical stability
-        llr_ch = tf.clip_by_value(llr_ch,
-                                  clip_value_min=-self._llr_max,
-                                  clip_value_max=self._llr_max)
+        # Clip LLRs for numerical stability
+        if self._llr_max is not None:
+            llr_ch = llr_ch.clamp(-self._llr_max, self._llr_max)
 
-        # reshape to support multi-dimensional inputs
-        llr_ch_shape = llr_ch.get_shape().as_list()
+        # Reshape to support multi-dimensional inputs
+        llr_ch_shape = list(llr_ch.shape)
         new_shape = [-1, self._num_vns]
-        llr_ch_reshaped = tf.reshape(llr_ch, new_shape)
+        llr_ch_reshaped = llr_ch.reshape(new_shape)  # [batch_size, num_vns]
 
-        # batch dimension is last dimension due to ragged tensor representation
-        llr_ch = tf.transpose(llr_ch_reshaped, (1, 0))
+        # Logits are converted into "true" LLRs as usually done in literature
+        llr_ch_reshaped = llr_ch_reshaped * -1.0
 
-        # logits are converted into "true" LLRs as usually done in literature
-        llr_ch *= -1.
-
-        # If no initial decoder state is provided, we initialize it with 0.
-        # This is relevant for IDD schemes.
+        # Initialize v2c messages
         if msg_v2c is None:
-            # init v2c messages with channel LLRs
-            msg_v2c = tf.gather(llr_ch, self._vn_idx)
+            msg_v2c = llr_ch_reshaped[:, self._vn_idx_t]  # [bs, num_edges]
         else:
-            msg_v2c *= -1 # invert sign due to logit definition
+            msg_v2c = msg_v2c * -1.0  # invert sign due to logit definition
 
-        # msg_v2c is of shape [num_edges, batch_size]
-        # it contains all edge message from VN to CN
-        # Hereby, self._vn_idx indicates the index of the associated VN
-        # and self._cn_idx the index of the associated CN
+        # Messages from CN perspective; initialized to zero
+        msg_c2v = torch.zeros_like(msg_v2c)
 
-        # messages from CN perspective; are inititalized to zero
-        msg_c2v = tf.zeros_like(msg_v2c)
-
-        # apply VN callbacks before first iteration
-        if self._v2c_callbacks != []:
-            msg_vn_rag_ = tf.RaggedTensor.from_value_rowids(
-                                values=msg_v2c,
-                                value_rowids=self._vn_idx)
-            # apply v2c callbacks
+        # Apply VN callbacks before first iteration
+        if self._v2c_callbacks:
+            msg_vn, vn_mask = self._gather_to_vn(msg_v2c)
             for cb in self._v2c_callbacks:
-                msg_vn_rag_ = cb(msg_vn_rag_, tf.constant(0, tf.int32), llr_ch)
+                msg_vn = cb(msg_vn, 0, llr_ch_reshaped)
+            msg_v2c = self._scatter_from_vn(msg_vn, vn_mask)
 
-            # Ensure shape as otherwise XLA cannot infer
-            # the output signature of the loop
-            msg_v2c = msg_vn_rag_.flat_values
+        # Initialize x_hat
+        x_hat = llr_ch_reshaped
 
-        #####################
         # Main decoding loop
-        #####################
+        for it in range(num_iter):
+            msg_v2c, msg_c2v, x_hat = self._bp_iter(
+                msg_v2c, msg_c2v, llr_ch_reshaped, x_hat, it
+            )
 
-        # msg_v2c : decoder state (from vN perspective)
-        # msg_c2v : decoder state (from CN perspective)
-        # llr_ch : channel llrs
-        # llr_ch:  x_hat; automatically returns llr_ch for 0 iterations
-        # tf.constant(0, tf.int32) : iteration counter
-        # num_iter : total number of iterations
-
-        inputs = (msg_v2c, msg_c2v, llr_ch, llr_ch,
-                  tf.constant(0, tf.int32), num_iter)
-
-        # and run main decoding loop for num_iter iterations
-        msg_v2c, _, _, x_hat, _, _ = tf.while_loop(
-                                        self._stop_cond,self._bp_iter,
-                                        inputs, maximum_iterations=num_iter)
-
-        ######################
-        # Post process outputs
-        ######################
-
-        # restore batch dimension to first dimension
-        x_hat = tf.transpose(x_hat, (1,0))
-
-        if self._hard_out: # hard decide decoder output if required
-            x_hat = tf.greater_equal(tf.cast(0, self.rdtype), x_hat)
-            x_hat = tf.cast(x_hat, self.rdtype)
+        if self._hard_out:
+            # Hard decide decoder output
+            x_hat = (x_hat <= 0).to(self.dtype)
         else:
-            x_hat *= -1.  # convert LLRs back into logits
+            x_hat = x_hat * -1.0  # convert LLRs back into logits
 
-        # Reshape c_short so that it matches the original input dimensions
-        output_shape = llr_ch_shape
-        output_shape[0] = -1 # Dynamic batch dim
-        x_reshaped = tf.reshape(x_hat, output_shape)
+        # Reshape to match original input dimensions
+        output_shape = llr_ch_shape.copy()
+        output_shape[0] = -1
+        x_reshaped = x_hat.reshape(output_shape)
 
         if not self._return_state:
             return x_reshaped
         else:
-            msg_v2c *= -1 # invert sign due to logit definition
+            msg_v2c = msg_v2c * -1.0  # invert sign due to logit definition
             return x_reshaped, msg_v2c
+
 
 #######################
 # Node update functions
 #######################
 
-# pylint: disable=unused-argument,unused-variable
-def vn_node_update_identity(msg_c2v_rag, llr_ch, llr_clipping=None, **kwargs):
+
+def vn_node_update_identity(
+    msg_c2v: torch.Tensor,
+    mask: torch.Tensor,
+    llr_ch: torch.Tensor,
+    llr_clipping: Optional[float] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     # pylint: disable=line-too-long
     r"""Dummy variable node update function for testing.
 
-    Behaves as an identity function and can be used for testing an debugging of
-    message passing decoding.
+    Behaves as an identity function and can be used for testing and debugging
+    of message passing decoding.
 
     Marginalizes input messages and returns them as second output.
 
-    Parameters
-    ----------
-    msg_c2v_rag: [num_edges, batch_size], tf.ragged
-        Ragged tensor of shape `[num_nodes, None, batch_size]` where the second
-        axis is ragged (represents individual node degrees).
-        Represents c2v messages.
-
-    llr_ch: [num_nodes, batch_size], tf.float
-        Tensor containing the channel LLRs.
-
-    llr_clipping: `None` (default) | float
-        Clipping value used for internal processing. If `None`, no internal
-        clipping is applied.
-
-    Returns
-    -------
-    msg_v2c_rag : tf.ragged
-        Updated v2c messages. Ragged tensor of same shape as ``msg_c2v``
-
-    x_tot: tf.float
-        Mariginalized LLRs per variable node of shape `[num_nodes, batch_size]`.
-        Can be used as final estimate per VN.
+    :param msg_c2v: Tensor of shape `[batch_size, num_nodes, max_degree]`
+        representing c2v messages.
+    :param mask: Tensor of shape `[num_nodes, max_degree]` indicating valid
+        edges.
+    :param llr_ch: Tensor of shape `[batch_size, num_nodes]` containing the
+        channel LLRs.
+    :param llr_clipping: Clipping value used for internal processing. If
+        `None`, no internal clipping is applied.
     """
-    # aggregate all incoming messages per node
-    x_tot = tf.reduce_sum(msg_c2v_rag, axis=1) + llr_ch
+    x_tot = msg_c2v.sum(dim=2) + llr_ch  # [bs, num_nodes]
 
-    return msg_c2v_rag, x_tot
+    return msg_c2v, x_tot
 
-def vn_update_sum(msg_c2v_rag, llr_ch, llr_clipping=None):
+
+def vn_update_sum(
+    msg_c2v: torch.Tensor,
+    mask: torch.Tensor,
+    llr_ch: torch.Tensor,
+    llr_clipping: Optional[float] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     # pylint: disable=line-too-long
     r"""Variable node update function implementing the `sum` update.
 
@@ -689,77 +960,63 @@ def vn_update_sum(msg_c2v_rag, llr_ch, llr_clipping=None):
     Additionally, the channel LLR ``llr_ch`` is considered in each variable
     node.
 
-    Parameters
-    ----------
-    msg_c2v_rag: [num_nodes, None, batch_size], tf.ragged
-        Ragged tensor of shape `[num_nodes, None, batch_size]` where the second
-        axis is ragged (represents individual node degrees).
-        Represents c2v messages.
-
-    llr_ch: [num_nodes, batch_size], tf.float
-        Tensor containing the channel LLRs.
-
-    llr_clipping: `None` (default) | float
-        Clipping value used for internal processing. If `None`, no internal
-        clipping is applied.
-
-    Returns
-    -------
-    msg_v2c_rag : tf.ragged
-        Updated v2c messages. Ragged tensor of same shape as ``msg_c2v``
-
-    x_tot: tf.float
-        Mariginalized LLRs per variable node of shape `[num_nodes, batch_size]`.
+    :param msg_c2v: Tensor of shape `[batch_size, num_nodes, max_degree]`
+        representing c2v messages.
+    :param mask: Tensor of shape `[num_nodes, max_degree]` indicating valid
+        edges.
+    :param llr_ch: Tensor of shape `[batch_size, num_nodes]` containing the
+        channel LLRs.
+    :param llr_clipping: Clipping value used for internal processing. If
+        `None`, no internal clipping is applied.
     """
-    # aggregate all incoming messages per node
-    x = tf.reduce_sum(msg_c2v_rag, axis=1)
-    x_tot = tf.add(x, llr_ch)
+    x = msg_c2v.sum(dim=2)  # [bs, num_nodes]
+    x_tot = x + llr_ch
 
-    # TF2.9 does not support XLA for the addition of ragged tensors
-    # the following code provides a workaround that supports XLA
+    # Extrinsic message: total - intrinsic
+    x_e = x_tot.unsqueeze(2) - msg_c2v  # [bs, num_nodes, max_degree]
 
-    # subtract extrinsic message from node value
-    #x_e = tf.expand_dims(x_tot, axis=1)
-    #x_e = tf.add(-msg_c2v, x_e)
-    x_e = tf.ragged.map_flat_values(lambda x,y,row_ind: x+tf.gather(y, row_ind),
-                            -1.*msg_c2v_rag, x_tot, msg_c2v_rag.value_rowids())
+    # mask [num_nodes, max_degree] broadcasts with [bs, num_nodes, max_degree]
+    x_e = x_e * mask
 
     if llr_clipping is not None:
-        x_e = tf.clip_by_value(x_e,
-                    clip_value_min=-llr_clipping, clip_value_max=llr_clipping)
-        x_tot = tf.clip_by_value(x_tot,
-                    clip_value_min=-llr_clipping, clip_value_max=llr_clipping)
+        x_e = x_e.clamp(-llr_clipping, llr_clipping)
+        x_tot = x_tot.clamp(-llr_clipping, llr_clipping)
+
     return x_e, x_tot
 
-# pylint: disable=unused-argument,unused-variable
-def cn_node_update_identity(msg_v2c_rag, *kwargs):
+
+def cn_node_update_identity(
+    msg_v2c: torch.Tensor,
+    mask: torch.Tensor,
+    llr_clipping: Optional[float] = None,
+) -> torch.Tensor:
     # pylint: disable=line-too-long
     r"""Dummy function that returns the first tensor without any processing.
 
-    Used for testing an debugging of message passing decoding.
+    Used for testing and debugging of message passing decoding.
 
-    Parameters
-    ----------
-    msg_v2c_rag: [num_nodes, None, batch_size], tf.ragged
-        Ragged tensor of shape `[num_nodes, None, batch_size]` where the second
-        axis is ragged (represents individual node degrees).
-        Represents v2c messages
-
-    Returns
-    -------
-    msg_c2v_rag : [num_nodes, None, batch_size], tf.ragged
-        Updated v2c messages. Ragged tensor of same shape as ``msg_c2v``.
+    :param msg_v2c: Tensor of shape `[batch_size, num_nodes, max_degree]`
+        representing v2c messages.
+    :param mask: Tensor of shape `[num_nodes, max_degree]` indicating valid
+        edges.
+    :param llr_clipping: Clipping value (unused).
     """
-    return msg_v2c_rag
+    return msg_v2c
 
-def cn_update_offset_minsum(msg_v2c_rag, llr_clipping=None, offset=0.5):
+
+def cn_update_offset_minsum(
+    msg_v2c: torch.Tensor,
+    mask: torch.Tensor,
+    llr_clipping: Optional[float] = None,
+    offset: float = 0.5,
+) -> torch.Tensor:
     # pylint: disable=line-too-long
     r"""Check node update function implementing the offset corrected minsum.
 
     The function implements
 
     .. math::
-            \qquad y_{j \to i} = \alpha_{j \to i} \cdot {max} \left( {min}_{i' \in \mathcal{N}(j) \setminus i} \left(|x_{i' \to j}| \right)-\beta , 0\right)
+            \qquad y_{j \to i} = \alpha_{j \to i} \cdot \max \left( \min_{i' \in \mathcal{N}(j) \setminus i} \left(|x_{i' \to j}| \right)-\beta , 0\right)
 
     where :math:`\beta=0.5` and :math:`y_{j \to i}` denotes the message from
     check node (CN) *j* to variable node (VN) *i* and :math:`x_{i \to j}` from
@@ -770,152 +1027,82 @@ def cn_update_offset_minsum(msg_v2c_rag, llr_clipping=None, offset=0.5):
         \alpha_{j \to i} = \prod_{i' \in \mathcal{N}(j) \setminus i} \operatorname{sign}(x_{i' \to j})
 
     is the sign of the outgoing message. For further details we refer to
-    [Chen]_.
+    :cite:p:`Chen`.
 
-    Parameters
-    ----------
-    msg_v2c_rag: [num_nodes, None, batch_size], tf.ragged
-        Ragged tensor of shape `[num_nodes, None, batch_size]` where the second
-        axis is ragged (represents individual node degrees).
-        Represents v2c messages.
-
-    llr_clipping: `None` (default) | float
-        Clipping value used for internal processing. If `None`, no internal
-        clipping is applied.
-
-    offset: float (default `0.5`)
-        Offset value to be subtracted from each outgoing message.
-
-    Returns
-    -------
-    msg_c2v : [num_nodes, None, batch_size], tf.ragged
-        Ragged tensor of same shape as ``msg_c2v`` containing the updated c2v
-        messages.
+    :param msg_v2c: Tensor of shape `[batch_size, num_nodes, max_degree]`
+        representing v2c messages.
+    :param mask: Tensor of shape `[num_nodes, max_degree]` indicating valid
+        edges.
+    :param llr_clipping: Clipping value used for internal processing. If
+        `None`, no internal clipping is applied.
+    :param offset: Offset value to be subtracted from each outgoing message.
     """
+    large_val = 1e6
 
-    def _sign_val_minsum(msg):
-        """Helper to replace find sign-value during min-sum decoding.
-        Must be called with `map_flat_values`."""
+    # mask [num_nodes, max_degree] broadcasts with [bs, num_nodes, max_degree]
+    inv_mask = 1.0 - mask
 
-        sign_val = tf.sign(msg)
-        sign_val = tf.where(tf.equal(sign_val, 0),
-                            tf.ones_like(sign_val),
-                            sign_val)
-        return sign_val
+    sign_val = torch.sign(msg_v2c)
+    sign_val = torch.where(sign_val == 0, torch.ones_like(sign_val), sign_val)
 
-    # a constant used to overwrite the first min
-    large_val = 100000.
-    msg_v2c_rag = tf.clip_by_value(msg_v2c_rag,
-                               clip_value_min=-large_val,
-                               clip_value_max=large_val)
+    # For padded positions, set sign to 1 (neutral for product)
+    sign_val = sign_val * mask + inv_mask
 
-    # only output is clipped (we assume input was clipped by previous function)
+    sign_node = sign_val.prod(dim=2, keepdim=True)  # [bs, num_nodes, 1]
 
-    # calculate sign of outgoing msg and the node
-    sign_val = tf.ragged.map_flat_values(_sign_val_minsum, msg_v2c_rag)
-    sign_node = tf.reduce_prod(sign_val, axis=1)
+    # Extrinsic sign: total sign / intrinsic sign
+    sign_out = sign_node * sign_val  # [bs, num_nodes, max_degree]
 
-    # TF2.9 does not support XLA for the multiplication of ragged tensors
-    # the following code provides a workaround that supports XLA
+    msg_abs = torch.abs(msg_v2c)
 
-    # sign_val = self._stop_ragged_gradient(sign_val) \
-    #             * tf.expand_dims(sign_node, axis=1)
-    sign_val = tf.ragged.map_flat_values(
-                                    lambda x, y, row_ind:
-                                    tf.multiply(x, tf.gather(y, row_ind)),
-                                    sign_val,
-                                    sign_node,
-                                    sign_val.value_rowids())
+    # For padded positions, set to large value so they don't affect min
+    msg_abs_masked = msg_abs * mask + large_val * inv_mask
 
-    # remove sign from messages
-    msg = tf.ragged.map_flat_values(tf.abs, msg_v2c_rag)
+    min_val, _ = msg_abs_masked.min(dim=2, keepdim=True)  # [bs, num_nodes, 1]
 
-    # Calculate the extrinsic minimum per CN, i.e., for each message of
-    # index i, find the smallest and the second smallest value.
-    # However, in some cases the second smallest value may equal the
-    # smallest value (multiplicity of mins).
-    # Please note that this needs to be applied to raggedTensors, e.g.,
-    # tf.top_k() is currently not supported and all ops must support graph
-    # and XLA mode.
+    msg_min1 = (msg_abs_masked - min_val) * mask + large_val * inv_mask
 
-    # find min_value per node
-    min_val = tf.reduce_min(msg, axis=1, keepdims=True)
+    is_min_position = msg_min1 == 0
 
-    # TF2.9 does not support XLA for the subtraction of ragged tensors
-    # the following code provides a workaround that supports XLA
+    num_min_positions = (is_min_position * mask).sum(dim=2, keepdim=True)
 
-    # and subtract min; the new array contains zero at the min positions
-    # benefits from broadcasting; all other values are positive
-    msg_min1 = tf.ragged.map_flat_values(lambda x, y, row_ind:
-                                            x - tf.gather(y, row_ind),
-                                            msg,
-                                            tf.squeeze(min_val, axis=1),
-                                            msg.value_rowids())
+    double_min = (num_min_positions > 1).to(msg_v2c.dtype)
 
-    # replace 0 (=min positions) with large value to ignore it for further
-    # min calculations
-    msg = tf.ragged.map_flat_values(
-                        lambda x: tf.where(tf.equal(x, 0), large_val, x),
-                        msg_min1)
+    msg_for_second_min = torch.where(
+        is_min_position, torch.full_like(msg_min1, large_val), msg_min1
+    )
 
-    # find the second smallest element (we add min_val as this has been
-    # subtracted before)
-    min_val_2 = tf.reduce_min(msg, axis=1, keepdims=True) + min_val
+    min_val_2, _ = msg_for_second_min.min(dim=2, keepdim=True)
+    min_val_2 = min_val_2 + min_val
 
-    # Detect duplicated minima (i.e., min_val occurs at two incoming
-    # messages). As the LLRs per node are <LLR_MAX and we have
-    # replace at least 1 position (position with message "min_val") by
-    # large_val, it holds for the sum < large_val + node_degree*LLR_MAX.
-    # If the sum > 2*large_val, the multiplicity of the min is at least 2.
-    node_sum = tf.reduce_sum(msg, axis=1, keepdims=True) - (2*large_val-1.)
-    # indicator that duplicated min was detected (per node)
-    double_min = 0.5*(1-tf.sign(node_sum))
+    min_val_e = (1 - double_min) * min_val_2 + double_min * min_val
 
-    # if a duplicate min occurred, both edges must have min_val, otherwise
-    # the second smallest value is taken
-    min_val_e = (1-double_min) * min_val + (double_min) * min_val_2
+    msg_e = torch.where(is_min_position, min_val_e, min_val)
 
-    # replace all values with min_val except the position where the min
-    # occurred (=extrinsic min).
+    msg_e = torch.clamp(msg_e - offset, min=0)
 
-    # no XLA support for TF 2.15
-    # msg_e = tf.where(msg==large_val, min_val_e, min_val)
+    msg_e = msg_e * mask
 
-    min_1 = tf.squeeze(tf.gather(min_val, msg.value_rowids()), axis=1)
-    min_e = tf.squeeze(tf.gather(min_val_e, msg.value_rowids()), axis=1)
-    msg_e = tf.ragged.map_flat_values(
-                lambda x: tf.where(x==large_val, min_e, min_1), msg)
+    msg_out = sign_out * msg_e
 
-    # it seems like tf.where does not set the shape of tf.ragged properly
-    # we need to ensure the shape manually
-    msg_e = tf.ragged.map_flat_values(
-                lambda x: tf.ensure_shape(x, msg.flat_values.shape), msg_e)
-
-    # apply offset
-    msg_e = tf.ragged.map_flat_values(lambda x,y: tf.maximum(x-y, 0),
-                                      msg_e, offset)
-
-    # TF2.9 does not support XLA for the multiplication of ragged tensors
-    # the following code provides a workaround that supports XLA
-
-    # and apply sign
-    #msg = sign_val * msg_e
-    msg = tf.ragged.map_flat_values(tf.multiply, sign_val, msg_e)
-
-    # clip output values if required
     if llr_clipping is not None:
-        msg = tf.clip_by_value(msg,
-                    clip_value_min=-llr_clipping, clip_value_max=llr_clipping)
-    return msg
+        msg_out = msg_out.clamp(-llr_clipping, llr_clipping)
 
-def cn_update_minsum(msg_v2c_rag, llr_clipping=None):
+    return msg_out
+
+
+def cn_update_minsum(
+    msg_v2c: torch.Tensor,
+    mask: torch.Tensor,
+    llr_clipping: Optional[float] = None,
+) -> torch.Tensor:
     # pylint: disable=line-too-long
     r"""Check node update function implementing the `minsum` update.
 
     The function implements
 
     .. math::
-            \qquad y_{j \to i} = \alpha_{j \to i} \cdot {min}_{i' \in \mathcal{N}(j) \setminus i} \left(|x_{i' \to j}|\right)
+            \qquad y_{j \to i} = \alpha_{j \to i} \cdot \min_{i' \in \mathcal{N}(j) \setminus i} \left(|x_{i' \to j}|\right)
 
     where :math:`y_{j \to i}` denotes the message from check node (CN) *j* to
     variable node (VN) *i* and :math:`x_{i \to j}` from VN *i* to CN *j*,
@@ -926,33 +1113,23 @@ def cn_update_minsum(msg_v2c_rag, llr_clipping=None):
         \alpha_{j \to i} = \prod_{i' \in \mathcal{N}(j) \setminus i} \operatorname{sign}(x_{i' \to j})
 
     is the sign of the outgoing message. For further details we refer to
-    [Ryan]_ and [Chen]_.
+    :cite:p:`Ryan` and :cite:p:`Chen`.
 
-    Parameters
-    ----------
-    msg_v2c_rag: [num_nodes, None, batch_size], tf.ragged
-        Ragged tensor of shape `[num_nodes, None, batch_size]` where the second
-        axis is ragged (represents individual node degrees).
-        Represents v2c messages
-
-    llr_clipping: `None` (default) | float
-        Clipping value used for internal processing. If `None`, no internal
-        clipping is applied.
-
-    Returns
-    -------
-    msg_c2v : [num_nodes, None, batch_size], tf.ragged
-        Ragged tensor of same shape as ``msg_c2v`` containing the updated c2v
-        messages.
+    :param msg_v2c: Tensor of shape `[batch_size, num_nodes, max_degree]`
+        representing v2c messages.
+    :param mask: Tensor of shape `[num_nodes, max_degree]` indicating valid
+        edges.
+    :param llr_clipping: Clipping value used for internal processing. If
+        `None`, no internal clipping is applied.
     """
+    return cn_update_offset_minsum(msg_v2c, mask, llr_clipping, offset=0.0)
 
-    msg_c2v = cn_update_offset_minsum(msg_v2c_rag,
-                                      llr_clipping=llr_clipping,
-                                      offset=0)
 
-    return msg_c2v
-
-def cn_update_tanh(msg, llr_clipping=None):
+def cn_update_tanh(
+    msg_v2c: torch.Tensor,
+    mask: torch.Tensor,
+    llr_clipping: Optional[float] = None,
+) -> torch.Tensor:
     # pylint: disable=line-too-long
     r"""Check node update function implementing the `boxplus` operation.
 
@@ -975,90 +1152,70 @@ def cn_update_tanh(msg, llr_clipping=None):
         \alpha_{j \to i} = \prod_{i' \in \mathcal{N}(j) \setminus i} \operatorname{sign}(x_{i' \to j})
 
     is the sign of the outgoing message. For further details we refer to
-    [Ryan]_.
+    :cite:p:`Ryan`.
 
     Note that for numerical stability clipping can be applied.
 
-    Parameters
-    ----------
-    msg_v2c_rag: [num_nodes, None, batch_size], tf.ragged
-        Ragged tensor of shape `[num_nodes, None, batch_size]` where the second
-        axis is ragged (represents individual node degrees).
-        Represents v2c messages
-
-    llr_clipping: `None` (default) | float
-        Clipping value used for internal processing. If `None`, no internal
-        clipping is applied.
-
-    Returns
-    -------
-    msg_c2v : [num_nodes, None, batch_size], tf.ragged
-        Ragged tensor of same shape as ``msg_c2v`` containing the updated c2v
-        messages.
+    :param msg_v2c: Tensor of shape `[batch_size, num_nodes, max_degree]`
+        representing v2c messages.
+    :param mask: Tensor of shape `[num_nodes, max_degree]` indicating valid
+        edges.
+    :param llr_clipping: Clipping value used for internal processing. If
+        `None`, no internal clipping is applied.
     """
-
-    # clipping value for the atanh function is applied (tf.float32 is used)
     atanh_clip_value = 1 - 1e-7
 
-    msg = msg / 2
-    # tanh is not overloaded for ragged tensors
-    msg = tf.ragged.map_flat_values(tf.tanh, msg) # tanh is not overloaded
+    # mask [num_nodes, max_degree] broadcasts with [bs, num_nodes, max_degree]
+    inv_mask = 1.0 - mask
 
-    # for ragged tensors; map to flat tensor first
-    msg = tf.ragged.map_flat_values(
-            lambda x: tf.where(tf.equal(x, 0), tf.ones_like(x) * 1e-12, x), msg)
+    msg = msg_v2c / 2
+    msg = torch.tanh(msg)
 
-    msg_prod = tf.reduce_prod(msg, axis=1)
+    msg = torch.where(msg == 0, torch.full_like(msg, 1e-12), msg)
 
-    # TF2.9 does not support XLA for the multiplication of ragged tensors
-    # the following code provides a workaround that supports XLA
+    # For padded positions, set to 1 (neutral for product)
+    msg = msg * mask + inv_mask
 
-    # ^-1 to avoid division
-    # Note this is (potentially) numerically unstable
-    # msg = msg**-1 * tf.expand_dims(msg_prod, axis=1) # remove own edge
+    msg_prod = msg.prod(dim=2, keepdim=True)  # [bs, num_nodes, 1]
 
-    msg = tf.ragged.map_flat_values(
-                        lambda x,y,row_ind : x * tf.gather(y, row_ind),
-                        msg**-1, msg_prod, msg.value_rowids())
+    msg_recip = 1.0 / msg
+    msg_e = msg_recip * msg_prod
 
-    # Overwrite small (numerical zeros) message values with exact zero
-    # these are introduced by the previous "_where_ragged" operation
-    # this is required to keep the product stable (cf. _phi_update for log
-    # sum implementation)
-    msg = tf.ragged.map_flat_values(
-        lambda x: tf.where(tf.less(tf.abs(x), 1e-7), tf.zeros_like(x), x), msg)
+    msg_e = torch.where(torch.abs(msg_e) < 1e-7, torch.zeros_like(msg_e), msg_e)
 
-    msg = tf.clip_by_value(msg,
-                           clip_value_min=-atanh_clip_value,
-                           clip_value_max=atanh_clip_value)
+    msg_e = msg_e.clamp(-atanh_clip_value, atanh_clip_value)
 
-    # atanh is not overloaded for ragged tensors
-    msg = 2 * tf.ragged.map_flat_values(tf.atanh, msg)
+    msg_out = 2 * torch.atanh(msg_e)
 
-    # clip output values if required
+    msg_out = msg_out * mask
+
     if llr_clipping is not None:
-        msg = tf.clip_by_value(msg,
-                               clip_value_min=-llr_clipping,
-                               clip_value_max=llr_clipping)
-    return msg
+        msg_out = msg_out.clamp(-llr_clipping, llr_clipping)
 
-def cn_update_phi(msg, llr_clipping=None):
+    return msg_out
+
+
+def cn_update_phi(
+    msg_v2c: torch.Tensor,
+    mask: torch.Tensor,
+    llr_clipping: Optional[float] = None,
+) -> torch.Tensor:
     # pylint: disable=line-too-long
     r"""Check node update function implementing the `boxplus` operation.
 
     This function implements the (extrinsic) check node update function
-    based on the numerically more stable `"_phi"` function (cf. [Ryan]_).
+    based on the numerically more stable `"_phi"` function (cf. :cite:p:`Ryan`).
     It calculates the boxplus function over all incoming messages ``msg``
     excluding the intrinsic (=outgoing) message itself.
     The exact boxplus function is implemented by using the `"_phi"` function
-    as in [Ryan]_.
+    as in :cite:p:`Ryan`.
 
     The function implements
 
     .. math::
             y_{j \to i} = \alpha_{j \to i} \cdot \phi \left( \sum_{i' \in \mathcal{N}(j) \setminus i} \phi \left( |x_{i' \to j}|\right) \right)
 
-    where :math:`\phi(x)=-\operatorname{log}(\operatorname{tanh} \left(\frac{x} {2}) \right)`
+    where :math:`\phi(x)=-\operatorname{log}\left(\operatorname{tanh}\left(\frac{x}{2}\right)\right)`
     and :math:`y_{j \to i}` denotes the message from check node
     (CN) *j* to variable node (VN) *i* and :math:`x_{i \to j}` from VN *i* to
     CN *j*, respectively. Further, :math:`\mathcal{N}(j)` denotes all indices
@@ -1068,102 +1225,62 @@ def cn_update_phi(msg, llr_clipping=None):
         \alpha_{j \to i} = \prod_{i' \in \mathcal{N}(j) \setminus i} \operatorname{sign}(x_{i' \to j})
 
     is the sign of the outgoing message. For further details we refer to
-    [Ryan]_.
+    :cite:p:`Ryan`.
 
     Note that for numerical stability clipping can be applied.
 
-    Parameters
-    ----------
-    msg_v2c_rag: [num_nodes, None, batch_size], tf.ragged
-        Ragged tensor of shape `[num_nodes, None, batch_size]` where the second
-        axis is ragged (represents individual node degrees).
-        Represents v2c messages
-
-    llr_clipping: `None` (default) | float
-        Clipping value used for internal processing. If `None`, no internal
-        clipping is applied.
-
-    Returns
-    -------
-    msg_c2v : [num_nodes, None, batch_size], tf.ragged
-        Ragged tensor of same shape as ``msg_c2v`` containing the updated c2v
-        messages.
+    :param msg_v2c: Tensor of shape `[batch_size, num_nodes, max_degree]`
+        representing v2c messages.
+    :param mask: Tensor of shape `[num_nodes, max_degree]` indicating valid
+        edges.
+    :param llr_clipping: Clipping value used for internal processing. If
+        `None`, no internal clipping is applied.
     """
-    def _phi(x):
-        # pylint: disable=line-too-long
-        r"""Utility function for the boxplus-phi check node update.
 
-        This function implements the (element-wise) `"phi"` function as defined
-        in [Ryan]_  :math:`\phi(x)=-\operatorname{log}(\operatorname{tanh} \left(\frac{x}{2}) \right)`.
-
-        Parameters
-        ----------
-        x : tf.float
-            Input tensor of arbitrary shape.
-
-        Returns
-        -------
-        : tf.float
-            Tensor of same shape and dtype as ``x``.
-
-        """
-        if x.dtype==tf.float32:
-            # the clipping values are optimized for tf.float32
-            x = tf.clip_by_value(x,
-                    clip_value_min=8.5e-8, clip_value_max=16.635532)
-        elif x.dtype==tf.float64:
-            x = tf.clip_by_value(x,
-                    clip_value_min=1e-12, clip_value_max=28.324079)
+    def _phi(x: torch.Tensor) -> torch.Tensor:
+        r"""Implements :math:`\phi(x)=-\operatorname{log}\left(\operatorname{tanh}\left(\frac{x}{2}\right)\right)`."""
+        if x.dtype == torch.float32:
+            x = x.clamp(min=8.5e-8, max=16.635532)
+        elif x.dtype == torch.float64:
+            x = x.clamp(min=1e-12, max=28.324079)
         else:
-            raise TypeError("Unsupported dtype for phi function.")
+            x = x.clamp(min=1e-7, max=20.0)
 
-        return tf.math.log(tf.math.exp(x)+1) - tf.math.log(tf.math.exp(x)-1)
+        return torch.log(torch.exp(x) + 1) - torch.log(torch.exp(x) - 1)
 
-    ##################
-    # Sign of messages
-    ##################
+    # mask [num_nodes, max_degree] broadcasts with [bs, num_nodes, max_degree]
+    inv_mask = 1.0 - mask
 
-    sign_val = tf.sign(msg)
-    # TF2.14 does not support XLA for tf.where
-    # the following code provides a workaround that supports XLA
-    sign_val = tf.ragged.map_flat_values(lambda x : tf.where(tf.equal(x, 0),
-                                         tf.ones_like(x), x), sign_val)
-    # calculate sign of entire node
-    sign_node = tf.reduce_prod(sign_val, axis=1)
+    sign_val = torch.sign(msg_v2c)
+    sign_val = torch.where(sign_val == 0, torch.ones_like(sign_val), sign_val)
+    sign_val = sign_val * mask + inv_mask
 
-    # TF2.9 does not support XLA for the multiplication of ragged tensors
-    # the following code provides a workaround that supports XLA
-    #sign_val = sign_val * tf.expand_dims(sign_node, axis=1)
-    sign_val = tf.ragged.map_flat_values(
-                lambda x,y,row_ind : x * tf.gather(y, row_ind),
-                sign_val, sign_node, sign_val.value_rowids())
+    sign_node = sign_val.prod(dim=2, keepdim=True)  # [bs, num_nodes, 1]
 
-    ###################
-    # Value of messages
-    ###################
-    msg = tf.ragged.map_flat_values(tf.abs, msg) # remove sign
+    sign_out = sign_val * sign_node
 
-    # apply _phi element-wise
-    msg = tf.ragged.map_flat_values(_phi, msg)
+    msg_abs = torch.abs(msg_v2c)
 
-    # sum over entire node
-    msg_sum = tf.reduce_sum(msg, axis=1)
+    msg_phi = _phi(msg_abs)
 
-    # TF2.9 does not support XLA for the addition of ragged tensors
-    # the following code provides a workaround that supports XLA
-    #msg = tf.add( -msg, tf.expand_dims(msg_sum, axis=1)) # remove own edge
-    msg = tf.ragged.map_flat_values(
-                            lambda x, y, row_ind : x + tf.gather(y, row_ind),
-                            -1.*msg, msg_sum, msg.value_rowids())
+    # For padded positions, set to 0 (neutral for sum)
+    msg_phi = msg_phi * mask
 
-    # apply _phi element-wise (does not support ragged Tensors)
-    sign_val = sign_val.with_flat_values(tf.stop_gradient(sign_val.flat_values))
-    msg_e = sign_val * tf.ragged.map_flat_values(_phi, msg)
+    msg_sum = msg_phi.sum(dim=2, keepdim=True)  # [bs, num_nodes, 1]
+
+    # Extrinsic: total sum - intrinsic
+    msg_e = msg_sum - msg_phi
+
+    msg_e = _phi(msg_e)
+
+    msg_out = sign_out * msg_e
+
+    msg_out = msg_out * mask
 
     if llr_clipping is not None:
-        msg_e = tf.clip_by_value(msg_e,
-                    clip_value_min=-llr_clipping, clip_value_max=llr_clipping)
-    return msg_e
+        msg_out = msg_out.clamp(-llr_clipping, llr_clipping)
+
+    return msg_out
 
 
 class LDPC5GDecoder(LDPCBPDecoder):
@@ -1172,7 +1289,7 @@ class LDPC5GDecoder(LDPCBPDecoder):
 
     Inherits from :class:`~sionna.phy.fec.ldpc.decoding.LDPCBPDecoder` and
     provides a wrapper for 5G compatibility, i.e., automatically handles
-    rate-matching according to [3GPPTS38212_LDPC]_.
+    rate-matching according to :cite:p:`3GPPTS38212`.
 
     Note that for full 5G 3GPP NR compatibility, the correct puncturing and
     shortening patterns must be applied and, thus, the encoder object is
@@ -1180,110 +1297,89 @@ class LDPC5GDecoder(LDPCBPDecoder):
 
     If required the decoder can be made trainable and is differentiable
     (the training of some check node types may be not supported) following the
-    concept of "weighted BP" [Nachmani]_.
+    concept of "weighted BP" :cite:p:`Nachmani`.
 
-    Parameters
-    ----------
-    encoder: LDPC5GEncoder
-        An instance of :class:`~sionna.phy.fec.ldpc.encoding.LDPC5GEncoder`
-        containing the correct code parameters.
-
-    cn_update: `str`, "boxplus-phi" (default) | "boxplus" | "minsum" | "offset-minsum" | "identity" | callable
-        Check node update rule to be used as described above.
+    :param encoder: An instance of
+        :class:`~sionna.phy.fec.ldpc.encoding.LDPC5GEncoder` containing the
+        correct code parameters.
+    :param cn_update: Check node update rule to be used as described above.
+        One of "boxplus-phi" (default), "boxplus", "minsum", "offset-minsum",
+        "identity", or a callable.
         If a callable is provided, it will be used instead as CN update.
-        The input of the function is a ragged tensor of v2c messages of shape
-        `[num_cns, None, batch_size]` where the second dimension is ragged
-        (i.e., depends on the individual CN degree).
-
-    vn_update: `str`, "sum" (default) | "identity" | callable
-        Variable node update rule to be used.
+        The input of the function is a tensor of v2c messages of shape
+        `[batch_size, num_cns, max_degree]` with a mask of shape
+        `[num_cns, max_degree]`.
+    :param vn_update: Variable node update rule to be used.
+        One of "sum" (default), "identity", or a callable.
         If a callable is provided, it will be used instead as VN update.
-        The input of the function is a ragged tensor of c2v messages of shape
-        `[num_vns, None, batch_size]` where the second dimension is ragged
-        (i.e., depends on the individual VN degree).
-
-    cn_schedule: "flooding" | "layered" | [num_update_steps, num_active_nodes], tf.int
-        Defines the CN update scheduling per BP iteration. Can be either
-        "flooding" to update all nodes in parallel (recommended) or "layered"
-        to sequentally update all CNs in the same lifting group together or an
-        2D tensor where each row defines the `num_active_nodes` node indices to
-        be updated per subiteration. In this case each BP iteration runs
-        `num_update_steps` subiterations, thus the decoder's level of
-        parallelization is lower and usually the decoding throughput decreases.
-
-    hard_out: `bool`, (default `True`)
-        If `True`,  the decoder provides hard-decided codeword bits instead of
-        soft-values.
-
-    return_infobits: `bool`, (default `True`)
-        If `True`, only the `k` info bits (soft or hard-decided) are returned.
-        Otherwise all `n` positions are returned.
-
-    prune_pcm: `bool`, (default `True`)
-        If `True`, all punctured degree-1 VNs and connected check nodes are
-        removed from the decoding graph (see [Cammerer]_ for details). Besides
-        numerical differences, this should yield the same decoding result but
-        improved the decoding throughput and reduces the memory footprint.
-
-    num_iter: `int` (default: 20)
-        Defining the number of decoder iterations (due to batching, no early
-        stopping used at the moment!).
-
-    llr_max: `float` (default: 20) | `None`
-        Internal clipping value for all internal messages. If `None`, no
-        clipping is applied.
-
-    v2c_callbacks, `None` (default) | list of callables
-        Each callable will be executed after each VN update with the following
-        arguments `msg_vn_rag_`, `it`, `x_hat`,where `msg_vn_rag_` are the v2c
-        messages as ragged tensor of shape `[num_vns, None, batch_size]`,
-        `x_hat` is the current estimate of each VN of shape
-        `[num_vns, batch_size]` and `it` is the current iteration counter.
-        It must return and updated version of `msg_vn_rag_` of same shape.
-
-    c2v_callbacks: `None` (default) | list of callables
-        Each callable will be executed after each CN update with the following
-        arguments `msg_cn_rag_` and `it` where `msg_cn_rag_` are the c2v
-        messages as ragged tensor of shape `[num_cns, None, batch_size]` and
-        `it` is the current iteration counter.
-        It must return and updated version of `msg_cn_rag_` of same shape.
-
-    return_state: `bool`, (default `False`)
-        If `True`,  the internal VN messages ``msg_vn`` from the last decoding
-        iteration are returned, and ``msg_vn`` or `None` needs to be given as a
-        second input when calling the decoder.
+        The input of the function is a tensor of c2v messages of shape
+        `[batch_size, num_vns, max_degree]` with a mask of shape
+        `[num_vns, max_degree]`.
+    :param cn_schedule: Defines the CN update scheduling per BP iteration.
+        Can be either "flooding" to update all nodes in parallel (recommended)
+        or "layered" to sequentially update all CNs in the same lifting group
+        together or a 2D tensor of shape
+        `[num_update_steps, num_active_nodes]` where each row defines the
+        node indices to be updated per subiteration. In this case each BP
+        iteration runs ``num_update_steps`` subiterations, thus the decoder's
+        level of parallelization is lower and usually the decoding throughput
+        decreases.
+    :param hard_out: If `True`, the decoder provides hard-decided codeword
+        bits instead of soft-values.
+    :param return_infobits: If `True`, only the `k` info bits (soft or
+        hard-decided) are returned. Otherwise all `n` positions are returned.
+    :param prune_pcm: If `True`, all punctured degree-1 VNs and connected
+        check nodes are removed from the decoding graph (see :cite:p:`Cammerer` for
+        details). Besides numerical differences, this should yield the same
+        decoding result but improves the decoding throughput and reduces the
+        memory footprint.
+    :param num_iter: Defining the number of decoder iterations (due to
+        batching, no early stopping used at the moment!).
+    :param llr_max: Internal clipping value for all internal messages. If
+        `None`, no clipping is applied.
+    :param v2c_callbacks: Each callable will be executed after each VN update
+        with the following arguments ``msg_vn``, ``it``, ``x_hat``, where
+        ``msg_vn`` are the v2c messages as tensor of shape
+        `[batch_size, num_vns, max_degree]`, ``x_hat`` is the current
+        estimate of each VN of shape `[batch_size, num_vns]`, and ``it`` is
+        the current iteration counter.
+        It must return an updated version of ``msg_vn`` of same shape.
+    :param c2v_callbacks: Each callable will be executed after each CN update
+        with the following arguments ``msg_cn`` and ``it`` where ``msg_cn``
+        are the c2v messages as tensor of shape
+        `[batch_size, num_cns, max_degree]` and ``it`` is the current
+        iteration counter.
+        It must return an updated version of ``msg_cn`` of same shape.
+    :param return_state: If `True`, the internal VN messages ``msg_vn`` from
+        the last decoding iteration are returned, and ``msg_vn`` or `None`
+        needs to be given as a second input when calling the decoder.
         This can be used for iterative demapping and decoding.
-
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
+    :param precision: Precision used for internal calculations and outputs.
         If set to `None`, :py:attr:`~sionna.phy.config.precision` is used.
+    :param device: Device for computation (e.g., 'cpu', 'cuda:0').
 
-    Input
-    -----
-    llr_ch: [...,n], tf.float
+    :input llr_ch: [..., n], `torch.float`.
         Tensor containing the channel logits/llr values.
 
-    msg_v2c: `None` | [num_edges, batch_size], tf.float
+    :input msg_v2c: `None` | [batch_size, num_edges], `torch.float`.
         Tensor of VN messages representing the internal decoder state.
-        Required only if the decoder shall use its previous internal state, e.g.
-        for iterative detection and decoding (IDD) schemes.
+        Required only if the decoder shall use its previous internal state,
+        e.g., for iterative detection and decoding (IDD) schemes.
 
-    Output
-    ------
-    : [...,n] or [...,k], tf.float
+    :output x_hat: [..., n] or [..., k], `torch.float`.
         Tensor of same shape as ``llr_ch`` containing
         bit-wise soft-estimates (or hard-decided bit-values) of all
         `n` codeword bits or only the `k` information bits if
-        ``return_infobits`` is True.
+        ``return_infobits`` is `True`.
 
-    : [num_edges, batch_size], tf.float:
+    :output msg_v2c: [batch_size, num_edges], `torch.float`.
         Tensor of VN messages representing the internal decoder state.
         Returned only if ``return_state`` is set to `True`.
-        Remark: always retruns entire decoder state, even if
-        ``return_infobits`` is True.
+        Remark: always returns entire decoder state, even if
+        ``return_infobits`` is `True`.
 
-    Note
-    ----
+    .. rubric:: Notes
+
     As decoding input logits :math:`\operatorname{log} \frac{p(x=1)}{p(x=0)}`
     are assumed for compatibility with the learning framework, but internally
     LLRs with definition :math:`\operatorname{log} \frac{p(x=0)}{p(x=1)}` are
@@ -1292,245 +1388,283 @@ class LDPC5GDecoder(LDPCBPDecoder):
     The decoder is not (particularly) optimized for Quasi-cyclic (QC) LDPC
     codes and, thus, supports arbitrary parity-check matrices.
 
-    The decoder is implemented by using '"ragged Tensors"' [TF_ragged]_ to
-    account for arbitrary node degrees. To avoid a performance degradation
-    caused by a severe indexing overhead, the batch-dimension is shifted to
-    the last dimension during decoding.
+    The batch-dimension is shifted to the last dimension during decoding to
+    avoid a performance degradation caused by a severe indexing overhead.
 
+    .. rubric:: Examples
+
+
+    .. code-block:: python
+
+        import torch
+        from sionna.phy.fec.ldpc import LDPC5GEncoder, LDPC5GDecoder
+
+        # Create encoder and decoder
+        encoder = LDPC5GEncoder(k=100, n=200)
+        decoder = LDPC5GDecoder(encoder, num_iter=20)
+
+        # Encode and decode
+        u = torch.randint(0, 2, (10, 100), dtype=torch.float32)
+        c = encoder(u)
+        llr_ch = 2.0 * (2.0 * c - 1.0)  # Perfect LLRs
+        u_hat = decoder(llr_ch)
+        print(torch.equal(u, u_hat))
+        # True
     """
 
-    def __init__(self,
-                 encoder,
-                 cn_update="boxplus-phi",
-                 vn_update="sum",
-                 cn_schedule="flooding",
-                 hard_out=True,
-                 return_infobits=True,
-                 num_iter=20,
-                 llr_max=20.,
-                 v2c_callbacks=None,
-                 c2v_callbacks=None,
-                 prune_pcm=True,
-                 return_state=False,
-                 precision=None,
-                 **kwargs):
-
-        # needs the 5G Encoder to access all 5G parameters
+    def __init__(
+        self,
+        encoder: LDPC5GEncoder,
+        cn_update: Union[str, Callable] = "boxplus-phi",
+        vn_update: Union[str, Callable] = "sum",
+        cn_schedule: Union[str, np.ndarray, torch.Tensor] = "flooding",
+        hard_out: bool = True,
+        return_infobits: bool = True,
+        num_iter: int = 20,
+        llr_max: Optional[float] = 20.0,
+        v2c_callbacks: Optional[List[Callable]] = None,
+        c2v_callbacks: Optional[List[Callable]] = None,
+        prune_pcm: bool = True,
+        return_state: bool = False,
+        precision: Optional[str] = None,
+        device: Optional[str] = None,
+        **kwargs,
+    ):
+        # Needs the 5G Encoder to access all 5G parameters
         if not isinstance(encoder, LDPC5GEncoder):
             raise TypeError("encoder must be of class LDPC5GEncoder.")
 
-        self._encoder = encoder
+        # Store encoder reference (will be assigned after super().__init__())
+        _encoder_ref = encoder
         pcm = encoder.pcm
 
         if not isinstance(return_infobits, bool):
-            raise TypeError('return_info must be bool.')
+            raise TypeError("return_infobits must be bool.")
         self._return_infobits = return_infobits
 
         if not isinstance(return_state, bool):
-            raise TypeError('return_state must be bool.')
-        self._return_state = return_state
+            raise TypeError("return_state must be bool.")
 
         # Deprecation warning for cn_type
-        if 'cn_type' in kwargs:
+        if "cn_type" in kwargs:
             raise TypeError("'cn_type' is deprecated; use 'cn_update' instead.")
 
-        # prune punctured degree-1 VNs and connected CNs. A punctured
-        # VN-1 node will always "send" llr=0 to the connected CN. Thus, this
-        # CN will only send 0 messages to all other VNs, i.e., does not
-        # contribute to the decoding process.
+        # Prune punctured degree-1 VNs and connected CNs
         if not isinstance(prune_pcm, bool):
-            raise TypeError('prune_pcm must be bool.')
+            raise TypeError("prune_pcm must be bool.")
         self._prune_pcm = prune_pcm
+
         if prune_pcm:
-            # find index of first position with only degree-1 VN
-            dv = np.sum(pcm, axis=0) # VN degree
-            last_pos = encoder._n_ldpc
-            for idx in range(encoder._n_ldpc-1, 0, -1):
-                if dv[0, idx]==1:
+            # Find index of first position with only degree-1 VN
+            dv = np.sum(pcm, axis=0)  # VN degree
+            last_pos = encoder.n_ldpc
+            for idx in range(encoder.n_ldpc - 1, 0, -1):
+                if dv[0, idx] == 1:
                     last_pos = idx
                 else:
                     break
-            # number of filler bits
-            k_filler = self.encoder.k_ldpc - self.encoder.k
 
-            # number of punctured bits
-            nb_punc_bits = ((self.encoder.n_ldpc - k_filler)
-                                     - self.encoder.n - 2*self.encoder.z)
+            # Number of filler bits
+            k_filler = encoder.k_ldpc - encoder.k
 
-            # if layered decoding is used, qunatized number of punctured bits
-            # to a multiple of z; otherwise scheduling groups of Z CNs becomes
-            # impossible
-            if cn_schedule=="layered":
-                nb_punc_bits = np.floor(nb_punc_bits/self.encoder.z) \
-                             * self.encoder.z
-                nb_punc_bits = int (nb_punc_bits) # cast to int
+            # Number of punctured bits
+            nb_punc_bits = (encoder.n_ldpc - k_filler) - encoder.n - 2 * encoder.z
 
-            # effective codeword length after pruning of vn-1 nodes
-            self._n_pruned = np.max((last_pos, encoder._n_ldpc - nb_punc_bits))
+            # If layered decoding is used, quantize number of punctured bits
+            # to a multiple of z
+            if cn_schedule == "layered":
+                nb_punc_bits = int(np.floor(nb_punc_bits / encoder.z) * encoder.z)
+
+            # Effective codeword length after pruning of vn-1 nodes
+            self._n_pruned = int(np.maximum(last_pos, encoder._n_ldpc - nb_punc_bits))
             self._nb_pruned_nodes = encoder._n_ldpc - self._n_pruned
 
-            # remove last CNs and VNs from pcm
-            pcm = pcm[:-self._nb_pruned_nodes, :-self._nb_pruned_nodes]
+            # Remove last CNs and VNs from pcm
+            pcm = pcm[: -self._nb_pruned_nodes, : -self._nb_pruned_nodes]
 
-            #check for consistency
-            if self._nb_pruned_nodes<0:
-                msg = "Internal error: number of pruned nodes must be positive."
-                raise ArithmeticError(msg)
+            if self._nb_pruned_nodes < 0:
+                raise ArithmeticError(
+                    "Internal error: number of pruned nodes must be positive."
+                )
         else:
-            # no pruning; same length as before
             self._nb_pruned_nodes = 0
             self._n_pruned = encoder._n_ldpc
 
-        if cn_schedule=="layered":
-            z = self._encoder.z
-            num_blocks = int(pcm.shape[0]/z)
-            cn_schedule = []
+        # Handle layered scheduling
+        if cn_schedule == "layered":
+            z = encoder.z
+            num_blocks = int(pcm.shape[0] / z)
+            cn_schedule_list = []
             for i in range(num_blocks):
-                cn_schedule.append(np.arange(z) + i*z)
-            cn_schedule = tf.stack(cn_schedule, axis=0)
+                cn_schedule_list.append(np.arange(z) + i * z)
+            cn_schedule = np.stack(cn_schedule_list, axis=0)
 
-        super().__init__(pcm,
-                         cn_update=cn_update,
-                         vn_update=vn_update,
-                         cn_schedule=cn_schedule,
-                         hard_out=hard_out,
-                         num_iter=num_iter,
-                         llr_max=llr_max,
-                         v2c_callbacks=v2c_callbacks,
-                         c2v_callbacks=c2v_callbacks,
-                         return_state=return_state,
-                         precision=precision,
-                         **kwargs)
+        super().__init__(
+            pcm,
+            cn_update=cn_update,
+            vn_update=vn_update,
+            cn_schedule=cn_schedule,
+            hard_out=hard_out,
+            num_iter=num_iter,
+            llr_max=llr_max,
+            v2c_callbacks=v2c_callbacks,
+            c2v_callbacks=c2v_callbacks,
+            return_state=return_state,
+            precision=precision,
+            device=device,
+            **kwargs,
+        )
+
+        # Assign encoder after super().__init__() for nn.Module compatibility
+        self._encoder = _encoder_ref
 
     ###############################
     # Public methods and properties
     ###############################
 
     @property
-    def encoder(self):
-        """LDPC Encoder used for rate-matching/recovery"""
+    def encoder(self) -> LDPC5GEncoder:
+        """LDPC Encoder used for rate-matching/recovery."""
         return self._encoder
 
     ########################
     # Sionna block functions
     ########################
 
-    def build(self, input_shape, **kwargs):
-        """Build block"""
-
-        # check input dimensions for consistency
-        if input_shape[-1]!=self.encoder.n:
-            raise ValueError('Last dimension must be of length n.')
+    def build(self, input_shape: tuple, **kwargs) -> None:
+        """Build block and check input dimensions."""
+        if input_shape[-1] != self.encoder.n:
+            raise ValueError("Last dimension must be of length n.")
 
         self._old_shape_5g = input_shape
 
-    def call(self, llr_ch, /, *, num_iter=None, msg_v2c=None):
+    def call(
+        self,
+        llr_ch: torch.Tensor,
+        /,
+        *,
+        num_iter: Optional[int] = None,
+        msg_v2c: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Iterative BP decoding function and rate matching.
+
+        :param llr_ch: Channel LLRs of shape [..., n].
+        :param num_iter: Number of iterations. If `None`, uses default.
+        :param msg_v2c: Initial v2c messages for IDD schemes.
+
+        :output x_hat: Decoded bits of shape [..., n] or [..., k].
+
+        :output msg_v2c: Decoder state. Returned only if ``return_state``
+            is `True`.
         """
-
-        llr_ch_shape = llr_ch.get_shape().as_list()
+        llr_ch_shape = list(llr_ch.shape)
         new_shape = [-1, self.encoder.n]
-        llr_ch_reshaped = tf.reshape(llr_ch, new_shape)
-        batch_size = tf.shape(llr_ch_reshaped)[0]
+        llr_ch_reshaped = llr_ch.reshape(new_shape)
+        batch_size = llr_ch_reshaped.shape[0]
 
-        # invert if rate-matching output interleaver was applied as defined in
-        # Sec. 5.4.2.2 in 38.212
+        # Invert if rate-matching output interleaver was applied
         if self._encoder.num_bits_per_symbol is not None:
-            llr_ch_reshaped = tf.gather(llr_ch_reshaped,
-                                        self._encoder.out_int_inv,
-                                        axis=-1)
+            llr_ch_reshaped = llr_ch_reshaped[:, self._encoder.out_int_inv]
 
-        # undo puncturing of the first 2*Z bit positions
-        llr_5g = tf.concat(
-                    [tf.zeros([batch_size, 2*self.encoder.z], self.rdtype),
-                    llr_ch_reshaped], axis=1)
+        # Use input device for all created tensors
+        input_device = llr_ch_reshaped.device
 
-        # undo puncturing of the last positions
-        # total length must be n_ldpc, while llr_ch has length n
-        # first 2*z positions are already added
-        # -> add n_ldpc - n - 2Z punctured positions
-        k_filler = self.encoder.k_ldpc - self.encoder.k # number of filler bits
-        nb_punc_bits = ((self.encoder.n_ldpc - k_filler)
-                        - self.encoder.n - 2*self.encoder.z)
+        # Undo puncturing of the first 2*Z bit positions
+        llr_5g = torch.cat(
+            [
+                torch.zeros(
+                    batch_size,
+                    2 * self.encoder.z,
+                    dtype=self.dtype,
+                    device=input_device,
+                ),
+                llr_ch_reshaped,
+            ],
+            dim=1,
+        )
 
-        llr_5g = tf.concat([llr_5g,
-                    tf.zeros([batch_size, nb_punc_bits - self._nb_pruned_nodes],
-                            self.rdtype)], axis=1)
+        # Undo puncturing of the last positions
+        k_filler = self.encoder.k_ldpc - self.encoder.k
+        nb_punc_bits = (
+            (self.encoder.n_ldpc - k_filler) - self.encoder.n - 2 * self.encoder.z
+        )
 
-        # undo shortening (= add 0 positions after k bits, i.e. LLR=LLR_max)
-        # the first k positions are the systematic bits
-        x1 = tf.slice(llr_5g, [0,0], [batch_size, self.encoder.k])
+        llr_5g = torch.cat(
+            [
+                llr_5g,
+                torch.zeros(
+                    batch_size,
+                    nb_punc_bits - self._nb_pruned_nodes,
+                    dtype=self.dtype,
+                    device=input_device,
+                ),
+            ],
+            dim=1,
+        )
 
-        # parity part
-        nb_par_bits = (self.encoder.n_ldpc - k_filler
-                       - self.encoder.k - self._nb_pruned_nodes)
-        x2 = tf.slice(llr_5g,
-                      [0, self.encoder.k],
-                      [batch_size, nb_par_bits])
+        # Undo shortening (= add 0 positions after k bits, i.e. LLR=LLR_max)
+        x1 = llr_5g[:, : self.encoder.k]
 
-        # negative sign due to logit definition
-        z = -tf.cast(self._llr_max, self.rdtype) \
-            * tf.ones([batch_size, k_filler], self.rdtype)
+        # Parity part
+        nb_par_bits = (
+            self.encoder.n_ldpc - k_filler - self.encoder.k - self._nb_pruned_nodes
+        )
+        x2 = llr_5g[:, self.encoder.k : self.encoder.k + nb_par_bits]
 
-        llr_5g = tf.concat([x1, z, x2], axis=1)
+        # Filler bits get large negative LLR (due to logit definition)
+        z = -self._llr_max * torch.ones(
+            batch_size, k_filler, dtype=self.dtype, device=input_device
+        )
 
-        # and run the core decoder
+        llr_5g = torch.cat([x1, z, x2], dim=1)
+
+        # Run the core decoder
         output = super().call(llr_5g, num_iter=num_iter, msg_v2c=msg_v2c)
 
         if self._return_state:
-            x_hat, msg_v2c = output
+            x_hat, msg_v2c_out = output
         else:
             x_hat = output
 
+        if self._return_infobits:
+            # Return only info bits (5G NR code is systematic)
+            u_hat = x_hat[:, : self.encoder.k]
 
-        if self._return_infobits:# return only info bits
-            # reconstruct u_hat
-            # 5G NR code is systematic
-            u_hat = tf.slice(x_hat, [0,0], [batch_size, self.encoder.k])
-            # Reshape u_hat so that it matches the original input dimensions
-            output_shape = llr_ch_shape[0:-1] + [self.encoder.k]
-            # overwrite first dimension as this could be None
+            # Reshape to match original input dimensions
+            output_shape = llr_ch_shape[:-1] + [self.encoder.k]
             output_shape[0] = -1
-            u_reshaped = tf.reshape(u_hat, output_shape)
+            u_reshaped = u_hat.reshape(output_shape)
 
             if self._return_state:
-                return u_reshaped, msg_v2c
+                return u_reshaped, msg_v2c_out
             else:
                 return u_reshaped
 
-        else: # return all codeword bits
-            # The transmitted CW bits are not the same as used during decoding
-            # cf. last parts of 5G encoding function
+        else:
+            # Return all codeword bits
+            x = x_hat.reshape(batch_size, self._n_pruned)
 
-            # remove last dim
-            x = tf.reshape(x_hat, [batch_size, self._n_pruned])
+            # Remove filler bits at pos (k, k_ldpc)
+            x_no_filler1 = x[:, : self.encoder.k]
+            x_no_filler2 = x[:, self.encoder.k_ldpc : self._n_pruned]
 
-            # remove filler bits at pos (k, k_ldpc)
-            x_no_filler1 = tf.slice(x, [0, 0], [batch_size, self.encoder.k])
+            x_no_filler = torch.cat([x_no_filler1, x_no_filler2], dim=1)
 
-            x_no_filler2 = tf.slice(x,
-                                    [0, self.encoder.k_ldpc],
-                                    [batch_size,
-                                    self._n_pruned-self.encoder.k_ldpc])
+            # Shorten the first 2*Z positions and end after n bits
+            x_short = x_no_filler[
+                :, 2 * self.encoder.z : 2 * self.encoder.z + self.encoder.n
+            ]
 
-            x_no_filler = tf.concat([x_no_filler1, x_no_filler2], 1)
-
-            # shorten the first 2*Z positions and end after n bits
-            x_short = tf.slice(x_no_filler,
-                               [0, 2*self.encoder.z],
-                               [batch_size, self.encoder.n])
-
-            # if used, apply rate-matching output interleaver again as
-            # Sec. 5.4.2.2 in 38.212
+            # If used, apply rate-matching output interleaver again
             if self._encoder.num_bits_per_symbol is not None:
-                x_short = tf.gather(x_short, self._encoder.out_int, axis=-1)
+                x_short = x_short[:, self._encoder.out_int]
 
-            # Reshape x_short so that it matches the original input dimensions
-            # overwrite first dimension as this could be None
-            llr_ch_shape[0] = -1
-            x_short= tf.reshape(x_short, llr_ch_shape)
+            # Reshape to match original input dimensions
+            output_shape = llr_ch_shape.copy()
+            output_shape[0] = -1
+            x_short = x_short.reshape(output_shape)
 
             if self._return_state:
-                return x_short, msg_v2c
+                return x_short, msg_v2c_out
             else:
                 return x_short

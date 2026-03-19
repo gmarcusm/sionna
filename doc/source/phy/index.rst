@@ -4,23 +4,21 @@ Physical Layer (PHY)
 This package provides a differentiable link-level simulator.
 
 It seamlessly integrates multiple communication system elements, including
-:doc:`forward error correction (FEC) <api/fec>`,
-:doc:`multiple input multiple output (MIMO) systems <api/mimo>`,
-:doc:`orthogonal frequency division multiplexing (OFDM) <api/ofdm>`, and a range
-of :doc:`wireless <api/channel.wireless>` and :doc:`optical <api/channel.optical>`
-channel models. It also supports simulation of some :doc:`5G NR <api/nr>` compliant features.
+:doc:`forward error correction (FEC) <api/fec/fec>`,
+:doc:`multiple input multiple output (MIMO) systems <api/mimo/index>`,
+:doc:`orthogonal frequency division multiplexing (OFDM) <api/ofdm/index>`, and a range
+of :doc:`wireless <api/channel/wireless/index>` and :doc:`optical <api/channel/optical/optical>`
+channel models. It also supports simulation of some :doc:`5G NR <api/nr/index>` compliant features.
 
-The best way to get started is by going through some of the :doc:`Tutorials <tutorials>`.
+A good starting point for Sionna PHY is the available
+:doc:`tutorials <tutorials/index>` page.
 
-Advanced users may want to consult the :doc:`Developer Guides <developer/developer>`
-for a deeper understanding of the inner workings of Sionna PHY and to learn how to
-extended it with custom physical layer algorithms.
 
 .. toctree::
    :hidden:
-   :maxdepth: 6
+   :maxdepth: 5
 
-
-   tutorials
+   tutorials/index
    api/phy.rst
-   developer/developer
+   developer/index
+   references

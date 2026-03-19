@@ -1,15 +1,24 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
-"""Class for generating channel frequency responses"""
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+"""Class for generating channel frequency responses."""
 
-from sionna.phy.block import Object
-from sionna.phy.channel.utils import subcarrier_frequencies, cir_to_ofdm_channel
+from typing import Optional
+
+import torch
+
+from sionna.phy.object import Object
+from sionna.phy.config import Precision
+from sionna.phy.ofdm import ResourceGrid
+from .channel_model import ChannelModel
+from .utils import subcarrier_frequencies, cir_to_ofdm_channel
+
+__all__ = ["GenerateOFDMChannel"]
+
 
 class GenerateOFDMChannel(Object):
-    # pylint: disable=line-too-long
-    r"""
-    Generates channel frequency responses
+    r"""Generates channel frequency responses.
 
     The channel impulse response is constant over the duration of an OFDM symbol.
 
@@ -26,60 +35,84 @@ class GenerateOFDMChannel(Object):
     next in the event of mobility, even if it is assumed static over the duration
     of an OFDM symbol.
 
-    Parameters
-    ----------
-    channel_model : :class:`~sionna.phy.channel.ChannelModel`
-        Channel model to be used.
+    :param channel_model: Channel model to be used.
+    :param resource_grid: Resource grid.
+    :param normalize_channel: If set to `True`, the channel is normalized over the resource grid
+        to ensure unit average energy per resource element. Defaults to `False`.
+    :param precision: Precision used for internal calculations and outputs.
+        If set to `None`, :attr:`~sionna.phy.config.Config.precision` is used.
+    :param device: Device for computation (e.g., 'cpu', 'cuda:0').
+        If `None`, :attr:`~sionna.phy.config.Config.device` is used.
 
-    resource_grid : :class:`~sionna.phy.ofdm.ResourceGrid`
-        Resource grid
-
-    normalize_channel : `bool`, (default `False`)
-        If set to `True`, the channel is normalized over the resource grid
-        to ensure unit average energy per resource element.
-
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
-        If set to `None`,
-        :attr:`~sionna.phy.config.Config.precision` is used.
-
-    Input
-    -----
-    batch_size : `None` (default) | `int`
+    :input batch_size: `None` (default) | `int`.
         Batch size. Defaults to `None` for channel models that do not require this parameter.
 
-    Output
-    -------
-    h_freq : [batch size, num_rx, num_rx_ant, num_tx, num_tx_ant, num_ofdm_symbols, num_subcarriers], `tf.complex`
-        Channel frequency responses
-    """
-    def __init__(self, channel_model, resource_grid, normalize_channel=False,
-                 precision=None, **kwargs):
-        super().__init__(precision=precision, **kwargs)
+    :output h_freq: [batch size, num_rx, num_rx_ant, num_tx, num_tx_ant, num_ofdm_symbols, num_subcarriers], `torch.complex`.
+        Channel frequency responses.
 
-        # Callable used to sample channel input responses
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        import torch
+        from sionna.phy.channel import GenerateOFDMChannel, RayleighBlockFading
+
+        # Create a simple resource grid-like object
+        class SimpleResourceGrid:
+            num_ofdm_symbols = 14
+            fft_size = 64
+            subcarrier_spacing = 15e3
+            cyclic_prefix_length = 4
+
+            @property
+            def ofdm_symbol_duration(self):
+                return (1 + self.cyclic_prefix_length / self.fft_size) / self.subcarrier_spacing
+
+        rg = SimpleResourceGrid()
+        channel_model = RayleighBlockFading(num_rx=1, num_rx_ant=2, num_tx=1, num_tx_ant=2)
+        gen_ch = GenerateOFDMChannel(channel_model, rg)
+        h_freq = gen_ch(batch_size=32)
+        print(h_freq.shape)
+        # torch.Size([32, 1, 2, 1, 2, 14, 64])
+    """
+
+    def __init__(
+        self,
+        channel_model: ChannelModel,
+        resource_grid: ResourceGrid,
+        normalize_channel: bool = False,
+        precision: Optional[Precision] = None,
+        device: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(precision=precision, device=device, **kwargs)
+
+        # Callable used to sample channel impulse responses
         self._cir_sampler = channel_model
 
-        # We need those in call()
+        # Extract parameters from resource grid
         self._num_ofdm_symbols = resource_grid.num_ofdm_symbols
         self._subcarrier_spacing = resource_grid.subcarrier_spacing
         self._num_subcarriers = resource_grid.fft_size
         self._normalize_channel = normalize_channel
-        self._sampling_frequency = 1./resource_grid.ofdm_symbol_duration
+        self._sampling_frequency = 1.0 / resource_grid.ofdm_symbol_duration
 
         # Frequencies of the subcarriers
-        self._frequencies = subcarrier_frequencies(self._num_subcarriers,
-                                                   self._subcarrier_spacing,
-                                                   self.precision)
+        self._frequencies = subcarrier_frequencies(
+            self._num_subcarriers,
+            self._subcarrier_spacing,
+            precision=self.precision,
+            device=self.device,
+        )
 
-    def __call__(self, batch_size=None):
-
+    def __call__(self, batch_size: Optional[int] = None) -> torch.Tensor:
+        """Generate channel frequency responses."""
         # Sample channel impulse responses
-        h, tau = self._cir_sampler( batch_size,
-                                    self._num_ofdm_symbols,
-                                    self._sampling_frequency)
+        h, tau = self._cir_sampler(
+            batch_size, self._num_ofdm_symbols, self._sampling_frequency
+        )
 
-        h_freq = cir_to_ofdm_channel(self._frequencies, h, tau,
-                                     self._normalize_channel)
+        # Convert CIR to OFDM channel frequency response
+        h_freq = cir_to_ofdm_channel(self._frequencies, h, tau, self._normalize_channel)
 
         return h_freq

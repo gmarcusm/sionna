@@ -1,221 +1,294 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+"""Unit tests for sionna.phy.fec.crc.CRCEncoder and CRCDecoder."""
+
 import os
-import unittest
 import numpy as np
-import tensorflow as tf
+import pytest
+import torch
+
 from sionna.phy import config
 from sionna.phy.fec.crc import CRCEncoder, CRCDecoder
 from sionna.phy.mapping import BinarySource
 
-current_dir = os.path.dirname(os.path.abspath(__file__))
-test_dir = os.path.abspath(os.path.join(current_dir, os.pardir, os.pardir))
+
+# Get reference data directory
+test_dir = os.path.dirname(os.path.abspath(__file__))
+ref_path = os.path.join(test_dir, "..", "..", "codes", "crc")
 
 VALID_POLS = ["CRC24A", "CRC24B", "CRC24C", "CRC16", "CRC11", "CRC6"]
+PRECISION_DTYPES = [("single", torch.float32), ("double", torch.float64)]
 
-class TestCRC(unittest.TestCase):
-    """"Unittests for the CRC encoder/decoder class."""
 
-    def test_polynomials(self):
-        """Check that all valid polynomials from 38.212 are supported.
-        Also check against invalid input parameters."""
+class TestCRCEncoder:
+    """Tests for the CRCEncoder class."""
 
-        crc_polys =[
-            [1,1,0,0,0,0,1,1,0,0,1,0,0,1,1,0,0,1,1,1,1,1,0,1,1],
-            [1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,0,0,1,1],
-            [1,1,0,1,1,0,0,1,0,1,0,1,1,0,0,0,1,0,0,0,1,0,1,1,1],
-            [1,0,0,0,1,0,0,0,0,0,0,1,0,0,0,0,1],
-            [1,1,1,0,0,0,1,0,0,0,0,1],
-            [1,1,0,0,0,0,1]]
+    @pytest.mark.parametrize("idx,pol", enumerate(VALID_POLS))
+    def test_polynomials(self, idx, pol):
+        """Check that all valid polynomials from 38.212 are supported."""
+        crc_polys = [
+            [1, 1, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 1, 1],
+            [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 1, 1],
+            [1, 1, 0, 1, 1, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 1],
+            [1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+            [1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+            [1, 1, 0, 0, 0, 0, 1],
+        ]
 
-        for idx, p in enumerate(VALID_POLS):
-            c = CRCEncoder(p)
-            # test that result is correct
-            self.assertTrue(np.array_equal(c.crc_pol, crc_polys[idx]))
-            # test that crc_length has correct length of polynomial
-            self.assertTrue(c.crc_length == (len(crc_polys[idx])-1))
+        c = CRCEncoder(pol)
+        assert np.array_equal(c.crc_pol, crc_polys[idx])
+        assert c.crc_length == (len(crc_polys[idx]) - 1)
 
-        # test that invalid input raises an Exception
-        with self.assertRaises(AssertionError):
+    def test_invalid_inputs(self):
+        """Test that invalid input raises an Exception."""
+        # Non-string input
+        with pytest.raises(TypeError):
             CRCEncoder(24)
-        # test against unknown CRC polynomial
-        with self.assertRaises(ValueError):
+        # Unknown CRC polynomial
+        with pytest.raises(ValueError):
             CRCEncoder("CRC17")
 
-    def test_output_dim(self):
+    @pytest.mark.parametrize("pol", VALID_POLS)
+    @pytest.mark.parametrize(
+        "shape", [[10], [1, 10], [10, 3, 3], [1, 2, 3, 4, 100]]
+    )
+    def test_output_dim(self, device, pol, shape):
         """Test that output dims are correct (=k+crc_len)."""
+        crc_enc = CRCEncoder(pol, device=device)
+        crc_dec = CRCDecoder(crc_enc, device=device)
 
-        # test against random shapes
-        shapes = [[10],[1, 10],[10, 3, 3],[1, 2, 3, 4, 100]]
+        u = torch.zeros(shape, device=device)
+        c = crc_enc(u)
+        u_hat, crc_indicator = crc_dec(c)
 
-        for pol in VALID_POLS:
-            crc_enc = CRCEncoder(pol)
-            crc_dec = CRCDecoder(crc_enc)
-            for s in shapes:
-                u = tf.zeros(s)
-                c = crc_enc(u)
-                u_hat, crc_indicator = crc_dec(c)
-                c = c.numpy()
-                crc_indicator = crc_indicator.numpy()
-                u_hat = u_hat.numpy()
-                # output shapes are equal to input shape (besides last dim)
-                self.assertTrue(np.array_equal(c.shape[0:-1], s[0:-1]))
-                # last dimension of output is increased by 'crc_length'
-                self.assertTrue(c.shape[-1]==s[-1]+crc_enc.crc_length)
-                #check dimensions of "crc_valid indicator" (boolean)
-                self.assertTrue(np.array_equal(crc_indicator.shape[0:-1],
-                                               s[0:-1]))
-                self.assertTrue(crc_indicator.shape[-1]==1)
-                # check that decoder removes parity bits (=original shape)
-                self.assertTrue(np.array_equal(u_hat.shape, s))
+        # Output shapes are equal to input shape (besides last dim)
+        assert list(c.shape[:-1]) == shape[:-1]
+        # Last dimension of output is increased by 'crc_length'
+        assert c.shape[-1] == shape[-1] + crc_enc.crc_length
+        # Check dimensions of "crc_valid indicator" (boolean)
+        assert list(crc_indicator.shape[:-1]) == shape[:-1]
+        assert crc_indicator.shape[-1] == 1
+        # Check that decoder removes parity bits (=original shape)
+        assert list(u_hat.shape) == shape
 
-    def test_tf_fun(self):
-        """Test that tf.function works and XLA is supported."""
+    @pytest.mark.parametrize("shape", [[10], [2, 10], [1, 2, 3, 4, 100]])
+    def test_torch_compile(self, device, shape):
+        """Test that torch.compile works as expected."""
+        pol = "CRC24A"
 
-        # graph mode
-        @tf.function()
-        def run_graph(s, pol):
-            crc_enc = CRCEncoder(pol)
-            crc_dec = CRCDecoder(crc_enc)
-            u = tf.zeros(s)
+        crc_enc = CRCEncoder(pol, device=device)
+        crc_dec = CRCDecoder(crc_enc, device=device)
+
+        @torch.compile
+        def run_crc(u):
             x = crc_enc(u)
             y, z = crc_dec(x)
-            return y
+            return y, z
 
-        # XLA mode
-        @tf.function(jit_compile=True)
-        def run_graph_xla(s, pol):
-            crc_enc = CRCEncoder(pol)
-            crc_dec = CRCDecoder(crc_enc)
-            u = tf.zeros(s)
-            x = crc_enc(u)
-            y, z = crc_dec(x)
-            return y
+        u = torch.zeros(shape, device=device)
+        y, z = run_crc(u)
+        assert y.shape == u.shape
+        assert z.all()
 
-        shapes = [[10], [2, 10], [1 ,2, 3, 4, 100]]
-        # test for different shapes
-        for pol in VALID_POLS:
-            for s in shapes:
-                x = run_graph(s, pol)
-                x = run_graph_xla(s, pol)
+    @pytest.mark.parametrize("mode", ["default", "reduce-overhead"])
+    def test_torch_compile_modes(self, device, mode):
+        """Test that torch.compile works with different compilation modes."""
+        if device == "cpu" and mode == "reduce-overhead":
+            pytest.skip("reduce-overhead mode can be slow on CPU")
 
+        pol = "CRC24A"
+        shape = [10, 100]
 
-    def test_valid_crc(self):
-        """Test that CRC of error-free codewords always holds, i.e.,
-        re-encoding always yields a valid CRC.
-        """
+        crc_enc = CRCEncoder(pol, device=device)
+        crc_dec = CRCDecoder(crc_enc, device=device)
 
-        shapes = [[100,], [100, 10], [4, 2, 100], [1, int(1e6)]]
-        source = BinarySource()
+        source = BinarySource(device=device)
+        u = source(shape)
 
-        for pol in VALID_POLS:
-            crc_enc = CRCEncoder(pol)
-            crc_dec = CRCDecoder(crc_enc)
-            for s in shapes:
-                u = source(s)
-                x = crc_enc(u) # add CRC parity bits
-                _, y2 = crc_dec(x) # perform CRC check
+        # Reference without compilation
+        c_ref = crc_enc(u)
+        y_ref, z_ref = crc_dec(c_ref)
 
-                # CRC check for CRC encoded data x must always hold
-                self.assertTrue(np.all(y2.numpy()))
+        # Compile and run with fresh input to avoid CUDA graph tensor reuse issues
+        # Clone the input to create a new tensor that CUDA graphs won't conflict with
+        u_compiled = u.clone()
+        compiled_enc = torch.compile(crc_enc, mode=mode)
+        compiled_dec = torch.compile(crc_dec, mode=mode)
 
-    def test_error_patters(self):
-        """"Test that CRC detects random error patterns."""
-        shapes = [10, 100]
-        source = BinarySource()
+        # For reduce-overhead mode with CUDA graphs, we need to mark step boundaries
+        # when passing tensors between separately compiled functions
+        if mode == "reduce-overhead":
+            torch.compiler.cudagraph_mark_step_begin()
+        c_compiled = compiled_enc(u_compiled)
 
-        for pol in VALID_POLS:
-            crc_enc = CRCEncoder(pol)
-            crc_dec = CRCDecoder(crc_enc)
-            u = source(shapes)
-            x = crc_enc(u) # add CRC
+        if mode == "reduce-overhead":
+            # Clone to avoid CUDA graph tensor ownership conflicts between
+            # separately compiled encoder and decoder
+            c_compiled = c_compiled.clone()
+            torch.compiler.cudagraph_mark_step_begin()
+        y_compiled, z_compiled = compiled_dec(c_compiled)
 
-            # add error patters with 3 random errors per CW
-            e = tf.concat([tf.ones([10, 3]),
-                          tf.zeros([10, (97+crc_enc.crc_length)])], axis=1)
-            # shuffling permutes first dim, but we need the second dim
-            e = tf.transpose(e, (1,0))
-            random_indices = config.tf_rng.uniform(shape=[tf.shape(e)[0]],
-                                                   maxval=tf.shape(e)[0],
-                                                   dtype=tf.int32)
-            e = tf.gather(e, random_indices)
-            e = tf.transpose(e, (1,0))
-            # add error vector
-            x += e
-            x = tf.math.mod(x, 2) # take mod2 as we are in GF(2)
+        assert torch.equal(c_ref, c_compiled)
+        assert torch.equal(y_ref, y_compiled)
+        assert torch.equal(z_ref, z_compiled)
 
-            _, y2 = crc_dec(x) # perform CRC check
+    @pytest.mark.parametrize("pol", VALID_POLS)
+    @pytest.mark.parametrize(
+        "shape", [[100], [100, 10], [4, 2, 100], [1, 100000]]
+    )
+    def test_valid_crc(self, device, pol, shape):
+        """Test that CRC of error-free codewords always holds."""
+        source = BinarySource(device=device)
+        crc_enc = CRCEncoder(pol, device=device)
+        crc_dec = CRCDecoder(crc_enc, device=device)
 
-            # CRC should detect all errors (= all checks return False)
-            self.assertFalse(np.any(y2.numpy()))
+        u = source(shape)
+        x = crc_enc(u)  # Add CRC parity bits
+        _, crc_valid = crc_dec(x)  # Perform CRC check
 
-    def test_examples(self):
+        # CRC check for CRC encoded data x must always hold
+        assert crc_valid.all()
+
+    @pytest.mark.parametrize("pol", VALID_POLS)
+    def test_error_patterns(self, device, pol):
+        """Test that CRC detects random error patterns."""
+        shape = [10, 100]
+        source = BinarySource(device=device)
+
+        crc_enc = CRCEncoder(pol, device=device)
+        crc_dec = CRCDecoder(crc_enc, device=device)
+
+        u = source(shape)
+        x = crc_enc(u)  # Add CRC
+
+        # For shorter CRCs (like CRC6), use fewer errors to ensure reliable
+        # detection. CRC-6 has only 6 parity bits, so random 3-bit errors
+        # have ~1/64 probability of being undetected.
+        num_errors = 1 if crc_enc.crc_length <= 6 else 3
+
+        # Add error patterns
+        n_coded = x.shape[-1]
+        e = torch.zeros_like(x)
+        for i in range(x.shape[0]):
+            error_pos = torch.randperm(n_coded, device=device)[:num_errors]
+            e[i, error_pos] = 1
+
+        # Add error vector
+        x_err = torch.fmod(x + e, 2)
+
+        _, crc_valid = crc_dec(x_err)  # Perform CRC check
+
+        # CRC should detect all errors (= all checks return False)
+        assert not crc_valid.any()
+
+    @pytest.mark.parametrize("idx,pol", enumerate(VALID_POLS))
+    def test_examples(self, idx, pol):
         """Test against some manually calculated examples."""
+        crc_polys = [
+            [1, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 1, 1],
+            [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 1, 1],
+            [1, 0, 1, 1, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 1],
+            [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+            [1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+            [1, 0, 0, 0, 0, 1],
+        ]
 
-        crc_polys =[
-            [1,0,0,0,0,1,1,0,0,1,0,0,1,1,0,0,1,1,1,1,1,0,1,1],
-            [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,0,0,1,1],
-            [1,0,1,1,0,0,1,0,1,0,1,1,0,0,0,1,0,0,0,1,0,1,1,1],
-            [0,0,0,1,0,0,0,0,0,0,1,0,0,0,0,1],
-            [1,1,0,0,0,1,0,0,0,0,1],
-            [1,0,0,0,0,1]]
+        crc_length = len(crc_polys[idx])
+        crc_enc = CRCEncoder(pol)
+        u = torch.tensor([[1.0]], dtype=torch.float32)
+        x = crc_enc(u)
+        x = x.flatten()[-crc_length:].cpu().numpy()
+        x_ref = np.array(crc_polys[idx])
+        assert np.array_equal(x, x_ref)
 
-        for idx, pol in enumerate(VALID_POLS):
-            crc_length = len(crc_polys[idx])
-            crc_enc = CRCEncoder(pol) # init encoder
-            u = tf.constant(1., dtype=tf.float32) # encode single "1"
-            u = tf.reshape(u, [1,1])
-            x = crc_enc(u)
-            x = tf.reshape(x, (-1)).numpy()
-            x = x[-crc_length:] # slice only CRC bits
-            # calculate results by hand
-            x_ref = np.array(crc_polys[idx])
-            self.assertTrue(np.array_equal(x, x_ref))
-
-    def test_valid_encoding(self):
+    @pytest.mark.parametrize("pol", VALID_POLS)
+    def test_valid_encoding(self, device, pol):
         """Check all valid polynomials from 38.212 against
         a dataset from a reference implementation."""
+        if not os.path.exists(ref_path):
+            pytest.skip("Reference data not found")
 
-        for pol in VALID_POLS:
+        # Load reference codewords
+        u = np.load(os.path.join(ref_path, f"crc_u_{pol}.npy"))
+        x_ref_np = np.load(os.path.join(ref_path, f"crc_x_ref_np_{pol}.npy"))
 
-            ref_path = test_dir + '/codes/crc/'
+        crc_enc = CRCEncoder(pol, device=device)
 
-            # load reference codewords
-            u = np.load(ref_path + "crc_u_" + pol + ".npy")
-            x_ref_np = np.load(ref_path + "crc_x_ref_np_" + pol + ".npy")
+        u_t = torch.tensor(u, dtype=torch.float32, device=device)
+        x = crc_enc(u_t)  # Add CRC
+        x_crc = x.flatten()[-crc_enc.crc_length :].cpu().numpy()
 
-            crc_enc = CRCEncoder(pol)
+        assert np.array_equal(x_crc, x_ref_np)
 
-            x = crc_enc(u) # add CRC
-            x = tf.reshape(x, (-1))
-            x_crc = x.numpy()[-crc_enc.crc_length:] #consider only CRC positions
+        # Test properties k, n
+        assert crc_enc.k == u.shape[-1]
+        assert crc_enc.n == x.shape[-1]
 
-            self.assertTrue(np.array_equal(x_crc, x_ref_np))
-
-            # test properties k,n
-            self.assertTrue(crc_enc.k==u.shape[-1])
-            self.assertTrue(crc_enc.n==x.shape[-1])
-
-    def test_dtype(self):
+    @pytest.mark.parametrize("p_in,dt_in", PRECISION_DTYPES)
+    @pytest.mark.parametrize("p_enc,dt_enc", PRECISION_DTYPES)
+    @pytest.mark.parametrize("p_dec,dt_dec", PRECISION_DTYPES)
+    def test_dtype(self, device, p_in, dt_in, p_enc, dt_enc, p_dec, dt_dec):
         """Test support for variable dtypes."""
-
-        prec = ["single", "double"]
-        dtype = [tf.float32, tf.float64]
         pol = "CRC24A"
         shape = [2, 10]
-        source = BinarySource()
+        source = BinarySource(device=device)
 
-        for p_in, dt_in in zip(prec, dtype):
-            for p_enc, dt_enc in zip(prec, dtype):
-                for p_dec, dt_dec in zip(prec, dtype):
-                    crc_enc = CRCEncoder(pol, precision=p_enc)
-                    crc_dec = CRCDecoder(crc_enc, precision=p_dec)
+        crc_enc = CRCEncoder(pol, precision=p_enc, device=device)
+        crc_dec = CRCDecoder(crc_enc, precision=p_dec, device=device)
 
-                    u = tf.cast(source(shape), dtype=dt_in)
-                    x = crc_enc(u) # add CRC parity bits
-                    y, _ = crc_dec(x) # perform CRC check
+        u = source(shape).to(dt_in)
+        x = crc_enc(u)
+        y, _ = crc_dec(x)
 
-                    self.assertTrue(u.dtype==dt_in)
-                    self.assertTrue(x.dtype==dt_enc)
-                    self.assertTrue(y.dtype==dt_dec)
+        assert u.dtype == dt_in
+        assert x.dtype == dt_enc
+        assert y.dtype == dt_dec
+
+
+class TestCRCDecoder:
+    """Tests for the CRCDecoder class."""
+
+    def test_invalid_encoder(self):
+        """Test that decoder raises error for invalid encoder."""
+        with pytest.raises(TypeError):
+            CRCDecoder("not_an_encoder")
+
+    def test_input_too_short(self, device):
+        """Test that decoder raises error when input is too short."""
+        enc = CRCEncoder("CRC24A", device=device)
+        dec = CRCDecoder(enc, device=device)
+
+        # Input shorter than CRC length
+        with pytest.raises(ValueError):
+            dec(torch.zeros(10, device=device))
+
+    def test_docstring_example(self):
+        """Verify the docstring example works correctly."""
+        encoder = CRCEncoder("CRC24A")
+        decoder = CRCDecoder(encoder)
+
+        bits = torch.randint(0, 2, (10, 100), dtype=torch.float32)
+        encoded = encoder(bits)
+        decoded, crc_valid = decoder(encoded)
+
+        assert decoded.shape == torch.Size([10, 100])
+        assert crc_valid.all()
+
+    @pytest.mark.parametrize("pol", VALID_POLS)
+    def test_roundtrip(self, device, pol):
+        """Test that encoder followed by decoder returns original bits."""
+        source = BinarySource(device=device)
+        shape = [10, 50]
+
+        enc = CRCEncoder(pol, device=device)
+        dec = CRCDecoder(enc, device=device)
+
+        u = source(shape)
+        c = enc(u)
+        u_hat, crc_valid = dec(c)
+
+        assert torch.equal(u, u_hat)
+        assert crc_valid.all()
+

@@ -1,10 +1,13 @@
 Utils
 =====
 
+.. currentmodule:: sionna.sys
+
 Set of utility functions for Sionna SYS.
 
-.. autofunction:: sionna.sys.utils.get_pathloss
+.. autosummary::
+   :toctree: .
 
-.. autofunction:: sionna.sys.utils.is_scheduled_in_slot
-
-.. autofunction:: sionna.sys.utils.spread_across_subcarriers
+   is_scheduled_in_slot
+   get_pathloss
+   spread_across_subcarriers

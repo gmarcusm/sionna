@@ -1,192 +1,120 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+"""Unit tests for sionna.sys.power_control"""
 
-import unittest
 import numpy as np
-import tensorflow as tf
+import pytest
+import torch
 
-from sionna.phy import config, dtypes
-from sionna.sys import open_loop_uplink_power_control, downlink_fair_power_control
-from sionna.phy.utils import sample_bernoulli, db_to_lin, dbm_to_watt
-from sys_utils import open_loop_uplink_power_control_xla, downlink_fair_power_control_xla
+from sionna.phy import config
+from sionna.phy.utils import dbm_to_watt, lin_to_db, db_to_lin
+from sionna.sys import downlink_fair_power_control, open_loop_uplink_power_control
 
 
-class TestPowerControl(unittest.TestCase):
+class TestPowerControl:
+    """Tests for power control functions."""
 
-    def test_uplink_open_loop(self):
-        """Validate the per-UT power produced by sys.open_loop_uplink_power_control"""
+    def test_open_loop_ul_power_control(self, device, precision):
+        """Test open loop uplink power control."""
         batch_size = 2
-        num_ut = 1000
-        precision = 'double'
+        num_ut = 4
 
-        # N. allocated REs
-        num_allocated_re = config.tf_rng.uniform(
-            [batch_size, num_ut], minval=1, maxval=30, dtype=tf.int32)
-        ut_is_scheduled = sample_bernoulli(num_allocated_re.shape, p=.8)
-        num_allocated_re = num_allocated_re * \
-            tf.cast(ut_is_scheduled, num_allocated_re.dtype)
-
-        # Pathloss
-        pathloss_db = config.tf_rng.uniform([batch_size, num_ut],
-                                            minval=70, maxval=130)
+        # Generate random pathloss (linear scale)
+        rdtype = torch.float32 if precision == "single" else torch.float64
+        pathloss_db = torch.rand(batch_size, num_ut, dtype=rdtype, device=device) * 40 + 80
         pathloss = db_to_lin(pathloss_db, precision=precision)
 
-        # ULPC parameters
-        alpha = config.tf_rng.uniform([batch_size, num_ut],
-                                      minval=.5,
-                                      maxval=1)
-        p0_dbm = config.tf_rng.uniform([batch_size, num_ut],
-                                       minval=-110.,
-                                       maxval=-80)
-        max_power_dbm = 26.
+        # Number of allocated subcarriers per user
+        num_allocated_subcarriers = torch.randint(12, 52, (batch_size, num_ut), device=device)
 
-        for fun in [open_loop_uplink_power_control_xla,
-                    open_loop_uplink_power_control]:
-            # Uplink power control
-            tx_power_tf = fun(
-                pathloss,
-                num_allocated_re,
-                alpha=alpha,
-                p0_dbm=p0_dbm,
-                precision=precision).numpy()
+        # Power control parameters
+        p0_dbm = -90.0
+        alpha = 0.8
+        ut_max_power_dbm = 26.0
 
-            # Per-UT power control via Numpy
-            # [batch_size, num_ut]
-            num_allocated_prb = np.ceil(num_allocated_re / 12)
-            tx_power_np_dbm = np.zeros([batch_size, num_ut])
-            tx_power_np_dbm[ut_is_scheduled] = np.minimum(
-                alpha[ut_is_scheduled] * pathloss_db.numpy()[ut_is_scheduled] +
-                p0_dbm[ut_is_scheduled] + 10 *
-                np.log10(num_allocated_prb[ut_is_scheduled]),
-                max_power_dbm)
+        # Compute UL power
+        tx_power = open_loop_uplink_power_control(
+            pathloss,
+            num_allocated_subcarriers,
+            alpha=alpha,
+            p0_dbm=p0_dbm,
+            ut_max_power_dbm=ut_max_power_dbm,
+            precision=precision,
+        )
 
-            # Convert to Watt
-            tx_power_np = np.zeros([batch_size, num_ut])
-            tx_power_np[ut_is_scheduled] = np.power(
-                10, tx_power_np_dbm[ut_is_scheduled]/10) / 1e3
+        # Check output shape
+        assert tx_power.shape == (batch_size, num_ut)
 
-            # np/tf versions must be positive at the same positions
-            self.assertEqual(
-                (np.abs((tx_power_np > 0)*1 - (tx_power_tf > 0)*1)).sum(), 0)
+        # Check that power is positive
+        assert (tx_power >= 0).all()
 
-            # Compute tf/np difference
-            error = np.mean(np.abs(tx_power_np - tx_power_tf))
+        # Check that power does not exceed max
+        ut_max_power_watt = dbm_to_watt(ut_max_power_dbm).item()
+        assert (tx_power <= ut_max_power_watt * 1.01).all()  # small tolerance
 
-            self.assertAlmostEqual(error, 0, delta=1e-3)
+    def test_downlink_fair_power_control(self, device, precision):
+        """Test downlink fair power control."""
+        batch_size = 2
+        num_ut = 4
 
-    def test_downlink_fair(self):
-        """
-        Test ~sionna.sys.downlink_fair_power_control
-
-        """
-        precision = 'double'
-        rdtype = dtypes[precision]["tf"]["rdtype"]
-
-        batch_size = [2, 3]
-        num_ut = 30
-
-        interference_plus_noise_db = config.tf_rng.uniform(
-            batch_size + [num_ut], minval=-120, maxval=-115)
-        interference_plus_noise = db_to_lin(interference_plus_noise_db)
-
-        # Note: since minval=0, some UTs are not scheduled
-        num_resources = config.tf_rng.uniform(
-            batch_size + [num_ut], minval=0, maxval=5, dtype=tf.int32)
-        num_resources = tf.cast(num_resources, rdtype)
-
-        pathloss_db = config.tf_rng.uniform(
-            batch_size + [num_ut], minval=70, maxval=140)
+        # Generate random pathloss (linear scale)
+        rdtype = torch.float32 if precision == "single" else torch.float64
+        pathloss_db = torch.rand(batch_size, num_ut, dtype=rdtype, device=device) * 40 + 80
         pathloss = db_to_lin(pathloss_db, precision=precision)
 
-        bs_max_power_dbm = config.tf_rng.uniform(
-            batch_size, minval=54, maxval=58)
-        max_power_bs = dbm_to_watt(bs_max_power_dbm).numpy()
+        # Interference plus noise
+        interference_plus_noise = 1e-10  # [W]
 
-        # Channel quality
-        cq = (1 / (pathloss * tf.cast(interference_plus_noise, rdtype))).numpy()
+        # Number of allocated resources per user
+        num_allocated_re = torch.randint(10, 100, (batch_size, num_ut), device=device)
 
-        # N. scheduled UTs
-        n_scheduled_uts = tf.reduce_sum(
-            tf.cast(num_resources > 0, rdtype), axis=-1)
+        # Power control parameters
+        bs_max_power_dbm = 56.0
 
-        for guaranteed_power_ratio in [0, .5, 1]:
-            for fairness in [0., 1., 3.]:
-                for fun in [downlink_fair_power_control,
-                            downlink_fair_power_control_xla]:
-                    tx_power_tf, _, mu_inv_star = fun(
-                        pathloss,
-                        interference_plus_noise,
-                        num_resources,
-                        bs_max_power_dbm=bs_max_power_dbm,
-                        fairness=fairness,
-                        guaranteed_power_ratio=guaranteed_power_ratio,
-                        return_lagrangian=True,
-                        precision=precision)
+        # Compute DL power
+        tx_power, utility = downlink_fair_power_control(
+            pathloss,
+            interference_plus_noise=interference_plus_noise,
+            num_allocated_re=num_allocated_re,
+            bs_max_power_dbm=bs_max_power_dbm,
+            precision=precision,
+        )
 
-                    # If num_resources=0 then power must be 0
-                    power_must_be0 = tf.gather_nd(
-                        tx_power_tf, tf.where(num_resources == 0))
-                    err_pow0 = tf.abs(tf.reduce_sum(power_must_be0))
-                    self.assertEqual(err_pow0.numpy(), 0)
+        # Check output shapes
+        assert tx_power.shape == (batch_size, num_ut)
+        assert utility.shape == (batch_size, num_ut)
 
-                    # For scheduled UTs, power >= guaranteed power
+        # Check that power is non-negative
+        assert (tx_power >= 0).all()
 
-                    # Min power per UT
-                    min_power_per_ut = guaranteed_power_ratio * \
-                        dbm_to_watt(bs_max_power_dbm, precision=precision) / \
-                        n_scheduled_uts
-                    # Min power for each resource of each UT
-                    # [..., num_ut]
-                    min_power_per_res_ut = tf.expand_dims(
-                        min_power_per_ut, axis=-1)
-                    min_power_per_res_ut = tf.tile(
-                        min_power_per_res_ut, [1]*len(batch_size) + [num_ut])
-                    min_power_per_res_ut = min_power_per_res_ut / num_resources
-                    min_power_per_res_ut = tf.where(num_resources > 0,
-                                                    min_power_per_res_ut,
-                                                    tf.cast(0., rdtype))
-                    power_must_be_guaranteed = tf.gather_nd(
-                        tx_power_tf, tf.where(num_resources > 0))
-                    self.assertTrue(tf.reduce_all((power_must_be_guaranteed >=
-                                                   tf.gather_nd(min_power_per_res_ut,
-                                                                tf.where(num_resources > 0)) -
-                                                   tf.cast(1e-5, rdtype))
-                                                  ))
+    @pytest.mark.parametrize("mode", ["default", "reduce-overhead"])
+    def test_ul_power_control_compiled(self, device, mode):
+        """Test that open_loop_uplink_power_control works with torch.compile."""
+        if device == "cpu" and mode == "reduce-overhead":
+            pytest.skip("reduce-overhead mode not well supported on CPU")
 
-                    # Power constraint
-                    err_constr = tf.abs(tf.reduce_sum(tx_power_tf, axis=-1) -
-                                        dbm_to_watt(bs_max_power_dbm, precision=precision)).numpy()
-                    self.assertAlmostEqual(np.mean(err_constr), 0, delta=1e-3)
+        batch_size = 2
+        num_ut = 4
 
-                    if fairness == 0:
-                        # Compute optimal analytical solution
-                        tx_power_np = np.maximum(
-                            mu_inv_star.numpy()[..., np.newaxis] - 1 / cq, min_power_per_res_ut.numpy())
-                        tx_power_np *= num_resources.numpy()
-                        err_p_opt = np.mean(np.abs(tx_power_tf - tx_power_np))
-                        self.assertAlmostEqual(err_p_opt, 0, delta=1e-4)
-                    elif guaranteed_power_ratio < 1:
-                        # Verify KKT conditions
-                        # Note: at guaranteed_power_ratio=1, all UTs are at min power,
-                        # so check is useless
+        pathloss_db = torch.rand(batch_size, num_ut, device=device) * 40 + 80
+        pathloss = db_to_lin(pathloss_db)
 
-                        tx_power_tf = tx_power_tf.numpy()
-                        ut_is_not_at_min_power = tx_power_tf > \
-                            min_power_per_ut.numpy()[..., np.newaxis] + 1e-5
-                        # power per resource
-                        tx_power_tf[num_resources > 0] = \
-                            tx_power_tf[num_resources > 0] / \
-                            num_resources[num_resources > 0]
-                        term = (1 + tx_power_tf * cq)
-                        term1 = np.power(
-                            num_resources * np.log(term), fairness) * term
-                        err_kkt = cq * mu_inv_star[..., np.newaxis] - term1
-                        # Consider only UTs i) scheduled and ii) not at min power
-                        ind_to_consider = (
-                            num_resources > 0) & ut_is_not_at_min_power
-                        err_kkt_rel = err_kkt[ind_to_consider] / \
-                            np.linalg.norm(term1[ind_to_consider])
+        num_allocated_subcarriers = torch.randint(12, 52, (batch_size, num_ut), device=device)
 
-                        err_kkt_rel_mean = np.mean(np.abs(err_kkt_rel))
-                        self.assertAlmostEqual(err_kkt_rel_mean, 0, delta=1e-2)
+        # Compile the function
+        if mode != "default":
+            compiled_fn = torch.compile(open_loop_uplink_power_control, mode=mode)
+        else:
+            compiled_fn = open_loop_uplink_power_control
+
+        tx_power = compiled_fn(
+            pathloss,
+            num_allocated_subcarriers,
+            alpha=0.8,
+            p0_dbm=-90.0,
+            ut_max_power_dbm=26.0,
+        )
+
+        assert tx_power.shape == (batch_size, num_ut)

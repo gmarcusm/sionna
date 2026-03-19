@@ -1,65 +1,91 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
 """Block implementing upsampling"""
 
-import tensorflow as tf
-from tensorflow.experimental.numpy import swapaxes
+from typing import Optional
+
+import torch
+
 from sionna.phy import Block
+from sionna.phy.config import Precision
 from sionna.phy.utils import flatten_last_dims
 
+__all__ = ["Upsampling"]
+
+
 class Upsampling(Block):
-    """Upsampling(samples_per_symbol, axis=-1, precision=None, **kwargs)
+    """Upsamples a tensor along a specified axis by inserting zeros
+    between samples.
 
-    Upsamples a tensor along a specified axis by inserting zeros
-    between samples
+    :param samples_per_symbol: Upsampling factor. If ``samples_per_symbol``
+        is equal to `n`, then the upsampled axis will be `n`-times longer.
+    :param axis: Dimension to be up-sampled. Must not be the first dimension.
+        Defaults to -1.
+    :param precision: Precision used for internal calculations and outputs.
+        If set to `None`, :attr:`~sionna.phy.config.Config.precision` is
+        used.
+    :param device: Device for computation. If `None`,
+        :attr:`~sionna.phy.config.Config.device` is used.
 
-    Parameters
-    ----------
-    samples_per_symbol: `int`
-        Upsampling factor. If ``samples_per_symbol`` is equal to `n`,
-        then the upsampled axis will be `n`-times longer.
-
-    axis: `int`, (default -1)
-        Dimension to be up-sampled. Must not be the first dimension.
-
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
-        If set to `None`,
-        :attr:`~sionna.phy.config.Config.precision` is used.
-
-    Input
-    -----
-    x : [...,n,...], `tf.float` or `tf.complex`
+    :input x: [..., n, ...], `torch.float` or `torch.complex`.
         Tensor to be upsampled. `n` is the size of the `axis` dimension.
 
-    Output
-    ------
-    y : [...,n*samples_per_symbol,...], `tf.float` or `tf.complex`
-        Upsampled tensor
+    :output y: [..., n*samples_per_symbol, ...], `torch.float` or `torch.complex`.
+        Upsampled tensor.
+
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        import torch
+        from sionna.phy.signal import Upsampling
+
+        upsampler = Upsampling(samples_per_symbol=4)
+        x = torch.randn(32, 100)
+        y = upsampler(x)
+        print(y.shape)
+        # torch.Size([32, 400])
     """
-    def __init__(self,
-                 samples_per_symbol,
-                 axis=-1,
-                 precision=None,
-                **kwargs):
-        super().__init__(precision=precision, **kwargs)
+
+    def __init__(
+        self,
+        samples_per_symbol: int,
+        axis: int = -1,
+        precision: Optional[Precision] = None,
+        device: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(precision=precision, device=device, **kwargs)
         self._samples_per_symbol = samples_per_symbol
         self._axis = axis
 
-    def build(self, input_shape):
-        paddings = []
-        for _ in range(len(input_shape)):
-            paddings.append([0, 0])
-        paddings.append([0, self._samples_per_symbol-1])
-        self._paddings = paddings
+    @property
+    def samples_per_symbol(self) -> int:
+        """Upsampling factor"""
+        return self._samples_per_symbol
 
-    def call(self, inputs):
-        x = swapaxes(inputs, self._axis, -1)
-        x = tf.expand_dims(x, -1)
-        x = tf.pad(x,
-                   self._paddings,
-                   constant_values=tf.cast(0, dtype=x.dtype))
+    @property
+    def axis(self) -> int:
+        """Dimension to be upsampled"""
+        return self._axis
+
+    def call(self, x: torch.Tensor) -> torch.Tensor:
+        # Move target axis to last position
+        x = torch.swapaxes(x, self._axis, -1)
+
+        # Add dimension for zero-padding
+        x = x.unsqueeze(-1)
+
+        # Pad with zeros: [samples_per_symbol - 1] zeros after each sample
+        pad = (0, self._samples_per_symbol - 1)  # (left, right) for last dim
+        x = torch.nn.functional.pad(x, pad, value=0)
+
+        # Flatten last two dimensions
         x = flatten_last_dims(x, 2)
-        x = swapaxes(x, -1, self._axis)
+
+        # Move last axis back to original position
+        x = torch.swapaxes(x, -1, self._axis)
+
         return x

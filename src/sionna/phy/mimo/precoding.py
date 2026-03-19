@@ -1,19 +1,34 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
-"""Classes and functions related to MIMO transmit precoding"""
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+"""Classes and functions related to MIMO transmit precoding."""
 
-import tensorflow as tf
 import math
-from sionna.phy import PI, dtypes, config
+from typing import Optional, Tuple, Union, List
+import torch
+
+from sionna.phy.config import config, dtypes, Precision
+from sionna.phy.constants import PI
 from sionna.phy.utils import expand_to_rank
 
+__all__ = [
+    "rzf_precoding_matrix",
+    "cbf_precoding_matrix",
+    "rzf_precoder",
+    "grid_of_beams_dft_ula",
+    "grid_of_beams_dft",
+    "flatten_precoding_mat",
+    "normalize_precoding_power",
+]
 
-def rzf_precoding_matrix(h,
-                         alpha=0.,
-                         precision=None):
-    # pylint: disable=line-too-long
-    r"""Computes the Regularized Zero-Forcing (RZF) Precoder
+
+def rzf_precoding_matrix(
+    h: torch.Tensor,
+    alpha: Union[float, torch.Tensor] = 0.0,
+    precision: Optional[Precision] = None,
+) -> torch.Tensor:
+    r"""Computes the Regularized Zero-Forcing (RZF) Precoder.
 
     This function computes the RZF precoding matrix for a MIMO link, assuming the
     following model:
@@ -28,7 +43,7 @@ def rzf_precoding_matrix(h,
     :math:`\mathbf{x}\in\mathbb{C}^K` is the symbol vector to be precoded,
     and :math:`\mathbf{n}\in\mathbb{C}^K` is a noise vector.
 
-    The precoding matrix :math:`\mathbf{G}` is defined as  :
+    The precoding matrix :math:`\mathbf{G}` is defined as:
 
     .. math::
 
@@ -42,55 +57,63 @@ def rzf_precoding_matrix(h,
         \mathbf{H}^{\mathsf{H}} + \alpha \mathbf{I} \right)^{-1}\\
         \mathbf{D} &= \mathop{\text{diag}}\left( \lVert \mathbf{v}_{k} \rVert_2^{-1}, k=0,\dots,K-1 \right)
 
-    where :math:`\alpha>0` is the regularization parameter. The matrix :math:`\mathbf{V}`
+    where :math:`\alpha>0` is the regularization parameter. The matrix :math:`\mathbf{D}`
     ensures that each stream is precoded with a unit-norm vector,
     i.e., :math:`\mathop{\text{tr}}\left(\mathbf{G}\mathbf{G}^{\mathsf{H}}\right)=K`.
     The function returns the matrix :math:`\mathbf{G}`.
 
-    Input
-    ------
-    h : [...,K,M], `tf.complex`
-        2+D tensor containing the channel matrices
+    :param h: Channel matrices with shape [..., K, M]
+    :param alpha: Regularization parameter with shape [...] or scalar
+    :param precision: Precision used for internal calculations and outputs.
+        If set to `None`, :attr:`~sionna.phy.config.Config.precision` is used.
 
-    alpha : `0.` (default) | [...], `tf.float32`
-        Regularization parameter
+    :output g: [..., M, K], `torch.complex`. Precoding matrices.
 
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
-        If set to `None`,
-        :attr:`~sionna.phy.config.Config.precision` is used
+    .. rubric:: Examples
 
-    Output
-    -------
-    g : [...,M,K], `tf.complex`
-        2+D tensor containing the precoding matrices
+    .. code-block:: python
+
+        h = torch.complex(torch.randn(4, 8), torch.randn(4, 8))
+        g = rzf_precoding_matrix(h, alpha=0.1)
+        # g.shape = torch.Size([8, 4])
     """
-    # Cast inputs
+    # Determine dtype
     if precision is None:
-        cdtype = config.tf_cdtype
+        cdtype = config.cdtype
     else:
-        cdtype = dtypes[precision]["tf"]["cdtype"]
-    h = tf.cast(h, dtype=cdtype)
-    alpha = tf.cast(alpha, dtype=cdtype)
+        cdtype = dtypes[precision]["torch"]["cdtype"]
+
+    h = h.to(dtype=cdtype)
+    alpha = torch.as_tensor(alpha, dtype=cdtype, device=h.device)
 
     # Compute pseudo inverse for precoding
-    g = tf.matmul(h, h, adjoint_b=True)
-    alpha = expand_to_rank(alpha, tf.rank(g), axis=-1)
-    g = g + alpha * tf.eye(tf.shape(g)[-1],
-                           batch_shape=tf.shape(g)[:-2], dtype=cdtype)
-    l = tf.linalg.cholesky(g)
-    g = tf.linalg.cholesky_solve(l, h)
-    g = tf.linalg.adjoint(g)
+    g = h @ h.mH
+    alpha = expand_to_rank(alpha, g.dim(), axis=-1)
+    k = g.shape[-1]
+    eye = torch.eye(k, dtype=cdtype, device=g.device)
+    eye = expand_to_rank(eye, g.dim(), 0)
+    g = g + alpha * eye
+
+    # Cholesky decomposition and solve
+    # Use cholesky_ex with check_errors=False for CUDA graph compatibility
+    l, _ = torch.linalg.cholesky_ex(g, check_errors=False)
+    # Solve L @ L^H @ X = h for X
+    y = torch.linalg.solve_triangular(l, h, upper=False)
+    g = torch.linalg.solve_triangular(l.mH, y, upper=True)
+    g = g.mH
 
     # Normalize each column to unit power
-    norm = tf.sqrt(tf.reduce_sum(tf.abs(g)**2, axis=-2, keepdims=True))
-    g = tf.math.divide_no_nan(g, tf.cast(norm, g.dtype))
+    norm = torch.sqrt((g.abs() ** 2).sum(dim=-2, keepdim=True))
+    g = torch.where(norm > 0, g / norm, g)
 
     return g
 
-def cbf_precoding_matrix(h, precision=None):
-    # pylint: disable=line-too-long
-    r"""Computes the conjugate beamforming (CBF) Precoder
+
+def cbf_precoding_matrix(
+    h: torch.Tensor,
+    precision: Optional[Precision] = None,
+) -> torch.Tensor:
+    r"""Computes the conjugate beamforming (CBF) Precoder.
 
     This function computes the CBF precoding matrix for a MIMO link, assuming the
     following model:
@@ -105,7 +128,7 @@ def cbf_precoding_matrix(h, precision=None):
     :math:`\mathbf{x}\in\mathbb{C}^K` is the symbol vector to be precoded,
     and :math:`\mathbf{n}\in\mathbb{C}^K` is a noise vector.
 
-    The precoding matrix :math:`\mathbf{G}` is defined as  :
+    The precoding matrix :math:`\mathbf{G}` is defined as:
 
     .. math::
 
@@ -118,49 +141,51 @@ def cbf_precoding_matrix(h, precision=None):
         \mathbf{V} &= \mathbf{H}^{\mathsf{H}} \\
         \mathbf{D} &= \mathop{\text{diag}}\left( \lVert \mathbf{v}_{k} \rVert_2^{-1}, k=0,\dots,K-1 \right).
 
-    The matrix :math:`\mathbf{V}`
+    The matrix :math:`\mathbf{D}`
     ensures that each stream is precoded with a unit-norm vector,
     i.e., :math:`\mathop{\text{tr}}\left(\mathbf{G}\mathbf{G}^{\mathsf{H}}\right)=K`.
     The function returns the matrix :math:`\mathbf{G}`.
 
-    Input
-    ------
-    h : [...,K,M], `tf.complex`
-        2+D tensor containing the channel matrices
+    :param h: Channel matrices with shape [..., K, M]
+    :param precision: Precision used for internal calculations and outputs.
+        If set to `None`, :attr:`~sionna.phy.config.Config.precision` is used.
 
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
-        If set to `None`,
-        :attr:`~sionna.phy.config.Config.precision` is used
+    :output g: [..., M, K], `torch.complex`. Precoding matrices.
 
-    Output
-    -------
-    g : [...,M,K], `tf.complex`
-        2+D tensor containing the precoding matrices
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        h = torch.complex(torch.randn(4, 8), torch.randn(4, 8))
+        g = cbf_precoding_matrix(h)
+        # g.shape = torch.Size([8, 4])
     """
-    # Cast inputs
+    # Determine dtype
     if precision is None:
-        cdtype = config.tf_cdtype
+        cdtype = config.cdtype
     else:
-        cdtype = dtypes[precision]["tf"]["cdtype"]
-    h = tf.cast(h, dtype=cdtype)
+        cdtype = dtypes[precision]["torch"]["cdtype"]
+
+    h = h.to(dtype=cdtype)
 
     # Compute conjugate transpose of channel matrix
-    g = tf.linalg.adjoint(h)
+    g = h.mH
 
     # Normalize each column to unit power
-    norm = tf.sqrt(tf.reduce_sum(tf.abs(g)**2, axis=-2, keepdims=True))
-    g = tf.math.divide_no_nan(g, tf.cast(norm, g.dtype))
+    norm = torch.sqrt((g.abs() ** 2).sum(dim=-2, keepdim=True))
+    g = torch.where(norm > 0, g / norm, g)
 
     return g
 
-def rzf_precoder(x,
-                 h,
-                 alpha=0.,
-                 return_precoding_matrix=False,
-                 precision=None):
-    # pylint: disable=line-too-long
-    r"""Regularized Zero-Forcing (RZF) Precoder
+
+def rzf_precoder(
+    x: torch.Tensor,
+    h: torch.Tensor,
+    alpha: Union[float, torch.Tensor] = 0.0,
+    return_precoding_matrix: bool = False,
+    precision: Optional[Precision] = None,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    r"""Regularized Zero-Forcing (RZF) Precoder.
 
     This function implements RZF precoding for a MIMO link, assuming the
     following model:
@@ -175,7 +200,7 @@ def rzf_precoder(x,
     :math:`\mathbf{x}\in\mathbb{C}^K` is the symbol vector to be precoded,
     and :math:`\mathbf{n}\in\mathbb{C}^K` is a noise vector.
 
-    The precoding matrix :math:`\mathbf{G}` is defined as (Eq. 4.37) [BHS2017]_ :
+    The precoding matrix :math:`\mathbf{G}` is defined as (Eq. 4.37) :cite:p:`BHS2017`:
 
     .. math::
 
@@ -188,144 +213,136 @@ def rzf_precoder(x,
         \mathbf{V} &= \mathbf{H}^{\mathsf{H}}\left(\mathbf{H} \mathbf{H}^{\mathsf{H}} + \alpha \mathbf{I} \right)^{-1}\\
         \mathbf{D} &= \mathop{\text{diag}}\left( \lVert \mathbf{v}_{k} \rVert_2^{-1}, k=0,\dots,K-1 \right)
 
-    where :math:`\alpha>0` is the regularization parameter. 
+    where :math:`\alpha>0` is the regularization parameter.
 
     This ensures that each stream is precoded with a unit-norm vector,
     i.e., :math:`\mathop{\text{tr}}\left(\mathbf{G}\mathbf{G}^{\mathsf{H}}\right)=K`.
     The function returns the precoded vector :math:`\mathbf{G}\mathbf{x}`.
 
-    Input
-    -----
-    x : [...,K], `tf.complex`
-        Symbol vectors to be precoded
+    :param x: Symbol vectors to be precoded with shape [..., K]
+    :param h: Channel matrices with shape [..., K, M]
+    :param alpha: Regularization parameter with shape [...] or scalar
+    :param return_precoding_matrix: If `True`, the precoding matrices are
+        also returned
+    :param precision: Precision used for internal calculations and outputs.
+        If set to `None`, :attr:`~sionna.phy.config.Config.precision` is used.
 
-    h : [...,K,M], `tf.complex`
-        Channel matrices
+    :output x_precoded: [..., M], `torch.complex`. Precoded symbol vectors.
+    :output g: [..., M, K], `torch.complex`. Precoding matrices. Only returned
+        if ``return_precoding_matrix=True``.
 
-    alpha : `0.` (default) | [...], `tf.float32`
-        Regularization parameter
+    .. rubric:: Examples
 
-    return_precoding_matrices : `bool`, (default, `False`)
-        Indicates if the precoding matrices should be returned or not
+    .. code-block:: python
 
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
-        If set to `None`,
-        :attr:`~sionna.phy.config.Config.precision` is used
-
-    Output
-    -------
-    x_precoded : [...,M], `tf.complex`
-        Precoded symbol vectors
-
-    g : [...,M,K], `tf.complex`
-        Precoding matrices. Only returned
-        if ``return_precoding_matrices=True``.
+        x = torch.complex(torch.randn(4), torch.randn(4))
+        h = torch.complex(torch.randn(4, 8), torch.randn(4, 8))
+        x_precoded = rzf_precoder(x, h, alpha=0.1)
+        # x_precoded.shape = torch.Size([8])
     """
-    # Cast inputs
+    # Determine dtype
     if precision is None:
-        cdtype = config.tf_cdtype
+        cdtype = config.cdtype
     else:
-        cdtype = dtypes[precision]["tf"]["cdtype"]
-    x = tf.cast(x, dtype=cdtype)
-    h = tf.cast(h, dtype=cdtype)
+        cdtype = dtypes[precision]["torch"]["cdtype"]
+
+    x = x.to(dtype=cdtype)
+    h = h.to(dtype=cdtype)
 
     # Compute the precoding matrix
     g = rzf_precoding_matrix(h, alpha=alpha, precision=precision)
 
-    # Expand last dim of `x` for precoding
-    x_precoded = tf.expand_dims(x, -1)
-
     # Precode
-    x_precoded = tf.squeeze(tf.matmul(g, x_precoded), -1)
+    x_precoded = (g @ x.unsqueeze(-1)).squeeze(-1)
 
     if return_precoding_matrix:
-        return (x_precoded, g)
+        return x_precoded, g
     else:
         return x_precoded
 
-def grid_of_beams_dft_ula(num_ant, oversmpl=1, precision=None):
-    # pylint: disable=line-too-long
-    r""" Computes the Discrete Fourier Transform (DFT) Grid of Beam (GoB)
-    coefficients for a uniform linear array (ULA)
+
+def grid_of_beams_dft_ula(
+    num_ant: int,
+    oversmpl: int = 1,
+    precision: Optional[Precision] = None,
+) -> torch.Tensor:
+    r"""Computes the Discrete Fourier Transform (DFT) Grid of Beam (GoB)
+    coefficients for a uniform linear array (ULA).
 
     The coefficient applied to antenna :math:`n` for beam :math:`m` is expressed
     as:
 
-    .. math:: 
+    .. math::
         c_n^m = e^{\frac{2\pi n m}{N O}}, \quad n=0,\dots,N-1, \ m=0,\dots,NO
 
     where :math:`N` is the number of antennas ``num_ant`` and :math:`O` is the oversampling
-    factor ``oversmpl``. 
+    factor ``oversmpl``.
 
-    Note that the main lobe of beam :math:`m` points in the azimuth direction 
+    Note that the main lobe of beam :math:`m` points in the azimuth direction
     :math:`\theta = \mathrm{arc sin} \left( 2\frac{m}{N} \right)` if :math:`m\le
     N/2` and :math:`\theta = \mathrm{arc sin} \left( 2\frac{m-N}{N} \right)` if
     :math:`m\ge N/2`, where :math:`\theta=0` defines the perpendicular to the
-    antenna array. 
+    antenna array.
 
-    Input
-    ------
-    num_ant : `int`
-        Number of antennas
+    :param num_ant: Number of antennas
+    :param oversmpl: Oversampling factor
+    :param precision: Precision used for internal calculations and outputs.
+        If set to `None`, :attr:`~sionna.phy.config.Config.precision` is used.
 
-    oversmpl : `int`, (default 1)
-        Oversampling factor
-
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
-        If set to `None`,
-        :attr:`~sionna.phy.config.Config.precision` is used.
-
-    Output
-    -------
-    gob : [num_ant x oversmpl, num_ant], `tf.complex`
+    :output gob: [num_ant x oversmpl, num_ant], `torch.complex`.
         The :math:`m`-th row contains the `num_ant` antenna coefficients for
         the :math:`m`-th DFT beam.
+
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        gob = grid_of_beams_dft_ula(num_ant=8, oversmpl=2)
+        # gob.shape = torch.Size([16, 8])
     """
     if precision is None:
-        rdtype = config.tf_rdtype
+        rdtype = config.dtype
     else:
-        rdtype = dtypes[precision]["tf"]["rdtype"]
+        rdtype = dtypes[precision]["torch"]["dtype"]
 
     oversmpl = int(oversmpl)
 
     # Beam indices: [0, .., num_ant * oversmpl - 1]
-    beam_ind = tf.range(num_ant * oversmpl, dtype=tf.float32)[:, tf.newaxis]
-    beam_ind = tf.cast(beam_ind, dtype=rdtype)
+    beam_ind = torch.arange(num_ant * oversmpl, dtype=rdtype, device=config.device).unsqueeze(-1)
 
     # Antenna indices: [0, .., num_ant - 1]
-    antenna_ind = tf.range(num_ant, dtype=tf.float32)[tf.newaxis, :]
-    antenna_ind = tf.cast(antenna_ind, dtype=rdtype)
+    antenna_ind = torch.arange(num_ant, dtype=rdtype, device=config.device).unsqueeze(0)
 
-    # Combine real and imaginary part and normalize power to 1
+    # Compute phases and combine to complex coefficients
     phases = 2 * PI * beam_ind * antenna_ind / (num_ant * oversmpl)
-    gob = tf.complex(tf.cos(phases), tf.sin(phases)) / math.sqrt(num_ant)
+    gob = torch.complex(torch.cos(phases), torch.sin(phases)) / math.sqrt(num_ant)
 
     return gob
 
-def grid_of_beams_dft(num_ant_v,
-                      num_ant_h,
-                      oversmpl_v=1,
-                      oversmpl_h=1,
-                      precision=None):
-    # pylint: disable=line-too-long
-    r""" Computes the Discrete Fourier Transform (DFT) Grid of Beam (GoB)
-    coefficients for a uniform rectangular array (URA)
 
-    GoB indices are arranged over a 2D grid indexed by :math:`(m_v,m_h)`. 
+def grid_of_beams_dft(
+    num_ant_v: int,
+    num_ant_h: int,
+    oversmpl_v: int = 1,
+    oversmpl_h: int = 1,
+    precision: Optional[Precision] = None,
+) -> torch.Tensor:
+    r"""Computes the Discrete Fourier Transform (DFT) Grid of Beam (GoB)
+    coefficients for a uniform rectangular array (URA).
+
+    GoB indices are arranged over a 2D grid indexed by :math:`(m_v,m_h)`.
     The coefficient of the beam with index :math:`(m_v,m_h)` applied to the
     antenna located at row :math:`n_v` and column :math:`n_h` of the rectangular
     array is expressed as:
-    
-    .. math:: 
+
+    .. math::
         c_{n_v,n_h}^{m_v,m_h} = e^{\frac{2\pi n_h m_v}{N_h O_h}} e^{\frac{2\pi n_h m_h}{N_v O_v}}
-    
+
     where :math:`n_v=0,\dots,N_v-1`, :math:`n_h=0,\dots,N_h-1`,
     :math:`m_v=0,\dots,N_v O_v`, :math:`m_h=0,\dots,N_h O_h`, :math:`N` is the
     number of antennas ``num_ant`` and :math:`O_v,O_h` are the oversampling
     factor ``oversmpl_v``, ``oversmpl_h`` in the vertical and
-    horizontal direction, respectively. 
+    horizontal direction, respectively.
 
     We can rewrite more concisely the matrix coefficients
     :math:`c^{m_v,m_h}` as follows:
@@ -337,137 +354,126 @@ def grid_of_beams_dft(num_ant_v,
     :math:`c^{m_v},c^{m_h}` are the ULA DFT beams computed as in
     :func:`~sionna.phy.mimo.grid_of_beams_dft_ula`.
 
-    Such a DFT GoB is, e.g., defined in Section 5.2.2.2.1 [3GPP38214]_.
+    Such a DFT GoB is, e.g., defined in Section 5.2.2.2.1 :cite:p:`3GPPTS38214`.
 
-    Input
-    -----
+    :param num_ant_v: Number of antenna rows (i.e., in vertical direction)
+    :param num_ant_h: Number of antenna columns (i.e., in horizontal direction)
+    :param oversmpl_v: Oversampling factor in vertical direction
+    :param oversmpl_h: Oversampling factor in horizontal direction
+    :param precision: Precision used for internal calculations and outputs.
+        If set to `None`, :attr:`~sionna.phy.config.Config.precision` is used.
 
-    num_ant_v : `int`
-        Number of antenna rows (i.e., in vertical direction) of the rectangular
-        array
-
-    num_ant_h : `int`
-        Number of antenna columns (i.e., in horizontal direction) of the
-        rectangular array.
-
-    oversmpl_v : `int`, (default 1)
-        Oversampling factor in vertical direction
-
-    oversmpl_h : `int`, (default 1)
-        Oversampling factor in horizontal direction
-
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
-        If set to `None`,
-        :attr:`~sionna.phy.config.Config.precision` is used.
-
-    Output
-    ------
-
-    gob : [num_ant_v x oversmpl_v, num_ant_h x oversmpl_h, num_ant_v x num_ant_h], `tf.complex`
+    :output gob: [num_ant_v x oversmpl_v, num_ant_h x oversmpl_h, num_ant_v x num_ant_h], `torch.complex`.
         The elements :math:`[m_v,m_h,:]` contain the antenna coefficients of the
         DFT beam with index pair :math:`(m_v,m_h)`.
+
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        gob = grid_of_beams_dft(num_ant_v=4, num_ant_h=8)
+        # gob.shape = torch.Size([4, 8, 32])
     """
+    # Compute the DFT coefficients for vertical and horizontal directions
+    gob_v = grid_of_beams_dft_ula(num_ant_v, oversmpl=oversmpl_v, precision=precision)
+    gob_v = gob_v[:, None, :, None]
 
-    # Compute the DFT coefficients to be applied in the vertical direction
-    gob_v = grid_of_beams_dft_ula(num_ant_v,
-                                  oversmpl=oversmpl_v,
-                                  precision=precision)
-    gob_v = gob_v[:, tf.newaxis, :, tf.newaxis]
+    gob_h = grid_of_beams_dft_ula(num_ant_h, oversmpl=oversmpl_h, precision=precision)
+    gob_h = gob_h[None, :, None, :]
 
-    # Compute the DFT coefficients to be applied in the horizontal direction
-    gob_h = grid_of_beams_dft_ula(num_ant_h,
-                                  oversmpl=oversmpl_h,
-                                  precision=precision)
-    gob_h = gob_h[tf.newaxis, :, tf.newaxis, :]
+    # Kronecker product
+    # [num_ant_v * oversmpl_v, num_ant_h * oversmpl_h, num_ant_v, num_ant_h]
+    coef_vh = gob_h * gob_v
 
-    # Kronecker product:
-    # [num_ant_v * oversmpl_v , num_ant_h * oversmpl_v, num_ant_v, num_ant_h]
-    coef_vh = tf.math.multiply(gob_h, gob_v)
-
-    # Flatten the last two dimensions to produce 1-dimensional precoding vectors
-    # [num_ant_v * oversmpl_v , num_ant_h * oversmpl_v, num_ant_v x num_ant_h]
+    # Flatten the last two dimensions
     coef_vh = flatten_precoding_mat(coef_vh)
 
     return coef_vh
 
-def flatten_precoding_mat(precoding_mat, by_column=True):
-    # pylint: disable=line-too-long
+
+def flatten_precoding_mat(
+    precoding_mat: torch.Tensor,
+    by_column: bool = True,
+) -> torch.Tensor:
     r"""Flattens a [..., num_ant_v, num_ant_h] precoding matrix associated with
-    a rectangular array by producing a [..., num_ant_v x num_ant_h] precoding vector
+    a rectangular array by producing a [..., num_ant_v x num_ant_h] precoding vector.
 
-    Input
-    ------
-    precoding_mat : [..., num_antennas_vertical, num_antennas_horizontal], `tf.complex` 
-        Precoding matrix. The element :math:`(i,j)` contains the precoding
-        coefficient of the antenna element located at row :math:`i` and column
-        :math:`j` of a rectangular antenna array.
+    :param precoding_mat: Precoding matrix with shape
+        [..., num_antennas_vertical, num_antennas_horizontal].
+        The element :math:`(i,j)` contains the precoding coefficient of the
+        antenna element located at row :math:`i` and column :math:`j`
+        of a rectangular antenna array.
+    :param by_column: If `True`, flattening occurs on a per-column basis,
+        i.e., the first column is appended to the second, and so on.
+        Else, flattening is performed on a per-row basis.
 
-    by_column : `bool`, (default `True`)
-        If `True`, then flattening occurs on a per-column basis, i.e., the first
-        column is appended to the second, and so on. Else, flattening is performed on
-        a per-row basis.
+    :output precoding_vec: [..., num_antennas_vertical x num_antennas_horizontal], `torch.complex`.
+        Flattened precoding matrix.
 
-    Output
-    -------
-    : [..., num_antennas_vertical x num_antennas_horizontal], `tf.complex`
-        Flattened precoding matrix
+    .. rubric:: Examples
+
+    .. code-block:: python
+
+        mat = torch.randn(4, 8, dtype=torch.complex64)
+        vec = flatten_precoding_mat(mat)
+        # vec.shape = torch.Size([32])
     """
-
-    # Transpose the last two dimensions
+    # Transpose the last two dimensions if flattening by column
     if by_column:
-        precoding_mat = tf.linalg.matrix_transpose(precoding_mat)
+        precoding_mat = precoding_mat.mT
+
     # Flatten the last two dimensions
-    precoding_vec = tf.reshape(
-        precoding_mat, precoding_mat.shape[:-2] + [math.prod(precoding_mat.shape[2:])])
+    shape = list(precoding_mat.shape[:-2]) + [-1]
+    precoding_vec = precoding_mat.reshape(shape)
 
     return precoding_vec
 
-def normalize_precoding_power(precoding_vec,
-                              tx_power_list=None,
-                              precision=None):
-    # pylint: disable=line-too-long
-    r""" Normalizes the beam coefficient power to 1 by default, or to
-    ``tx_power_list`` if provided as input
 
-    Input
-    ------
-    precoding_vec : [N,M], `tf.complex`
+def normalize_precoding_power(
+    precoding_vec: torch.Tensor,
+    tx_power_list: Optional[List[float]] = None,
+    precision: Optional[Precision] = None,
+) -> torch.Tensor:
+    r"""Normalizes the beam coefficient power to 1 by default, or to
+    ``tx_power_list`` if provided as input.
+
+    :param precoding_vec: Precoding vectors with shape [N, M].
         Each row contains a set of antenna coefficients whose power is to be normalized.
+    :param tx_power_list: The :math:`i`-th element defines the power of the
+        :math:`i`-th precoding vector. If `None`, power is normalized to 1.
+    :param precision: Precision used for internal calculations and outputs.
+        If set to `None`, :attr:`~sionna.phy.config.Config.precision` is used.
 
-    tx_power_list : [N], float
-        The :math:`i`-th element defines the power of the :math:`i`-th precoding
-        vector.
+    :output precoding_vec: [N, M], `torch.complex`. Normalized antenna coefficients.
 
-    precision : `None` (default) | "single" | "double"
-        Precision used for internal calculations and outputs.
-        If set to `None`,
-        :attr:`~sionna.phy.config.Config.precision` is used.
+    .. rubric:: Examples
 
-    Output
-    -------
-     : [N,M] `tf.complex`
-        Normalized antenna coefficients
+    .. code-block:: python
+
+        vec = torch.complex(torch.randn(4, 8), torch.randn(4, 8))
+        vec_norm = normalize_precoding_power(vec)
+        # Each row now has unit power
     """
     if precision is None:
-        cdtype = config.tf_cdtype
+        cdtype = config.cdtype
+        rdtype = config.dtype
     else:
-        cdtype = dtypes[precision]["tf"]["cdtype"]
+        cdtype = dtypes[precision]["torch"]["cdtype"]
+        rdtype = dtypes[precision]["torch"]["dtype"]
 
-    precoding_vec = tf.cast(precoding_vec, dtype=cdtype)
+    precoding_vec = precoding_vec.to(dtype=cdtype)
 
-    if len(precoding_vec.shape)==1:
-        precoding_vec = precoding_vec[tf.newaxis, :]
+    if precoding_vec.dim() == 1:
+        precoding_vec = precoding_vec.unsqueeze(0)
 
     if tx_power_list is None:
-        # By default, power is normalized to 1
-        tx_power_list = [1] * precoding_vec.shape[0]
+        tx_power_list = [1.0] * precoding_vec.shape[0]
 
-    precoding_vec_norm = tf.norm(precoding_vec, axis=1)[:, tf.newaxis]
-    tx_power = tf.constant(tx_power_list, dtype=cdtype)[:, tf.newaxis]
+    precoding_vec_norm = torch.norm(precoding_vec, dim=1, keepdim=True)
+    tx_power = torch.tensor(tx_power_list, dtype=rdtype, device=precoding_vec.device).unsqueeze(-1)
 
     # Normalize the power of each row
-    precoding_vec = tf.math.multiply(tf.math.divide(
-        precoding_vec, precoding_vec_norm), tx_power)
+    precoding_vec = (precoding_vec / precoding_vec_norm) * tx_power
 
     return precoding_vec
+

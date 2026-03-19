@@ -1,37 +1,34 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
 """Global Sionna PHY Configuration"""
 
+from __future__ import annotations
 import random
+from typing import Literal
 import numpy as np
-import tensorflow as tf
+import torch
+
+__all__ = ["Config", "config", "dtypes", "Precision"]
+
+# Type aliases
+Precision = Literal["single", "double"]
 
 # Mapping from precision to dtypes
-dtypes = {
-    'single' : {
-        'tf' : {
-            'cdtype' : tf.complex64,
-            'rdtype' : tf.float32
-        },
-        'np' : {
-            'cdtype' : np.complex64,
-            'rdtype' : np.float32
-        }
+dtypes: dict[str, dict[str, dict[str, type]]] = {
+    "single": {
+        "torch": {"cdtype": torch.complex64, "dtype": torch.float32},
+        "np": {"cdtype": np.complex64, "dtype": np.float32},
     },
-    'double' : {
-        'tf' : {
-            'cdtype' : tf.complex128,
-            'rdtype' : tf.float64
-        },
-        'np' : {
-            'cdtype' : np.complex128,
-            'rdtype' : np.float64
-        }
-    }
+    "double": {
+        "torch": {"cdtype": torch.complex128, "dtype": torch.float64},
+        "np": {"cdtype": np.complex128, "dtype": np.float64},
+    },
 }
 
-class Config():
+
+class Config:
     """Sionna PHY Configuration Class
 
     This singleton class is used to define global configuration variables
@@ -40,28 +37,45 @@ class Config():
     accessed as :code:`sionna.phy.config.desired_property`.
     """
 
-    # This object is a singleton
-    _instance = None
-    def __new__(cls):
+    _instance: Config | None = None
+
+    def __new__(cls) -> Config:
+        """Create or return the singleton Config instance."""
         if cls._instance is None:
             instance = object.__new__(cls)
             cls._instance = instance
+            cls._instance._initialized = False
         return cls._instance
 
-    def __init__(self):
-        self._seed = None
-        self._py_rng = None
-        self._np_rng = None
-        self._tf_rng = None
-        self._precision = None
+    def __init__(self) -> None:
+        """Initialize the Config instance with default values."""
+        if self._initialized:
+            return
+        self._initialized: bool = True
 
-        # Set default properties
-        self.precision = 'single'
+        # Initialize private properties
+        self._precision: Precision | None = None
+        self._device: str | None = None
+        self._seed: int | None = None
+        self._py_rng: random.Random | None = None
+        self._np_rng: np.random.Generator | None = None
+        self._torch_rngs: dict[str, torch.Generator] = {}
+        self._np_dtype: type | None = None
+        self._np_cdtype: type | None = None
+        self._dtype: torch.dtype | None = None
+        self._cdtype: torch.dtype | None = None
+
+        # Set default property values
+        self.precision = "single"
+        self.device = None
+        self.seed = None
 
     @property
-    def py_rng(self):
-        """
-        `random.Random` : Python random number generator
+    def py_rng(self) -> random.Random:
+        """`random.Random` : Python random number generator
+
+        Example
+        -------
 
         .. code-block:: python
 
@@ -69,16 +83,18 @@ class Config():
             config.seed = 42 # Set seed for deterministic results
 
             # Use generator instead of random
-            int = config.py_rng.randint(0, 10)
+            val = config.py_rng.randint(0, 10)
         """
         if self._py_rng is None:
-            self._py_rng = random.Random()
+            self._py_rng = random.Random(self.seed)
         return self._py_rng
 
     @property
-    def np_rng(self):
-        """
-        `np.random.Generator` : NumPy random number generator
+    def np_rng(self) -> np.random.Generator:
+        """`np.random.Generator` : NumPy random number generator
+
+        Example
+        -------
 
         .. code-block:: python
 
@@ -89,36 +105,89 @@ class Config():
             noise = config.np_rng.normal(size=[4])
         """
         if self._np_rng is None:
-            self._np_rng = np.random.default_rng()
+            self._np_rng = np.random.default_rng(self.seed)
         return self._np_rng
 
-    @property
-    def tf_rng(self):
-        """
-        `tf.random.Generator` : TensorFlow random number generator
+    def torch_rng(self, device: str | None = None) -> torch.Generator:
+        """`torch.Generator` : PyTorch random number generator for the specified device
+
+        :param device: Device name (e.g., ``'cpu'``, ``'cuda:0'``).
+            If `None`, :attr:`~sionna.phy.config.Config.device` is used.
+
+        Example
+        -------
 
         .. code-block:: python
 
             from sionna.phy import config
             config.seed = 42 # Set seed for deterministic results
 
-            # Use generator instead of tf.random
-            noise = config.tf_rng.normal([4])
+            # Use generator instead of torch.randn
+            noise = torch.randn([4], generator=config.torch_rng())
         """
-        if self._tf_rng  is None:
-            self._tf_rng = tf.random.Generator.from_non_deterministic_state()
-        return self._tf_rng
+        if device is None:
+            device = self.device
+        return self._torch_rngs[device]
+
+    def _reset_rngs(self) -> None:
+        """Reset all random number generators."""
+        # Uses device-specific seed offsets (seed + device_index) to ensure
+        # different devices produce different random streams. This applies to
+        # both the explicit generators (used in eager mode) and the default
+        # CUDA generators (used in compiled mode via global RNG).
+        self._py_rng = None
+        self._np_rng = None
+        self._torch_rngs = {}
+
+        # Initialize CUDA to populate default_generators if available
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            torch.cuda.init()
+
+        for i, device in enumerate(self.available_devices):
+            self._torch_rngs[device] = torch.Generator(device=device)
+
+            if self._seed is None:
+                # Random seeding - each device gets a random seed
+                self._torch_rngs[device].seed()
+                # Also seed default generators randomly
+                if device == "cpu":
+                    torch.default_generator.seed()
+                elif device.startswith("cuda:"):
+                    device_idx = int(device.split(":")[1])
+                    # Check if default generators are initialized and index is valid
+                    if torch.cuda.is_available() and device_idx < len(
+                        torch.cuda.default_generators
+                    ):
+                        torch.cuda.default_generators[device_idx].seed()
+            else:
+                # Deterministic seeding with device-specific offset
+                # This ensures different devices produce different streams
+                device_seed = self._seed + i
+                self._torch_rngs[device].manual_seed(device_seed)
+                # Also seed default generators for compiled mode
+                if device == "cpu":
+                    torch.default_generator.manual_seed(device_seed)
+                elif device.startswith("cuda:"):
+                    device_idx = int(device.split(":")[1])
+                    # Check if default generators are initialized and index is valid
+                    if torch.cuda.is_available() and device_idx < len(
+                        torch.cuda.default_generators
+                    ):
+                        torch.cuda.default_generators[device_idx].manual_seed(
+                            device_seed
+                        )
 
     @property
-    def seed(self):
-        # pylint: disable=line-too-long
-        """
-        `None` (default) | `int` : Get/set seed for all random number generators
+    def seed(self) -> int | None:
+        """`None` (default) | `int` : Get/set seed for all random number generators
 
         All random number generators used internally by Sionna
-        can be configured with a common seed to ensure reproducability
+        can be configured with a common seed to ensure reproducibility
         of results. It defaults to `None` which implies that a random
         seed will be used and results are non-deterministic.
+
+        Example
+        -------
 
         .. code-block:: python
 
@@ -127,75 +196,85 @@ class Config():
             from sionna.phy.mapping import BinarySource
             config.seed = 42
             print(BinarySource()([10]))
-
-        .. code-block:: console
-
-            tf.Tensor([0. 1. 1. 1. 1. 0. 1. 0. 1. 0.], shape=(10,), dtype=float32)
         """
         return self._seed
 
     @seed.setter
-    def seed(self, seed):
-        # Store seed
-        if seed is not None:
-            seed = int(seed)
+    def seed(self, seed: int | None) -> None:
         self._seed = seed
-
-        #TensorFlow
-        self.tf_rng.reset_from_seed(seed)
-
-        # Python
-        self.py_rng.seed(seed)
-
-        # NumPy
-        self._np_rng = np.random.default_rng(seed)
+        self._reset_rngs()
 
     @property
-    def precision(self):
-        # pylint: disable=line-too-long
-        """
-        "single" (default) | "double" : Default precision used for all computations
+    def device(self) -> str:
+        """`str` : Get/set the device for computation (e.g., ``'cpu'``, ``'cuda:0'``)"""
+        return self._device
 
-        The "single" option represents real-valued floating-point numbers
-        using 32 bits, whereas the "double" option uses 64 bits.
+    @device.setter
+    def device(self, v: str | None) -> None:
+        # Set default device if None
+        if v is None:
+            if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+                v = "cuda:0"
+            else:
+                v = "cpu"
+
+        # If device is already set to the desired value, do nothing
+        if self._device == v:
+            return
+
+        # Raise error if device is invalid
+        if v not in self.available_devices:
+            raise ValueError(f"Invalid device: {v}")
+
+        # Set device value
+        self._device = v
+
+    @property
+    def np_dtype(self) -> np.dtype:
+        """`np.dtype` : Default NumPy dtype for real floating point numbers"""
+        return dtypes[self.precision]["np"]["dtype"]
+
+    @property
+    def np_cdtype(self) -> np.dtype:
+        """`np.dtype` : Default NumPy dtype for complex floating point numbers"""
+        return dtypes[self.precision]["np"]["cdtype"]
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """`torch.dtype` : Default PyTorch dtype for real floating point numbers"""
+        return dtypes[self.precision]["torch"]["dtype"]
+
+    @property
+    def cdtype(self) -> torch.dtype:
+        """`torch.dtype` : Default PyTorch dtype for complex floating point numbers"""
+        return dtypes[self.precision]["torch"]["cdtype"]
+
+    @property
+    def precision(self) -> Precision:
+        """``"single"`` (default) | ``"double"`` : Default precision used for all computations
+
+        The ``"single"`` option represents real-valued floating-point numbers
+        using 32 bits, whereas the ``"double"`` option uses 64 bits.
         For complex-valued data types, each component of the complex number
-        (real and imaginary parts) uses either 32 bits (for "single")
-        or 64 bits (for "double").
+        (real and imaginary parts) uses either 32 bits (for ``"single"``)
+        or 64 bits (for ``"double"``).
         """
         return self._precision
 
     @precision.setter
-    def precision(self, v):
-        if v not in ["single", "double"]:
-            raise ValueError("Precision must be ``single`` or ``double``.")
+    def precision(self, v: Precision) -> None:
+        if v not in dtypes:
+            raise ValueError("Precision must be 'single' or 'double'.")
         self._precision = v
 
     @property
-    def np_rdtype(self):
-        """
-        `np.dtype` : Default NumPy dtype for real floating point numbers
-        """
-        return dtypes[self.precision]['np']['rdtype']
+    def available_devices(self) -> list[str]:
+        """`list` of `str` : List of available compute devices"""
+        devices = ["cpu"]
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                devices.append(f"cuda:{i}")
+        return devices
 
-    @property
-    def np_cdtype(self):
-        """
-        `np.dtype` : Default NumPy dtype for complex floating point numbers
-        """
-        return dtypes[self.precision]['np']['cdtype']
-
-    @property
-    def tf_rdtype(self):
-        """
-        `tf.dtype` : Default TensorFlow dtype for real floating point numbers
-        """
-        return dtypes[self.precision]['tf']['rdtype']
-
-    @property
-    def tf_cdtype(self):
-        """
-        `tf.dtype` : Default TensorFlow dtype for complex floating point numbers
-        """
-        return dtypes[self.precision]['tf']['cdtype']
 
 config = Config()

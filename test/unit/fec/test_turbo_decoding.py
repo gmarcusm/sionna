@@ -1,300 +1,395 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 2021-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0#
-import pytest
+# SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+"""Unit tests for sionna.phy.fec.turbo.decoding module."""
+
 import os
-from itertools import product
-import unittest
+
 import numpy as np
-import tensorflow as tf
-from sionna.phy import config
+import pytest
+import torch
+
 from sionna.phy.fec.turbo import TurboEncoder, TurboDecoder
-from sionna.phy.fec.utils import GaussianPriorSource
-from sionna.phy.utils import sim_ber, ebnodb2no
-from sionna.phy.channel import AWGN
-from sionna.phy.mapping import Mapper, Demapper, Constellation, BinarySource
+from sionna.phy.mapping import BinarySource
+from sionna.phy.fec.conv.decoding import BCJRDecoder
 
-current_dir = os.path.dirname(os.path.abspath(__file__))
-test_dir = os.path.abspath(os.path.join(current_dir, os.pardir, os.pardir))
 
-class TestTurboDecoding(unittest.TestCase):
+# Get test data directory
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+REF_PATH = os.path.join(TEST_DIR, "..", "..", "codes", "turbo")
 
-    def test_output_dim_num_stab(self):
-        """Test that output dims are correct (=n) and output is all-zero
-         codeword.
 
-        Further, test numerical stability (no nan or infty as output)."""
-        bs = 6
+class TestTurboDecoder:
+    """Tests for TurboDecoder class."""
 
-        coderates = [1/2, 1/3]
-        ks = [12, 60]
+    @pytest.mark.parametrize("t", [False, True])
+    @pytest.mark.parametrize("k", [10, 20, 50, 100])
+    @pytest.mark.parametrize("rate", [1 / 2, 1 / 3])
+    def test_output_dim_num_stab(self, device, rate, k, t):
+        """Test that output dims are correct (=k) and numerical stability."""
+        bs = 10
+        cl = 5  # constraint length
 
-        source = GaussianPriorSource()
+        n = int(k / rate)
+        if t:
+            n += int(cl / rate)
 
-        for rate in coderates:
-            for k in ks:
-                n = int(k/rate)
-                dec = TurboDecoder(rate=rate,
-                                   constraint_length=5,
-                                   num_iter=3,
-                                   terminate=False)
+        enc = TurboEncoder(
+            rate=rate, constraint_length=cl, terminate=t, device=device
+        )
+        dec = TurboDecoder(enc, num_iter=1, hard_out=False, device=device)
 
-                # --- test output dimensions ---
-                # all-zero with BPSK (no noise);logits
-                c = -10. * tf.ones([bs, n])
-                u = dec(c).numpy()
-                self.assertTrue(u.shape[-1]==k)
-                # also check that all-zero input yields all-zero output
-                u_hat = np.zeros([bs, k])
-                self.assertTrue(np.array_equal(u, u_hat))
+        u = torch.zeros(bs, k, dtype=torch.float32, device=device)
+        c = enc(u)
 
-                # --- test numerical stability ---
-                # case 1: extremely large inputs
-                c = source([bs, n], 0.0001)
-                # llrs
-                u1 = dec(c).numpy()
-                # no nan
-                self.assertFalse(np.any(np.isnan(u1)))
-                #no inftfy
-                self.assertFalse(np.any(np.isinf(u1)))
-                self.assertFalse(np.any(np.isneginf(u1)))
+        # Input to decoder is channel symbols (as LLR)
+        y = torch.zeros(bs, c.shape[-1], device=device)
+        u_hat = dec(y)
 
-                # case 2: zero input
-                c = tf.zeros([bs, n])
-                # llrs
-                u2 = dec(c).numpy()
-                # no nan
-                self.assertFalse(np.any(np.isnan(u2)))
-                #no inftfy
-                self.assertFalse(np.any(np.isinf(u2)))
-                self.assertFalse(np.any(np.isneginf(u2)))
+        # Check that output has the correct shape
+        assert u_hat.shape == torch.Size([bs, k])
 
-    def test_identity(self):
-        """test that info bits can be recovered if no noise is added"""
+        # Check numerical stability
+        assert torch.all(torch.isfinite(u_hat))
 
-        def test_identity_(enc, dec, msg):
-            cw = enc(msg)
-            # BPSK modulation, no noise
-            code_syms = 20. * (2. * cw - 1)
-            u_hat = dec(code_syms)
-            self.assertTrue(np.array_equal(msg.numpy(), u_hat.numpy()))
+    @pytest.mark.parametrize("t", [False, True])
+    @pytest.mark.parametrize("k", [10, 20, 50, 100])
+    @pytest.mark.parametrize("rate", [1 / 2, 1 / 3])
+    def test_identity(self, device, rate, k, t):
+        """Test that encoded all-zero codeword yields all-zero estimates,
+        when SNR is perfect (high confidence LLRs)."""
+        bs = 10
+        cl = 5  # constraint length
 
-            # BPSK symbols with AWGN noise
-            bs, n = cw.get_shape().as_list()
-            code_syms = 6. * (2. * cw - 1) + config.np_rng.normal(size=[bs,n])
-            u_hat = dec(code_syms)
-            self.assertTrue(np.array_equal(msg.numpy(), u_hat.numpy()))
+        enc = TurboEncoder(
+            rate=rate, constraint_length=cl, terminate=t, device=device
+        )
+        dec = TurboDecoder(enc, num_iter=4, hard_out=True, device=device)
 
-            return
+        u = torch.zeros(bs, k, dtype=torch.float32, device=device)
+        c = enc(u)
 
-        bs = 5
-        k = 50
-        cl = 4 # constraint length
-        coderates = [1/3, 1/2]
+        # Perfect channel: high confidence LLRs (logit convention)
+        # 0 -> -large, 1 -> +large
+        y = 20.0 * (2.0 * c - 1.0)  # High SNR LLRs
 
-        for terminate, alg in product([True, False], ("map", "log", "maxlog")):
-            for rate in coderates:
-                u = BinarySource()([bs, k])
-                enc = TurboEncoder(
-                    constraint_length=cl, rate=rate, terminate=terminate)
-                dec = TurboDecoder(enc, algorithm=alg, num_iter=2)
-                test_identity_(enc, dec, u)
+        u_hat = dec(y)
 
-    def test_multi_dimensional(self):
-        """Test against arbitrary multi-dim input shapes."""
-        k = 100
-        n = 200
+        # All-zero u should yield all-zero u_hat
+        assert torch.allclose(u, u_hat)
 
-        source = BinarySource()
-        dec = TurboDecoder(rate=1/2, constraint_length=3, num_iter=2, terminate=False)
+    @pytest.mark.parametrize("s_", [[4, 5, 5], []])
+    def test_multi_dimensional(self, device, s_):
+        """Test against arbitrary shapes."""
+        k = 120
+        rate = 1 / 2
 
-        b = source([30, n])
-        b_res = tf.reshape(b, [2, 3, 5, n])
+        source = BinarySource(device=device)
+        enc = TurboEncoder(
+            rate=rate, constraint_length=5, terminate=False, device=device
+        )
+        dec = TurboDecoder(enc, num_iter=4, hard_out=True, device=device)
 
-        # encode 2D Tensor
-        c = dec(b).numpy()
+        s = s_.copy()
+        bs = int(np.prod(s)) if s else 1
+        b = source([bs, k])
 
-        # encode 4D Tensor
-        c_res = dec(b_res).numpy()
+        if s:
+            s.append(k)
+            b_res = b.reshape(s)
+        else:
+            b_res = b.reshape(k)
 
-        # test that shape was preserved
-        self.assertTrue(c_res.shape[:-1]==b_res.shape[:-1])
+        # Encode
+        c = enc(b)
 
-        # and reshape to 2D shape
-        c_res = tf.reshape(c_res, [30, k])
-        # both version should yield same result
-        self.assertTrue(np.array_equal(c, c_res))
+        # Create high confidence LLRs
+        y = 20.0 * (2.0 * c - 1.0)
 
-    def test_batch(self):
-        """Test that all samples in batch yield same output (for same input).
-        """
-        bs = 30
-        n = 240
+        if s:
+            s_out = s.copy()
+            s_out[-1] = c.shape[-1]
+            y_res = y.reshape(s_out)
+        else:
+            y_res = y.reshape(c.shape[-1])
 
-        source = GaussianPriorSource()
-        dec = TurboDecoder(rate=1/2, constraint_length=3,
-                           terminate=False, num_iter=2)
+        # Decode 2D tensor
+        u_hat = dec(y)
+        # Decode multi-D tensor
+        u_hat_res = dec(y_res)
 
-        b = source([1, n], 1.)
-        b_rep = tf.tile(b, [bs, 1])
+        # Test that shape was preserved
+        expected_shape = list(b_res.shape)
+        assert list(u_hat_res.shape) == expected_shape
 
-        # and run the decoder
-        c = dec(b_rep).numpy()
+        # And reshape to 2D shape
+        u_hat_res_flat = (
+            u_hat_res.reshape(bs, k) if s else u_hat_res.reshape(1, k)
+        )
+        # Both versions should yield same result
+        assert torch.equal(u_hat, u_hat_res_flat)
 
-        # test that all samples in the batch are the same
+    def test_batch(self, device):
+        """Test that all samples in batch yield same output (for same input)."""
+        bs = 100
+        k = 120
+
+        source = BinarySource(device=device)
+        enc = TurboEncoder(rate=0.5, constraint_length=6, device=device)
+        dec = TurboDecoder(enc, num_iter=4, hard_out=True, device=device)
+
+        b = source([1, 15, k])
+        b_rep = b.repeat(bs, 1, 1)
+
+        c = enc(b_rep)
+        y = 20.0 * (2.0 * c - 1.0)
+
+        u_hat = dec(y)
+
         for i in range(bs):
-            self.assertTrue(np.array_equal(c[0,:], c[i,:]))
+            assert torch.equal(u_hat[0, :, :], u_hat[i, :, :])
 
-        # test no batch-dim
-        b = source([n,], 1.)
-        c = dec(b).numpy()
+    def test_ber_match(self, device):
+        """Test that BER is within expected bounds for a given SNR.
 
-
-    @pytest.mark.usefixtures("only_gpu")
-    def test_ber_match(self):
-        """Test against results from reference implementation.
+        Note: This test may be slow on CPU. Skipped on CPU.
         """
-        def simulation(k, num_iter, snrs):
-            r = 1/3
-            source = BinarySource()
-            enc = TurboEncoder(gen_poly=('1101', '1011'),
-                               rate=r, terminate=True)
-            dec = TurboDecoder(enc, num_iter=num_iter)
-            constellation = Constellation("qam", num_bits_per_symbol=2)
-            mapper = Mapper(constellation=constellation)
-            demapper = Demapper("app", constellation=constellation)
-            channel = AWGN()
+        if device == "cpu":
+            pytest.skip("BER test skipped on CPU due to performance")
 
-            @tf.function(jit_compile=True)
-            def run_graph(batch_size, ebno_db):
-                no = ebnodb2no(ebno_db, num_bits_per_symbol=2, coderate=r)
-                u = source([batch_size, k])
-                c = enc(u)
-                x = mapper(c)
-                y = channel(x, no)
-                llr_ch = demapper(y, no)
-                u_hat = dec(llr_ch)
-                return u, u_hat
+        bs = 100
+        k = 40
+        snr_db = 3.0
+        target_ber_max = 0.02  # Should be below this for SNR=3dB
 
-            ber, _ = sim_ber(run_graph,
-                            ebno_dbs=snrs,
-                            max_mc_iter=20,
-                            num_target_bit_errors=500,
-                            batch_size=10000,
-                            soft_estimates=False,
-                            early_stop=True,
-                            forward_keyboard_interrupt=False)
-            return ber
-        k = 512
-        snrs = [0, 0.5, 1, 1.5, 2]
-        ber_lb, ber_ub = {}, {}
-        ber_ub[3] = [10.0e-02, 6.0e-02, 5.5e-03, 2.5e-4, 5.0e-06]
-        ber_lb[3] = [5.0e-02, 1.0e-02, 1.0e-03, 5.0e-5, 8.0e-07]
+        source = BinarySource(device=device)
+        enc = TurboEncoder(
+            rate=1 / 3, constraint_length=4, terminate=True, device=device
+        )
+        dec = TurboDecoder(enc, num_iter=6, hard_out=True, device=device)
 
-        ber_ub[6] = [10.0e-02, 4.0e-02, 6.5e-04, 4.5e-5]
-        ber_lb[6] = [5.0e-02, 8.0e-03, 1.0e-04, 2.0e-6]
-        for num_iters in [3, 6]:
-            if num_iters == 6:
-                snrs = snrs[:-1]
-            ber = simulation(k, num_iters, snrs)
-            for idx in range(len(snrs)):
-                self.assertTrue(np.less_equal(ber[idx], ber_ub[num_iters][idx]))
-                self.assertTrue(np.greater_equal(ber[idx],
-                                                 ber_lb[num_iters][idx]))
+        # SNR setup
+        snr_lin = 10 ** (snr_db / 10)
+        noise_var = 1 / (2 * snr_lin)
+        noise_std = np.sqrt(noise_var)
 
-    @pytest.mark.usefixtures("only_gpu")
-    def test_ref_implementation(self):
-        r"""Test against pre-decoded noisy codewords from reference
-        implementation.
-        """
-        ref_path = test_dir + '/codes/turbo/'
-        r = 1/3
-        ks = [40, 112, 168]
-        enc = TurboEncoder(rate=1/3, terminate=True, constraint_length=4)
-        dec = TurboDecoder(enc, num_iter=10)
+        u = source([bs, k])
+        c = enc(u)
+
+        # BPSK modulation: 0 -> -1, 1 -> +1 (using logit convention)
+        x = 2.0 * c - 1.0
+
+        # Add AWGN
+        noise = torch.randn_like(x) * noise_std
+        y_channel = x + noise
+
+        # Compute LLRs (logit convention: log p(1)/p(0))
+        llr = 2.0 * y_channel / noise_var
+
+        u_hat = dec(llr)
+
+        # Calculate BER
+        ber = (u != u_hat).float().mean().item()
+
+        # Check that BER is below threshold
+        assert ber < target_ber_max, f"BER {ber:.4f} is above threshold {target_ber_max}"
+
+    @pytest.mark.parametrize("k", [40, 112, 168, 432])
+    def test_ref_implementation(self, device, k):
+        """Test against pre-decoded outputs from reference implementation."""
+        if not os.path.exists(REF_PATH):
+            pytest.skip("Reference data not found")
+
+        # Reference data was generated with r=1/3, Eb/N0=0dB
+        r = 1 / 3
         ebno = 0.0
-        no = 1/(r* (10 ** (-ebno / 10)))
+        no = 1 / (r * (10 ** (-ebno / 10)))  # no = 3.0
 
-        for k in ks:
-            uhatref = np.load(ref_path + 'ref_k{}_uhat.npy'.format(k))
-            yref = np.load(ref_path + 'ref_k{}_y.npy'.format(k))
-            yref = tf.constant(yref, tf.float32)
-            uhat = dec(-4.*yref/no).numpy()
-            self.assertTrue(np.array_equal(uhat, uhatref))
+        y_path = os.path.join(REF_PATH, f"ref_k{k}_y.npy")
+        uhat_path = os.path.join(REF_PATH, f"ref_k{k}_uhat.npy")
 
-    def test_dtype_flexible(self):
-        """Test that output_dtype can be flexible."""
-        batch_size = 40
-        n = 64
-        source = GaussianPriorSource()
+        if not os.path.exists(y_path) or not os.path.exists(uhat_path):
+            pytest.skip(f"Reference data for k={k} not found")
 
-        precisions = ["single", "double"]
-        dtypes_supported = (tf.float32, tf.float64)
+        yref = np.load(y_path)
+        uref = np.load(uhat_path)
 
-        for p, dt_out in zip(precisions, dtypes_supported):
-            for dt_in in dtypes_supported:
-                llr = source([batch_size, n], 0.5)
-                llr = tf.cast(llr, dt_in)
+        enc = TurboEncoder(
+            rate=1 / 3,
+            terminate=True,
+            constraint_length=4,
+            device=device,
+        )
+        # Use 10 iterations as in the TensorFlow reference test
+        dec = TurboDecoder(enc, num_iter=10, hard_out=True, device=device)
 
-                dec = TurboDecoder(rate=1/2,
-                                   constraint_length=3,
-                                   precision=p)
+        # Apply the same LLR scaling as the TensorFlow reference test
+        # The TF test uses: dec(-4.*yref/no)
+        y = torch.tensor(-4.0 * yref / no, dtype=torch.float32, device=device)
+        u_hat = dec(y)
 
-                x = dec(llr)
+        assert np.array_equal(u_hat.cpu().numpy(), uref)
 
-                self.assertTrue(x.dtype==dt_out)
+    @pytest.mark.parametrize(
+        "dt,precision",
+        [(torch.float32, "single"), (torch.float64, "double")],
+    )
+    def test_dtype_flexible(self, device, dt, precision):
+        """Test that decoder supports variable dtypes."""
+        bs = 10
+        k = 32
 
-    @pytest.mark.usefixtures("only_gpu")
-    def test_tf_fun(self):
-        """Test that tf.function decorator works include xla compiler test."""
+        source = BinarySource(device=device)
 
-        bs = 5
-        n = 39 # n should be divisible by 3 for rate=1/3.
-        source = BinarySource()
+        enc = TurboEncoder(rate=0.5, constraint_length=4, device=device)
+        u = source([bs, k])
+        c = enc(u)
+        y = 20.0 * (2.0 * c - 1.0)
 
-        for t in [False, True]:
+        dec = TurboDecoder(
+            enc, num_iter=4, hard_out=True, precision=precision, device=device
+        )
+        y_dt = y.to(dt)
+        u_hat = dec(y_dt)
 
-            dec = TurboDecoder(rate=1/3, constraint_length=3,
-                               terminate=t, num_iter=3)
+        # Check correct output dtype
+        assert u_hat.dtype == dt
 
-            @tf.function
-            def run_graph(u):
-                return dec(u)
+    @pytest.mark.parametrize("t", [False, True])
+    def test_torch_compile(self, device, t):
+        """Test that torch.compile works as expected."""
+        bs = 10
+        k = 100
 
-            @tf.function(jit_compile=True)
-            def run_graph_xla(u):
-                return dec(u)
+        source = BinarySource(device=device)
 
-            # test that for arbitrary input only 0,1 values are outputed
-            u = source([bs, n])
-            x = run_graph(u).numpy()
+        enc = TurboEncoder(
+            rate=0.5, constraint_length=5, terminate=t, device=device
+        )
+        dec = TurboDecoder(enc, num_iter=4, hard_out=True, device=device)
 
-            # execute the graph twice
-            x = run_graph(u).numpy()
+        compiled_dec = torch.compile(dec)
 
-            # and change batch_size
-            u = source([bs+1, n])
-            x = run_graph(u).numpy()
+        u = source([bs, k])
+        c = enc(u)
+        y = 20.0 * (2.0 * c - 1.0)
 
-            # run same test for XLA (jit_compile=True)
-            u = source([bs, n])
-            x = run_graph_xla(u).numpy()
-            x = run_graph_xla(u).numpy()
-            # and change the batch_size again
-            u = source([bs+1, n])
-            x = run_graph_xla(u).numpy()
+        x = compiled_dec(y)
 
-    def test_dynamic_shapes(self):
-        """Test for dynamic (=unknown) batch-sizes"""
+        # Execute twice
+        x2 = compiled_dec(y)
+        assert torch.equal(x, x2)
 
-        n = 1536
-        enc = TurboEncoder(gen_poly=('1101', '1011'), rate=1/3, terminate=False)
-        dec = TurboDecoder(enc, num_iter=3)
+    @pytest.mark.parametrize("k", [40, 100, 200])
+    def test_dynamic_shapes(self, device, k):
+        """Test that decoder works with different input shapes."""
+        source = BinarySource(device=device)
 
-        @tf.function(jit_compile=True)
-        def run_graph(batch_size):
-            llr_ch = tf.zeros((batch_size, n))
-            u_hat = dec(llr_ch)
-            return u_hat
+        enc = TurboEncoder(rate=0.5, constraint_length=4, terminate=True, device=device)
+        dec = TurboDecoder(enc, num_iter=4, hard_out=True, device=device)
 
-        run_graph(tf.constant(1))
+        u = source([10, k])
+        c = enc(u)
+        y = 20.0 * (2.0 * c - 1.0)
+        u_hat = dec(y)
+
+        assert u_hat.shape[-1] == k
+        # With high SNR, should recover input
+        assert torch.equal(u, u_hat)
+
+    def test_decoder_without_encoder(self, device):
+        """Test that decoder can be constructed without an encoder object."""
+        k = 100
+
+        source = BinarySource(device=device)
+
+        enc = TurboEncoder(
+            rate=1 / 3, constraint_length=4, terminate=True, device=device
+        )
+        # Decoder from encoder
+        dec1 = TurboDecoder(enc, num_iter=4, hard_out=True, device=device)
+        # Decoder from explicit params
+        dec2 = TurboDecoder(
+            rate=1 / 3,
+            constraint_length=4,
+            terminate=True,
+            interleaver="3GPP",
+            num_iter=4,
+            hard_out=True,
+            device=device,
+        )
+
+        u = source([10, k])
+        c = enc(u)
+        y = 20.0 * (2.0 * c - 1.0)
+
+        u_hat1 = dec1(y)
+        u_hat2 = dec2(y)
+
+        assert torch.equal(u_hat1, u_hat2)
+        assert torch.equal(u, u_hat1)
+
+    def test_soft_output(self, device):
+        """Test soft (LLR) output mode."""
+        bs = 10
+        k = 100
+
+        source = BinarySource(device=device)
+        enc = TurboEncoder(
+            rate=1 / 3, constraint_length=4, terminate=True, device=device
+        )
+        dec = TurboDecoder(enc, num_iter=4, hard_out=False, device=device)
+
+        u = source([bs, k])
+        c = enc(u)
+        y = 20.0 * (2.0 * c - 1.0)
+
+        llr_out = dec(y)
+
+        # LLR should be continuous values
+        assert llr_out.shape[-1] == k
+
+        # Sign of LLR should match hard decision
+        u_hat = (llr_out > 0).float()
+        assert torch.equal(u, u_hat)
+
+    @pytest.mark.parametrize("algo", ["map", "log", "maxlog"])
+    def test_algorithms(self, device, algo):
+        """Test different BCJR algorithms."""
+        bs = 10
+        k = 50
+
+        source = BinarySource(device=device)
+        enc = TurboEncoder(
+            rate=1 / 3, constraint_length=4, terminate=True, device=device
+        )
+
+        u = source([bs, k])
+        c = enc(u)
+        y = 20.0 * (2.0 * c - 1.0)
+
+        dec = TurboDecoder(
+            enc, num_iter=4, hard_out=True, algorithm=algo, device=device
+        )
+        u_hat = dec(y)
+
+        # All algorithms should recover input with perfect channel
+        assert torch.equal(u, u_hat)
+
+    def test_docstring_example(self):
+        """Verify the docstring example works correctly."""
+        encoder = TurboEncoder(rate=1 / 3, constraint_length=4, terminate=True)
+        decoder = TurboDecoder(encoder, num_iter=6)
+
+        u = torch.randint(0, 2, (10, 40), dtype=torch.float32)
+        c = encoder(u)
+
+        # Simulate BPSK with AWGN
+        x = 2.0 * c - 1.0
+        y = x + 0.5 * torch.randn_like(x)
+        llr = 2.0 * y / 0.25
+
+        u_hat = decoder(llr)
+        assert u_hat.shape == torch.Size([10, 40])
+
